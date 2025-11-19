@@ -85,8 +85,8 @@ File explorers struggle with large, nested image collections. This app improves 
 **Goal:** Display images from disk in a basic grid
 
 ### Backend
-- [ ] Set up Tauri project
-- [ ] `scan_folder(path)` (recursive image lookup)
+- [x] Set up Tauri project
+- [x] `scan_folder(path)` (recursive image lookup)
 
 ### Frontend
 - [ ] Simple grid showing full-resolution images
