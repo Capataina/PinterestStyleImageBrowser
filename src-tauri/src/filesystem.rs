@@ -1,5 +1,5 @@
 use std::path::{Path};
-use image_browser_lib::image_struct::ImageStruct;
+use crate::image_struct::ImageStruct;
 
 const SUPPORTED_IMAGE_EXTENSIONS: [&str; 7] = ["jpg", "png", "gif", "jpeg", "bmp", "tiff", "webp"];
 

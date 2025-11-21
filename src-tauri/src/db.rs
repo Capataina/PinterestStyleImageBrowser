@@ -21,6 +21,11 @@ impl ImageDatabase {
         Ok(())
     }
 
+    pub fn default_database_path() -> String {
+        let default_path = "./images.db".to_string();
+        default_path
+    }
+
     pub fn add_image(&mut self, image: ImageStruct) -> rusqlite::Result<()> {
         self.connection.execute(
             "INSERT OR IGNORE INTO images (path) VALUES (?1)",
