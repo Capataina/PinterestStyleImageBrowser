@@ -1,4 +1,5 @@
-use std::path::{Path, PathBuf};
+use std::path::{Path};
+use crate::image_struct::ImageStruct;
 
 const SUPPORTED_IMAGE_EXTENSIONS: [&str; 7] = ["jpg", "png", "gif", "jpeg", "bmp", "tiff", "webp"];
 
@@ -21,8 +22,8 @@ impl ImageScanner {
         ImageScanner {}
     }
 
-    pub fn scan_directory(&self, root: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
-        let mut images: Vec<PathBuf> = Vec::new();
+    pub fn scan_directory(&self, root: &Path) -> Result<Vec<ImageStruct>, std::io::Error> {
+        let mut images: Vec<ImageStruct> = Vec::new();
 
         for entry_res in std::fs::read_dir(root)? {
             let entry = entry_res?;
@@ -34,7 +35,7 @@ impl ImageScanner {
                 images.append(&mut nested);
             } else if file_type.is_file() {
                 if is_supported_image(&path) {
-                    images.push(path);
+                    images.push(ImageStruct::new(&path, Vec::new()));
                 }
             }
         }
