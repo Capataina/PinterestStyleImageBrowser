@@ -1,6 +1,7 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 pub mod db;
 pub mod image_struct;
+pub mod filesystem;
 
 
 #[tauri::command]
