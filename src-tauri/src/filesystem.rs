@@ -1,5 +1,5 @@
-use std::path::{Path};
-use crate::image_struct::ImageStruct;
+use crate::image_struct::ImageData;
+use std::path::Path;
 
 const SUPPORTED_IMAGE_EXTENSIONS: [&str; 7] = ["jpg", "png", "gif", "jpeg", "bmp", "tiff", "webp"];
 
@@ -12,18 +12,15 @@ fn is_supported_image(path: &Path) -> bool {
     false
 }
 
-pub struct ImageScanner{
-
-}
-
+pub struct ImageScanner {}
 
 impl ImageScanner {
     pub fn new() -> Self {
         ImageScanner {}
     }
 
-    pub fn scan_directory(&self, root: &Path) -> Result<Vec<ImageStruct>, std::io::Error> {
-        let mut images: Vec<ImageStruct> = Vec::new();
+    pub fn scan_directory(&self, root: &Path) -> Result<Vec<ImageData>, std::io::Error> {
+        let mut images: Vec<ImageData> = Vec::new();
 
         for entry_res in std::fs::read_dir(root)? {
             let entry = entry_res?;
@@ -35,7 +32,7 @@ impl ImageScanner {
                 images.append(&mut nested);
             } else if file_type.is_file() {
                 if is_supported_image(&path) {
-                    images.push(ImageStruct::new(&path, Vec::new()));
+                    images.push(ImageData::new(&path, Vec::new()));
                 }
             }
         }
@@ -52,10 +49,10 @@ mod tests {
     #[test]
     fn test_scan_directory_finds_all_images() {
         let test_dir = Path::new("test_images");
-        
+
         let scanner = ImageScanner::new();
         let results = scanner.scan_directory(test_dir).unwrap();
-        
+
         assert_eq!(results.len(), 4, "Should find exactly 4 image files");
     }
 
