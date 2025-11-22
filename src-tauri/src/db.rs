@@ -1,17 +1,21 @@
-use crate::image_struct::ImageStruct;
+use std::sync::Mutex;
+
+use crate::image_struct::ImageData;
 
 pub struct ImageDatabase {
-    connection: rusqlite::Connection,
+    connection: Mutex<rusqlite::Connection>,
 }
 
 impl ImageDatabase {
     pub fn new(db_path: &str) -> rusqlite::Result<Self> {
         let connection = rusqlite::Connection::open(db_path)?;
-        Ok(ImageDatabase { connection })
+        Ok(ImageDatabase {
+            connection: Mutex::new(connection),
+        })
     }
 
     pub fn initialize(&self) -> rusqlite::Result<()> {
-        self.connection.execute(
+        self.connection.lock().unwrap().execute(
             "CREATE TABLE IF NOT EXISTS images (
                 id INTEGER PRIMARY KEY,
                 path TEXT NOT NULL UNIQUE
@@ -26,19 +30,20 @@ impl ImageDatabase {
         default_path
     }
 
-    pub fn add_image(&mut self, image: ImageStruct) -> rusqlite::Result<()> {
-        self.connection.execute(
+    pub fn add_image(&mut self, image: ImageData) -> rusqlite::Result<()> {
+        self.connection.lock().unwrap().execute(
             "INSERT OR IGNORE INTO images (path) VALUES (?1)",
             [image.path],
         )?;
         Ok(())
     }
 
-    pub fn get_all_images(&self) -> rusqlite::Result<Vec<ImageStruct>> {
-        let mut stmt = self.connection.prepare("SELECT path FROM images")?;
+    pub fn get_all_images(&self) -> rusqlite::Result<Vec<ImageData>> {
+        let conn = self.connection.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT path FROM images")?;
         let image_iter = stmt.query_map([], |row| {
             let path: String = row.get(0)?;
-            Ok(ImageStruct::new(std::path::Path::new(&path), Vec::new()))
+            Ok(ImageData::new(std::path::Path::new(&path), Vec::new()))
         })?;
 
         let mut images = Vec::new();
@@ -59,7 +64,7 @@ mod tests {
         db.initialize().unwrap();
 
         let test_image_path = "/path/to/image.jpg";
-        let test_image = ImageStruct::new(std::path::Path::new(test_image_path), Vec::new());
+        let test_image = ImageData::new(std::path::Path::new(test_image_path), Vec::new());
         db.add_image(test_image).unwrap();
 
         let images = db.get_all_images().unwrap();
@@ -72,7 +77,7 @@ mod tests {
         db.initialize().unwrap();
 
         let test_image_path = "/path/to/image.jpg";
-        let test_image = ImageStruct::new(std::path::Path::new(test_image_path), Vec::new());
+        let test_image = ImageData::new(std::path::Path::new(test_image_path), Vec::new());
         db.add_image(test_image.clone()).unwrap();
         db.add_image(test_image).unwrap(); // Attempt to add duplicate
 
