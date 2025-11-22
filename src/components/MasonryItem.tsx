@@ -1,5 +1,6 @@
+import { cn } from "@/lib/utils";
 import { ImageItem } from "../types";
-import { motion } from "framer-motion";
+import { Atropos } from "atropos/react";
 
 interface MasonryItemProps {
   item: ImageItem;
@@ -8,13 +9,17 @@ interface MasonryItemProps {
 
 export function MasonryItem(props: MasonryItemProps) {
   return (
-    <motion.div
+    <Atropos
       onClick={() => props.onClick(props.item)}
-      className="hover:scale-105 rounded-xl overflow-hidden hover:cursor-pointer hover:drop-shadow-xl duration-300 transition-transform ease-out"
-      initial={{ opacity: 0, y: 20 }}
-      animate={{ opacity: 1, y: 0 }}
+      className="hover:cursor-pointer"
+      rotateXMax={5}
+      rotateYMax={5}
+      activeOffset={5}
+      shadowScale={0.9}
     >
-      <img className="w-full" src={props.item.url} />
-    </motion.div>
+      <div className={cn("rounded-xl overflow-hidden")}>
+        <img className="w-full" src={props.item.url} />
+      </div>
+    </Atropos>
   );
 }
