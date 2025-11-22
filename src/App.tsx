@@ -1,5 +1,6 @@
 import { QueryClientProvider } from "@tanstack/react-query";
 import "./App.css";
+import "atropos/css";
 import "react";
 import { BrowserRouter, useRoutes } from "react-router-dom";
 

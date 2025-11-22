@@ -130,12 +130,14 @@ export default function Masonry(props: MasonryProps) {
 
   return (
     <div ref={containerRef} className="w-full h-full relative">
-      {items.map((item) => (
+      {items.map((item, index) => (
         <MasonryAnchor
           key={item.itemData.url}
+          selected={item.itemData.url == props.selectedItem?.url}
           x={item.x}
           y={item.y}
           width={item.width}
+          animationDelay={index * 0.1 + 0.1}
         >
           {props.selectedItem?.url == item.itemData.url ? (
             <MasonrySelectedItem item={item.itemData} />
