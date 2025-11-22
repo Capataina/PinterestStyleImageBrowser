@@ -1,10 +1,14 @@
 import { create } from "zustand";
 import { ImageItem } from "../types";
 
-type ImageStoreType = {
-  images: ImageItem[];
+type ImageStore = {
+  selectedImage: ImageItem | null;
 };
 
-const useImageStore = create<ImageStoreType>((set) => ({
-  images: [],
+export const useImageStore = create<ImageStore>((set) => ({
+  selectedImage: null,
+
+  setSelectedImage(img: ImageItem | null) {
+    set(() => ({ selectedImage: img }));
+  },
 }));

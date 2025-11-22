@@ -1,38 +1,32 @@
 import { useEffect, useState } from "react";
-import { ImageItem, ImageData } from "../types";
-import { convertFileSrc, invoke } from "@tauri-apps/api/core";
-import { getImageSize } from "../utils";
 import Masonry from "../components/Masonry";
+import { useImages } from "../queries/useImages";
+import { ImageItem } from "../types";
 
 export default function Home() {
-  const [images, setImages] = useState<ImageItem[]>([]);
-
-  async function fetchImages() {
-    const imagesDB: ImageData[] = await invoke("get_all_images");
-    const newImages = await Promise.all(
-      imagesDB.map(async (img) => {
-        const url = convertFileSrc(img.path);
-        const { width, height } = await getImageSize(url);
-        return { ...img, url, width, height };
-      })
-    );
-
-    setImages(newImages);
-  }
+  const [selectedItem, setSelectedItem] = useState<ImageItem | null>(null);
+  const { data, isFetching, refetch } = useImages();
 
   useEffect(() => {
-    fetchImages();
-  }, []);
+    console.log(data);
+  }, [data]);
 
   return (
     <main className="w-screen h-screen overflow-x-hidden overflow-y-auto">
       <div className="px-10 py-6 w-full h-full relative box-border">
-        <Masonry
-          items={images}
-          columnGap={25}
-          verticalGap={25}
-          minItemWidth={300}
-        />
+        {data && (
+          <Masonry
+            items={data}
+            columnGap={25}
+            verticalGap={25}
+            minItemWidth={300}
+            selectedItem={selectedItem}
+            onItemClick={(item) => {
+              console.log(item);
+              setSelectedItem(item);
+            }}
+          />
+        )}
       </div>
     </main>
   );
