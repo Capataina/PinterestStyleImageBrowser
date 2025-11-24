@@ -49,13 +49,10 @@ export default function Masonry(props: MasonryProps) {
     if (props.selectedItem) {
       const selectedWidth =
         columnWidth * selectionCols + props.columnGap * (selectionCols - 1);
-      const { height: selectedHeight, width } = await measure(
+      const { height: selectedHeight } = await measure(
         <MasonrySelectedItem item={props.selectedItem} />,
         selectedWidth
       );
-
-      console.log(selectedHeight);
-      console.log(width);
 
       newItems.push({
         x: 0,
@@ -99,8 +96,6 @@ export default function Masonry(props: MasonryProps) {
       });
       colHeights[minIndex] += img.height * ratio + props.verticalGap;
     }
-
-    console.log(newItems.length);
 
     setItems(newItems);
   }, [

@@ -4,6 +4,7 @@ import { ImageData } from "../types";
 
 export async function fetchImages() {
   const imagesDB: ImageData[] = await invoke("get_all_images");
+  console.log(imagesDB);
   const images = await Promise.all(
     imagesDB.map(async (img) => {
       const url = convertFileSrc(img.path);

@@ -14,7 +14,7 @@ export function MasonryItem(props: MasonryItemProps) {
       className="hover:cursor-pointer"
       rotateXMax={5}
       rotateYMax={5}
-      activeOffset={5}
+      activeOffset={10}
       shadowScale={0.9}
     >
       <div className={cn("rounded-xl overflow-hidden")}>
