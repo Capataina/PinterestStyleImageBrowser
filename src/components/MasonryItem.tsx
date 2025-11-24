@@ -6,7 +6,6 @@ import { motion } from "framer-motion";
 interface MasonryItemProps {
   item: ImageItem;
   onClick: (item: ImageItem) => void;
-  selected: boolean;
   animationDelay: number;
 }
 
@@ -24,7 +23,7 @@ export function MasonryItem(props: MasonryItemProps) {
     >
       <Atropos
         onClick={() => props.onClick(props.item)}
-        className={cn("hover:cursor-pointer", props.selected ? "z-50" : "")}
+        className={cn("hover:cursor-pointer")}
         rotateXMax={5}
         rotateYMax={5}
         activeOffset={10}

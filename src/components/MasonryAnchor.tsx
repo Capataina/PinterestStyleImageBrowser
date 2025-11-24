@@ -7,14 +7,16 @@ interface MasonryItemProps {
   width: number;
   children: ReactNode;
   visible?: boolean;
+  onTop: boolean;
 }
 
 export function MasonryAnchor(props: MasonryItemProps) {
   return (
     <div
       className={clsx(
-        "absolute transition-all duration-400 ease-in-out hover:z-50",
-        props.visible == false ? "invisible" : ""
+        "absolute transition-transform duration-400 ease-in-out",
+        props.visible == false && "invisible",
+        props.onTop && "z-50"
       )}
       style={{
         left: 0,

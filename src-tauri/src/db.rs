@@ -110,8 +110,6 @@ impl ImageDatabase {
         while let Some(row) = rows.next()? {
             let img_id: ID = row.get("img_id")?;
             let img_path: String = row.get("img_path")?;
-            println!("wow");
-            println!("{img_path}");
             let tag_id_opt: Option<ID> = row.get("tag_id")?;
 
             let entry = map.entry(img_id).or_insert((img_path, Vec::new()));
