@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { MasonryItemData } from "./Masonry";
 import { motion } from "framer-motion";
 
@@ -9,47 +9,56 @@ interface FullscreenImageProps {
 
 export function FullscreenImage(props: FullscreenImageProps) {
   const imgRef = useRef<HTMLImageElement>(null);
-  const initialData = useRef({
-    x: props.masonryItem.x,
-    y: props.masonryItem.y,
-    width: props.masonryItem.width,
-  });
+  const initialData = useMemo(
+    () => ({
+      x: props.masonryItem.x,
+      y: props.masonryItem.y,
+      width: props.masonryItem.width,
+    }),
+    [props.masonryItem]
+  );
   const [data, setData] = useState({
     x: props.masonryItem.x,
     y: props.masonryItem.y,
     width: props.masonryItem.width,
   });
 
-  useLayoutEffect(() => {
-    requestAnimationFrame(() => {
-      const rect = imgRef.current?.getBoundingClientRect()!;
+  const recalculatePosition = () => {
+    const rect = imgRef.current?.getBoundingClientRect()!;
 
-      let newWidth = 0;
-      let newHeight = 0;
-      if (rect.width > rect.height) {
-        newWidth = window.innerWidth * 0.6;
-        const ratio = newWidth / rect.width;
-        newHeight = rect.height * ratio;
-      } else {
-        newHeight = window.innerHeight * 0.8;
-        const ratio = newHeight / rect.height;
-        newWidth = rect.width * ratio;
-      }
+    let newWidth = 0;
+    let newHeight = 0;
+    if (rect.width > rect.height) {
+      newWidth = window.innerWidth * 0.6;
+      const ratio = newWidth / rect.width;
+      newHeight = rect.height * ratio;
+    } else {
+      newHeight = window.innerHeight * 0.8;
+      const ratio = newHeight / rect.height;
+      newWidth = rect.width * ratio;
+    }
 
-      setData({
-        x: window.innerWidth / 2 - newWidth / 2,
-        y: window.innerHeight / 2 - newHeight / 2,
-        width: newWidth,
-      });
+    setData({
+      x: window.innerWidth / 2 - newWidth / 2,
+      y: window.innerHeight / 2 - newHeight / 2,
+      width: newWidth,
     });
+  };
+
+  useLayoutEffect(() => {
+    requestAnimationFrame(recalculatePosition);
+  }, []);
+
+  useEffect(() => {
+    window.addEventListener("resize", recalculatePosition);
+    return () => {
+      window.removeEventListener("resize", recalculatePosition);
+    };
   }, []);
 
   const leaveFocus = () => {
-    setData(initialData.current);
+    setData(initialData);
     props.setFocusItem(null);
-
-    // setTimeout(() => {
-    // }, 400);
   };
 
   return (
