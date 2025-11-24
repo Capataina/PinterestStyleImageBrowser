@@ -8,8 +8,8 @@ export default function Home() {
   const { data, isFetching, refetch } = useImages();
 
   return (
-    <main className="w-screen h-screen overflow-x-hidden overflow-y-auto">
-      <div className="px-48 py-6 w-full h-full relative box-border">
+    <main className="w-screen h-screen overflow-hidden">
+      <div className="px-48 py-6 w-full h-full overflow-y-auto box-border">
         {data && (
           <Masonry
             items={data}
