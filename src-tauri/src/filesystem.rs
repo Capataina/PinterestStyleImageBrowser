@@ -1,5 +1,5 @@
 use crate::image_struct::ImageData;
-use std::path::Path;
+use std::{path::Path, str::FromStr};
 
 const SUPPORTED_IMAGE_EXTENSIONS: [&str; 7] = ["jpg", "png", "gif", "jpeg", "bmp", "tiff", "webp"];
 
@@ -19,8 +19,9 @@ impl ImageScanner {
         ImageScanner {}
     }
 
-    pub fn scan_directory(&self, root: &Path) -> Result<Vec<ImageData>, std::io::Error> {
-        let mut images: Vec<ImageData> = Vec::new();
+    // CAN USE WALKDIR
+    pub fn scan_directory(&self, root: &Path) -> Result<Vec<String>, std::io::Error> {
+        let mut img_paths: Vec<String> = Vec::new();
 
         for entry_res in std::fs::read_dir(root)? {
             let entry = entry_res?;
@@ -29,15 +30,15 @@ impl ImageScanner {
 
             if file_type.is_dir() {
                 let mut nested = self.scan_directory(&path)?;
-                images.append(&mut nested);
+                img_paths.append(&mut nested);
             } else if file_type.is_file() {
                 if is_supported_image(&path) {
-                    images.push(ImageData::new(&path, Vec::new()));
+                    img_paths.push(path.to_string_lossy().to_string());
                 }
             }
         }
 
-        Ok(images)
+        Ok(img_paths)
     }
 }
 

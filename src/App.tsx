@@ -12,8 +12,6 @@ function Routes() {
 }
 
 function App() {
-  console.log(routes);
-
   return (
     <BrowserRouter>
       <QueryClientProvider client={queryClient}>

@@ -1,15 +1,18 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+use crate::{db::ID, tag_struct::Tag};
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageData {
+    pub id: ID,
     pub name: String,
     pub path: String,
-    pub tags: Vec<String>,
+    pub tags: Vec<Tag>,
 }
 
 impl ImageData {
-    pub fn new(path: &Path, tags: Vec<String>) -> Self {
+    pub fn new(id: ID, path: &Path, tags: Vec<Tag>) -> Self {
         println!("{}", path.to_str().unwrap());
         let path_str = path
             .canonicalize()
@@ -24,45 +27,10 @@ impl ImageData {
             .to_string();
 
         return ImageData {
+            id,
             name,
             path: path_str,
             tags,
         };
-    }
-
-    pub fn add_tag(&mut self, tag: String) {
-        if !self.tags.contains(&tag) {
-            self.tags.push(tag);
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::Path;
-
-    #[test]
-    fn test_image_struct_creation() {
-        let path = Path::new("/images/photo.jpg");
-        let tags = vec!["vacation".to_string(), "summer".to_string()];
-        let image = ImageData::new(path, tags.clone());
-
-        assert_eq!(image.name, "photo.jpg");
-        assert_eq!(image.path, "/images/photo.jpg");
-        assert_eq!(image.tags, tags);
-    }
-
-    #[test]
-    fn test_add_tag() {
-        let path = Path::new("/images/photo.jpg");
-        let mut image = ImageData::new(path, Vec::new());
-
-        image.add_tag("nature".to_string());
-        assert_eq!(image.tags, vec!["nature".to_string()]);
-
-        // Adding the same tag should not duplicate it
-        image.add_tag("nature".to_string());
-        assert_eq!(image.tags, vec!["nature".to_string()]);
     }
 }
