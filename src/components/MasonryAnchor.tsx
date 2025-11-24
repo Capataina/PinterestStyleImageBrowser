@@ -1,4 +1,3 @@
-import { motion } from "framer-motion";
 import { ReactNode } from "react";
 import { clsx } from "clsx";
 
@@ -7,8 +6,7 @@ interface MasonryItemProps {
   y: number;
   width: number;
   children: ReactNode;
-  animationDelay: number;
-  selected: boolean;
+  visible?: boolean;
 }
 
 export function MasonryAnchor(props: MasonryItemProps) {
@@ -16,7 +14,7 @@ export function MasonryAnchor(props: MasonryItemProps) {
     <div
       className={clsx(
         "absolute transition-all duration-400 ease-in-out hover:z-50",
-        props.selected ? "z-50" : ""
+        props.visible == false ? "invisible" : ""
       )}
       style={{
         left: 0,
@@ -25,18 +23,7 @@ export function MasonryAnchor(props: MasonryItemProps) {
         width: props.width,
       }}
     >
-      <motion.div
-        transition={{
-          duration: 0.4,
-          ease: "easeOut",
-          delay: props.animationDelay,
-        }}
-        initial={{ opacity: 0, y: 20 }}
-        animate={{ opacity: 1, y: 0 }}
-        exit={{ opacity: 0 }}
-      >
-        {props.children}
-      </motion.div>
+      {props.children}
     </div>
   );
 }
