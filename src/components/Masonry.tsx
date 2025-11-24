@@ -144,6 +144,12 @@ export default function Masonry(props: MasonryProps) {
     setFocusedItem(item);
   };
 
+  const toNextItem = () => {
+    const index = props.items.findIndex(
+      (i) => i.url == props.selectedItem!.url
+    );
+  };
+
   return (
     <>
       <AnimatePresence>

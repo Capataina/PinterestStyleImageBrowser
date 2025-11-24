@@ -46,6 +46,7 @@ export function useLocate() {
                 const innerElement = refOuter.current.querySelector(
                   `#${targetId}`
                 )!;
+
                 const rectInner = innerElement.getBoundingClientRect();
 
                 resolve({
