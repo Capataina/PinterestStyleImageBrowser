@@ -1,17 +1,9 @@
-import {
-  useCallback,
-  useEffect,
-  useLayoutEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ImageItem } from "../types";
 import { MasonryItem } from "./MasonryItem";
 import debounce from "lodash/debounce";
 import { MasonryAnchor } from "./MasonryAnchor";
 import { MasonrySelectedFrame } from "./MasonrySelectedFrame";
-import { useMeasure } from "../hooks/useMeasure";
 import { useLocate } from "@/hooks/useLocate";
 import { MasonryItemSelected } from "./MasonryItemSelected";
 
@@ -147,6 +139,7 @@ export default function Masonry(props: MasonryProps) {
         x={0}
         y={0}
         width={selectedFrameWidthRef.current}
+        onTop={true}
       >
         <MasonrySelectedFrame
           height={selectedFrameHeightRef.current}
