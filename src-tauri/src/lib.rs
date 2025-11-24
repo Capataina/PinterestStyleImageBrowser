@@ -6,11 +6,17 @@ use crate::{db::ImageDatabase, image_struct::ImageData};
 pub mod db;
 pub mod filesystem;
 pub mod image_struct;
+pub mod tag_struct;
 
 #[tauri::command]
 fn get_all_images(db: State<'_, ImageDatabase>) -> Vec<ImageData> {
     return db.get_all_images().unwrap();
 }
+
+// #[tauri::command]
+// fn get_all_tags(db: State<'_, ImageDatabase>) -> Vec<Tag> {
+//     return db.get_all_images().unwrap();
+// }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run(db: ImageDatabase) {
