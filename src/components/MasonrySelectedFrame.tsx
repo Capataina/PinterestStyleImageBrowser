@@ -16,9 +16,10 @@ export function MasonrySelectedFrame(props: MasonrySelectedItemProps) {
 
   return (
     <Card
-      className="transition-all duration-300 overflow-hidden"
+      className="overflow-hidden"
       style={{
         height: props.height ? props.height : "auto",
+        transition: "height 0.3s ease-in-out",
       }}
     >
       <CardHeader>
@@ -45,10 +46,11 @@ export function MasonrySelectedFrame(props: MasonrySelectedItemProps) {
         </div>
       </CardHeader>
       <CardContent>
-        <div className="rounded-xl overflow-hidden hover:shadow-lg/50 hover:scale-[1.02] hover:cursor-pointer duration-400 transition-all ease-out">
+        <div className="rounded-xl overflow-hidden">
           <img id="img" className="w-full invisible" src={props.item.url} />
         </div>
       </CardContent>
+      <div className="grow" />
       <CardFooter>
         <hr />
         <h1>Test</h1>

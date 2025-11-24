@@ -13,6 +13,7 @@ import { MasonryAnchor } from "./MasonryAnchor";
 import { MasonrySelectedFrame } from "./MasonrySelectedFrame";
 import { useMeasure } from "../hooks/useMeasure";
 import { useLocate } from "@/hooks/useLocate";
+import { MasonryItemSelected } from "./MasonryItemSelected";
 
 interface MasonryProps {
   items: ImageItem[];
@@ -158,13 +159,17 @@ export default function Masonry(props: MasonryProps) {
           x={item.x}
           y={item.y}
           width={item.width}
+          onTop={props.selectedItem?.url == item.itemData.url}
         >
-          <MasonryItem
-            item={item.itemData}
-            onClick={props.onItemClick}
-            selected={item.itemData.url == props.selectedItem?.url}
-            animationDelay={index * 0.1 + 0.1}
-          />
+          {props.selectedItem?.url == item.itemData.url ? (
+            <MasonryItemSelected item={item.itemData} onClick={() => {}} />
+          ) : (
+            <MasonryItem
+              item={item.itemData}
+              onClick={props.onItemClick}
+              animationDelay={index * 0.1 + 0.1}
+            />
+          )}
         </MasonryAnchor>
       ))}
     </div>
