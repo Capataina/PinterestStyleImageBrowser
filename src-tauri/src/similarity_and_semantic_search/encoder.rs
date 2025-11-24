@@ -72,60 +72,60 @@ impl Encoder {
     }
 
     pub fn encode(&mut self, image_path: &Path) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-    let input_array = self.preprocess_image(image_path)?;
+        let input_array = self.preprocess_image(image_path)?;
 
-    // TODO: Optimize this to avoid copies
-    // this is a temp workaround for now, idk how to fix this but basically, the way Tensor::from_array works
-    // is that it requires ownership of the data vec so we have to extract it from the ndarray first
-    // the wiki shows them using 2 diff methods, one with a pure ndarray and one with a shape and vec
-    // when I tried to use the pure ndarray one it gave lifetime issues so this is the workaround
-    // ideally we would just be able to pass the ndarray directly but idk how to do that yet
-    let shape = [1usize, 3, 224, 224];
-    let (data, _offset) = input_array.into_raw_vec_and_offset();
+        // TODO: Optimize this to avoid copies
+        // this is a temp workaround for now, idk how to fix this but basically, the way Tensor::from_array works
+        // is that it requires ownership of the data vec so we have to extract it from the ndarray first
+        // the wiki shows them using 2 diff methods, one with a pure ndarray and one with a shape and vec
+        // when I tried to use the pure ndarray one it gave lifetime issues so this is the workaround
+        // ideally we would just be able to pass the ndarray directly but idk how to do that yet
+        let shape = [1usize, 3, 224, 224];
+        let (data, _offset) = input_array.into_raw_vec_and_offset();
 
-    // use the shape and data to create the tensor
-    let onnx_input: Tensor<f32> = Tensor::from_array((shape, data))?;
+        // use the shape and data to create the tensor
+        let onnx_input: Tensor<f32> = Tensor::from_array((shape, data))?;
 
-    // Create dummy inputs for the text branch to prevent ONNX crashes,
-    // honestly annoying as hell and will most likely break something later on but we can always refactor right hahah ha 
-    // TODO: Fix this when it breaks in the future...
-    // The model expects these to exist even if we are only doing image encoding
-    let text_shape = [1usize, 1]; 
-    let dummy_text_data = vec![0i64; 1]; // Batch size 1, sequence length 1, value 0
-    
-    // We clone dummy_text_data for the first one because Tensor takes ownership
-    let input_ids: Tensor<i64> = Tensor::from_array((text_shape, dummy_text_data.clone()))?;
-    let attention_mask: Tensor<i64> = Tensor::from_array((text_shape, dummy_text_data))?;
-    // --------------------------------------------------------------------------
+        // Create dummy inputs for the text branch to prevent ONNX crashes,
+        // honestly annoying as hell and will most likely break something later on but we can always refactor right hahah ha 
+        // TODO: Fix this when it breaks in the future...
+        // The model expects these to exist even if we are only doing image encoding
+        let text_shape = [1usize, 1]; 
+        let dummy_text_data = vec![0i64; 1]; // Batch size 1, sequence length 1, value 0
+        
+        // We clone dummy_text_data for the first one because Tensor takes ownership
+        let input_ids: Tensor<i64> = Tensor::from_array((text_shape, dummy_text_data.clone()))?;
+        let attention_mask: Tensor<i64> = Tensor::from_array((text_shape, dummy_text_data))?;
+        // --------------------------------------------------------------------------
 
-    // Use hardcoded input/output names since we know them from inspection
-    // do not change these unless your model uses different names
-    // so probs never
-    let input_name = "pixel_values";
-    let output_name = "image_embeds";
+        // Use hardcoded input/output names since we know them from inspection
+        // do not change these unless your model uses different names
+        // so probs never
+        let input_name = "pixel_values";
+        let output_name = "image_embeds";
 
-    // Now run the model (mutable borrow happens here)
-    // Updated to include the text branch inputs required by the graph
-    let outputs = self
-        .session
-        .run(ort::inputs![
-            input_name => onnx_input,
-            "input_ids" => input_ids,
-            "attention_mask" => attention_mask
-        ])?;
+        // Now run the model (mutable borrow happens here)
+        // Updated to include the text branch inputs required by the graph
+        let outputs = self
+            .session
+            .run(ort::inputs![
+                input_name => onnx_input,
+                "input_ids" => input_ids,
+                "attention_mask" => attention_mask
+            ])?;
 
-    // Extract from outputs using the name we got earlier
-    let dyn_tensor: &Value<_> = &outputs[output_name];
+        // Extract from outputs using the name we got earlier
+        let dyn_tensor: &Value<_> = &outputs[output_name];
 
-    // this is an absolute pain to fix
-    // it always keeps breaking because if we get a tuple from the tensor
-    // tuples do not have view, as slice or any of the other methods for us to turn them into a vec soooooo
-    // we use try_extract_tensor which gives us both the shape and a view we can turn into a vec
-    let (_out_shape, data_view) = dyn_tensor.try_extract_tensor::<f32>()?;
-    let embedding = data_view.to_vec();
+        // this is an absolute pain to fix
+        // it always keeps breaking because if we get a tuple from the tensor
+        // tuples do not have view, as slice or any of the other methods for us to turn them into a vec soooooo
+        // we use try_extract_tensor which gives us both the shape and a view we can turn into a vec
+        let (_out_shape, data_view) = dyn_tensor.try_extract_tensor::<f32>()?;
+        let embedding = data_view.to_vec();
 
-    Ok(embedding)
-}
+        Ok(embedding)
+    }
 
 }
 
