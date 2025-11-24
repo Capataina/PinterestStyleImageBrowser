@@ -1,5 +1,4 @@
-use crate::image_struct::ImageData;
-use std::{path::Path, str::FromStr};
+use std::{path::Path};
 
 const SUPPORTED_IMAGE_EXTENSIONS: [&str; 7] = ["jpg", "png", "gif", "jpeg", "bmp", "tiff", "webp"];
 
