@@ -1,17 +1,20 @@
-import {
-  useCallback,
-  useEffect,
-  useLayoutEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ImageItem } from "../types";
 import { MasonryItem } from "./MasonryItem";
 import debounce from "lodash/debounce";
 import { MasonryAnchor } from "./MasonryAnchor";
-import { MasonrySelectedItem } from "./MasonrySelectedItem";
-import { useMeasure } from "../hooks/useMeasure";
+import { MasonrySelectedFrame } from "./MasonrySelectedFrame";
+import { useLocate } from "@/hooks/useLocate";
+import { MasonryItemSelected } from "./MasonryItemSelected";
+import { FullscreenImage } from "./FullscreenImage";
+import { AnimatePresence } from "framer-motion";
+
+export type MasonryItemData = {
+  itemData: ImageItem;
+  x: number;
+  y: number;
+  width: number;
+};
 
 interface MasonryProps {
   items: ImageItem[];
@@ -22,17 +25,15 @@ interface MasonryProps {
   onItemClick: (item: ImageItem) => void;
 }
 
-type MasonryItemData = {
-  itemData: ImageItem;
-  x: number;
-  y: number;
-  width: number;
-};
-
 export default function Masonry(props: MasonryProps) {
   const [items, setItems] = useState<MasonryItemData[]>([]);
+  const [height, setHeight] = useState(0);
+  const [focusedItem, setFocusedItem] = useState<MasonryItemData | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-  const { measure } = useMeasure();
+  const { locate } = useLocate();
+
+  const selectedFrameWidthRef = useRef(0);
+  const selectedFrameHeightRef = useRef(0);
 
   const refreshLayout = useCallback(async () => {
     if (!containerRef.current) return;
@@ -47,26 +48,35 @@ export default function Masonry(props: MasonryProps) {
     const colHeights: number[] = [];
 
     if (props.selectedItem) {
-      const selectedWidth =
+      const selectedFrameWidth =
         columnWidth * selectionCols + props.columnGap * (selectionCols - 1);
-      const { height: selectedHeight, width } = await measure(
-        <MasonrySelectedItem item={props.selectedItem} />,
-        selectedWidth
+      const { height: selectedFrameHeight } = await locate(
+        <MasonrySelectedFrame item={props.selectedItem} />,
+        selectedFrameWidth
+      );
+      selectedFrameWidthRef.current = selectedFrameWidth;
+      selectedFrameHeightRef.current = selectedFrameHeight;
+
+      const {
+        x,
+        y,
+        width: imgWidth,
+      } = await locate(
+        <MasonrySelectedFrame item={props.selectedItem} />,
+        selectedFrameWidth,
+        "img"
       );
 
-      console.log(selectedHeight);
-      console.log(width);
-
       newItems.push({
-        x: 0,
-        y: 0,
+        x,
+        y,
         itemData: props.selectedItem,
-        width: selectedWidth,
+        width: imgWidth,
       });
 
       for (let i = 0; i < colCount; i++) {
         if (i < selectionCols) {
-          colHeights[i] = selectedHeight + props.verticalGap;
+          colHeights[i] = selectedFrameHeight + props.verticalGap;
         } else {
           colHeights[i] = 0;
         }
@@ -100,8 +110,10 @@ export default function Masonry(props: MasonryProps) {
       colHeights[minIndex] += img.height * ratio + props.verticalGap;
     }
 
-    console.log(newItems.length);
+    let colMax = 0;
+    colHeights.forEach((h) => (colMax = Math.max(colMax, h)));
 
+    setHeight(colMax);
     setItems(newItems);
   }, [
     props.items,
@@ -128,24 +140,53 @@ export default function Masonry(props: MasonryProps) {
     refreshLayout();
   }, [props.items, props.selectedItem]);
 
+  const onItemFocus = (item: MasonryItemData) => {
+    setFocusedItem(item);
+  };
+
   return (
-    <div ref={containerRef} className="w-full h-full relative">
-      {items.map((item, index) => (
+    <>
+      <AnimatePresence>
+        {focusedItem && (
+          <FullscreenImage
+            setFocusItem={setFocusedItem}
+            masonryItem={focusedItem}
+          />
+        )}
+      </AnimatePresence>
+      <div ref={containerRef} className="w-full relative" style={{ height }}>
         <MasonryAnchor
-          key={item.itemData.url}
-          selected={item.itemData.url == props.selectedItem?.url}
-          x={item.x}
-          y={item.y}
-          width={item.width}
-          animationDelay={index * 0.1 + 0.1}
+          visible={props.selectedItem != null}
+          x={0}
+          y={0}
+          width={selectedFrameWidthRef.current}
+          onTop={true}
         >
-          {props.selectedItem?.url == item.itemData.url ? (
-            <MasonrySelectedItem item={item.itemData} />
-          ) : (
-            <MasonryItem item={item.itemData} onClick={props.onItemClick} />
-          )}
+          <MasonrySelectedFrame
+            height={selectedFrameHeightRef.current}
+            item={props.selectedItem}
+          />
         </MasonryAnchor>
-      ))}
-    </div>
+        {items.map((item, index) => (
+          <MasonryAnchor
+            key={item.itemData.url}
+            x={item.x}
+            y={item.y}
+            width={item.width}
+            onTop={props.selectedItem?.url == item.itemData.url}
+          >
+            {props.selectedItem?.url == item.itemData.url ? (
+              <MasonryItemSelected item={item.itemData} onClick={onItemFocus} />
+            ) : (
+              <MasonryItem
+                item={item.itemData}
+                onClick={props.onItemClick}
+                animationDelay={index * 0.1 + 0.1}
+              />
+            )}
+          </MasonryAnchor>
+        ))}
+      </div>
+    </>
   );
 }

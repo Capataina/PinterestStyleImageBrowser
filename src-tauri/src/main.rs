@@ -6,10 +6,10 @@ use image_browser_lib::{db::ImageDatabase, *};
 fn index_directory(path: &std::path::Path, db: &mut ImageDatabase) {
     let scanner = filesystem::ImageScanner::new();
     match scanner.scan_directory(path) {
-        Ok(images) => {
-            for image in images {
-                println!("Found image: {:?}", image);
-                db.add_image(image).unwrap();
+        Ok(paths) => {
+            for path in paths {
+                println!("Found image: {:?}", path);
+                db.add_image(path).unwrap();
             }
         }
         Err(e) => {
