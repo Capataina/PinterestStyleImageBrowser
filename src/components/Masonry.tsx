@@ -10,8 +10,9 @@ import { ImageItem } from "../types";
 import { MasonryItem } from "./MasonryItem";
 import debounce from "lodash/debounce";
 import { MasonryAnchor } from "./MasonryAnchor";
-import { MasonrySelectedItem } from "./MasonrySelectedItem";
+import { MasonrySelectedFrame } from "./MasonrySelectedFrame";
 import { useMeasure } from "../hooks/useMeasure";
+import { useLocate } from "@/hooks/useLocate";
 
 interface MasonryProps {
   items: ImageItem[];
@@ -32,7 +33,10 @@ type MasonryItemData = {
 export default function Masonry(props: MasonryProps) {
   const [items, setItems] = useState<MasonryItemData[]>([]);
   const containerRef = useRef<HTMLDivElement>(null);
-  const { measure } = useMeasure();
+  const { locate } = useLocate();
+
+  const selectedFrameWidthRef = useRef(0);
+  const selectedFrameHeightRef = useRef(0);
 
   const refreshLayout = useCallback(async () => {
     if (!containerRef.current) return;
@@ -47,23 +51,35 @@ export default function Masonry(props: MasonryProps) {
     const colHeights: number[] = [];
 
     if (props.selectedItem) {
-      const selectedWidth =
+      const selectedFrameWidth =
         columnWidth * selectionCols + props.columnGap * (selectionCols - 1);
-      const { height: selectedHeight } = await measure(
-        <MasonrySelectedItem item={props.selectedItem} />,
-        selectedWidth
+      const { height: selectedFrameHeight } = await locate(
+        <MasonrySelectedFrame item={props.selectedItem} />,
+        selectedFrameWidth
+      );
+      selectedFrameWidthRef.current = selectedFrameWidth;
+      selectedFrameHeightRef.current = selectedFrameHeight;
+
+      const {
+        x,
+        y,
+        width: imgWidth,
+      } = await locate(
+        <MasonrySelectedFrame item={props.selectedItem} />,
+        selectedFrameWidth,
+        "img"
       );
 
       newItems.push({
-        x: 0,
-        y: 0,
+        x,
+        y,
         itemData: props.selectedItem,
-        width: selectedWidth,
+        width: imgWidth,
       });
 
       for (let i = 0; i < colCount; i++) {
         if (i < selectionCols) {
-          colHeights[i] = selectedHeight + props.verticalGap;
+          colHeights[i] = selectedFrameHeight + props.verticalGap;
         } else {
           colHeights[i] = 0;
         }
@@ -125,20 +141,30 @@ export default function Masonry(props: MasonryProps) {
 
   return (
     <div ref={containerRef} className="w-full h-full relative">
+      <MasonryAnchor
+        visible={props.selectedItem != null}
+        x={0}
+        y={0}
+        width={selectedFrameWidthRef.current}
+      >
+        <MasonrySelectedFrame
+          height={selectedFrameHeightRef.current}
+          item={props.selectedItem}
+        />
+      </MasonryAnchor>
       {items.map((item, index) => (
         <MasonryAnchor
           key={item.itemData.url}
-          selected={item.itemData.url == props.selectedItem?.url}
           x={item.x}
           y={item.y}
           width={item.width}
-          animationDelay={index * 0.1 + 0.1}
         >
-          {props.selectedItem?.url == item.itemData.url ? (
-            <MasonrySelectedItem item={item.itemData} />
-          ) : (
-            <MasonryItem item={item.itemData} onClick={props.onItemClick} />
-          )}
+          <MasonryItem
+            item={item.itemData}
+            onClick={props.onItemClick}
+            selected={item.itemData.url == props.selectedItem?.url}
+            animationDelay={index * 0.1 + 0.1}
+          />
         </MasonryAnchor>
       ))}
     </div>

@@ -4,17 +4,25 @@ import { Card, CardContent, CardFooter, CardHeader } from "./ui/card";
 import { Combobox } from "./ui/combobox";
 
 interface MasonrySelectedItemProps {
-  item: ImageItem;
+  item: ImageItem | undefined | null;
+  height?: number;
 }
 
-export function MasonrySelectedItem(props: MasonrySelectedItemProps) {
+export function MasonrySelectedFrame(props: MasonrySelectedItemProps) {
   const [comboboxOpen, setComboboxOpen] = useState(false);
   const [comboboxValue, setComboboxValue] = useState("");
 
+  if (!props.item) return;
+
   return (
-    <Card>
+    <Card
+      className="transition-all duration-300 overflow-hidden"
+      style={{
+        height: props.height ? props.height : "auto",
+      }}
+    >
       <CardHeader>
-        <div className="w-full flex flex-row items-end">
+        <div className="w-full flex flex-row justify-end">
           <Combobox
             items={[
               {
@@ -38,7 +46,7 @@ export function MasonrySelectedItem(props: MasonrySelectedItemProps) {
       </CardHeader>
       <CardContent>
         <div className="rounded-xl overflow-hidden hover:shadow-lg/50 hover:scale-[1.02] hover:cursor-pointer duration-400 transition-all ease-out">
-          <img className="w-full" src={props.item.url} />
+          <img id="img" className="w-full invisible" src={props.item.url} />
         </div>
       </CardContent>
       <CardFooter>
