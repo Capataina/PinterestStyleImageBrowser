@@ -12,3 +12,5 @@ models/*
 # Exception: Re-include the 'models/' directory itself
 # This ensures the empty folder is tracked by Git
 !models/.gitkeep 
+
+references/*

@@ -1,6 +1,6 @@
 use ort::{session::Session, value::{Tensor, Value}};
 use ndarray;
-use std::path::Path;
+use std::{error::Error, path::Path};
 use image::ImageReader;
 
 pub struct Encoder {
@@ -8,10 +8,12 @@ pub struct Encoder {
 }
 
 impl Encoder {
-    pub fn new(model_path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
-        // Make sure you've called `ort::init().commit()?` once in main before any sessions
-        // I don't know why this is important but its from the docs so here we are
-        let session = Session::builder()?.commit_from_file(model_path)?;
+    pub fn new(model_path: &Path) -> Result<Self, Box<dyn Error>> {
+        // ort will automatically use CUDA if available, otherwise falls back to CPU
+        // if it doesn't do that, we are going to have a LOT of issues later on but uhhhh
+        let session = Session::builder()?
+            .commit_from_file(model_path)?;
+        
         Ok(Encoder { session })
     }
 
@@ -125,6 +127,71 @@ impl Encoder {
         let embedding = data_view.to_vec();
 
         Ok(embedding)
+    }
+
+    // write a batch encode function that takes a vec of image paths and returns a vec of embeddings
+    // the batch size should be configurable
+    pub fn encode_batch(
+    &mut self,
+    image_paths: &[&Path],
+    ) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error>> {
+        if image_paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        
+        // Step 1: Preprocess all images
+        let mut preprocessed = Vec::new();
+        for path in image_paths {
+            let input_array = self.preprocess_image(path)?;
+            preprocessed.push(input_array);
+        }
+        
+        // Step 2: Concatenate (not stack!) into single batch tensor
+        let batch_array = ndarray::concatenate(
+            ndarray::Axis(0),
+            &preprocessed.iter().map(|a| a.view()).collect::<Vec<_>>(),
+        )?;
+        
+        // Verify the shape is correct
+        assert_eq!(
+            batch_array.shape(),
+            &[image_paths.len(), 3, 224, 224],
+            "Batch array has wrong shape"
+        );
+        
+        // Step 3: Convert to ONNX tensor
+        let shape = [image_paths.len(), 3, 224, 224];
+        let (data, _offset) = batch_array.into_raw_vec_and_offset();
+        let onnx_input: Tensor<f32> = Tensor::from_array((shape, data))?;
+        
+        // Step 4: Create dummy text inputs
+        let text_shape = [image_paths.len(), 1]; 
+        let dummy_text_data = vec![0i64; image_paths.len()];
+        let input_ids: Tensor<i64> = Tensor::from_array((text_shape, dummy_text_data.clone()))?;
+        let attention_mask: Tensor<i64> = Tensor::from_array((text_shape, dummy_text_data))?;
+        
+        // Step 5: Run inference
+        let outputs = self.session.run(ort::inputs![
+            "pixel_values" => onnx_input,
+            "input_ids" => input_ids,
+            "attention_mask" => attention_mask
+        ])?;
+        
+        // Step 6: Split output into individual embeddings
+        let dyn_tensor: &Value<_> = &outputs["image_embeds"];
+        let (out_shape, data_view) = dyn_tensor.try_extract_tensor::<f32>()?;
+        
+        let data_slice = data_view.to_vec();
+        let embedding_size = out_shape[1] as usize;
+        
+        let mut embeddings = Vec::new();
+        for i in 0..image_paths.len() {
+            let start = i * embedding_size;
+            let end = start + embedding_size;
+            embeddings.push(data_slice[start..end].to_vec());
+        }
+        
+        Ok(embeddings)
     }
 
 }
@@ -315,5 +382,36 @@ mod tests {
         // CLIP embeddings typically have reasonable value ranges
         assert!(min > -5.0 && min < 5.0, "Min value should be reasonable");
         assert!(max > -5.0 && max < 5.0, "Max value should be reasonable");
+    }
+
+    #[test]
+    fn test_encode_batch() {
+        let mut encoder = Encoder::new(Path::new("models/model.onnx")).unwrap();
+        
+        let paths = vec![
+            Path::new("C:\\image-browser\\src-tauri\\test_images\\66bb951dcab9c27a144292c8_WestStudio-LOL-Splash-Vol2-021.jpg"),
+            Path::new("C:\\image-browser\\src-tauri\\test_images\\613syV-a1sL._AC_UF894,1000_QL80_.jpg"),
+            Path::new("C:\\image-browser\\src-tauri\\test_images\\joaquin-castro-uribe-1653436027503.jpg"),
+        ];
+        
+        // Encode individually
+        let individual: Vec<Vec<f32>> = paths.iter()
+            .map(|p| encoder.encode(p).unwrap())
+            .collect();
+        
+        // Encode as batch
+        let batch_paths: Vec<&Path> = paths.iter().map(|p| p.as_ref()).collect();
+        let batched = encoder.encode_batch(&batch_paths).unwrap();
+        
+        // Results should match
+        assert_eq!(batched.len(), individual.len());
+        for (batch_emb, indiv_emb) in batched.iter().zip(individual.iter()) {
+            assert_eq!(batch_emb.len(), indiv_emb.len());
+            for (b, i) in batch_emb.iter().zip(indiv_emb.iter()) {
+                assert!((b - i).abs() < 1e-5, "Batch and individual encoding should match");
+            }
+        }
+        
+        println!("Batch encoding matches individual encoding!");
     }
 }
