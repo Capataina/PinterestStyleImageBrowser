@@ -7,6 +7,7 @@ pub mod db;
 pub mod filesystem;
 pub mod image_struct;
 pub mod tag_struct;
+pub mod similarity_and_semantic_search;
 
 #[tauri::command]
 fn get_all_images(db: State<'_, ImageDatabase>) -> Vec<ImageData> {

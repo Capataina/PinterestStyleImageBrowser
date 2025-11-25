@@ -5,6 +5,7 @@ A lightweight, high-performance desktop application for browsing large local ima
 Built with Rust, Tauri, and React. Designed to handle thousands of images smoothly with complete offline privacy.
 
 **Use it for:**
+
 - Organising personal photos
 - Browsing inspiration packs or mood boards
 - Managing art and design reference libraries
@@ -32,6 +33,7 @@ File explorers struggle with large, nested image collections. This app improves 
 ## Architecture Overview
 
 ### Frontend
+
 - React SPA inside Tauri
 - Masonry grid feed
 - Tag chips and tag editor
@@ -40,6 +42,7 @@ File explorers struggle with large, nested image collections. This app improves 
 - Slideshow viewer
 
 ### Backend (Rust)
+
 - Tauri IPC commands
 - Recursive folder scanning
 - Thumbnail generation
@@ -51,6 +54,7 @@ File explorers struggle with large, nested image collections. This app improves 
 - Cosine similarity engine
 
 ### Data
+
 - SQLite stored locally
 - Thumbnails cached in `/thumbs/`
 - Embeddings stored as BLOB
@@ -61,22 +65,22 @@ File explorers struggle with large, nested image collections. This app improves 
 ## Roadmap and Milestones
 
 - [ ] **Milestone 1** – Basic Folder Viewer  
-  Minimal grid, recursive scanning
+       Minimal grid, recursive scanning
 
 - [ ] **Milestone 2** – Database and Thumbnails  
-  SQLite and thumbnail caching
+       SQLite and thumbnail caching
 
 - [ ] **Milestone 3** – Masonry UI, Slideshow, Search Bar, and Manual Tagging  
-  Pinterest-style feed, search bar UI (tag search), tagging, slideshow
+       Pinterest-style feed, search bar UI (tag search), tagging, slideshow
 
 - [ ] **Milestone 4** – Similarity Search  
-  CLIP image embeddings → "View Similar Images"
+       CLIP image embeddings → "View Similar Images"
 
 - [ ] **Milestone 5** – Semantic Search  
-  Enhance the existing search bar with CLIP text embeddings
+       Enhance the existing search bar with CLIP text embeddings
 
 - [ ] **Milestone 6** – Reserved for Future Features  
-  (Boards, auto-tagging, video/GIF support, etc.)
+       (Boards, auto-tagging, video/GIF support, etc.)
 
 ---
 
@@ -85,11 +89,13 @@ File explorers struggle with large, nested image collections. This app improves 
 **Goal:** Display images from disk in a basic grid
 
 ### Backend
+
 - [x] Set up Tauri project
 - [x] `scan_folder(path)` (recursive image lookup)
 
 ### Frontend
-- [ ] Simple grid showing full-resolution images
+
+- [x] Simple grid showing full-resolution images
 - [ ] Folder picker or fixed path
 
 **Deliverable:** Basic viewer
@@ -101,12 +107,14 @@ File explorers struggle with large, nested image collections. This app improves 
 **Goal:** Persistent local library with fast thumbnail browsing
 
 ### Backend
-- [ ] SQLite integration
-- [ ] `images` table with metadata
+
+- [x] SQLite integration
+- [x] `images` table with metadata
 - [ ] Thumbnail generation stored in `/thumbs/`
 - [ ] `list_images(offset, limit)`
 
 ### Frontend
+
 - [ ] Render thumbnails
 - [ ] Pagination → infinite scroll preparation
 
@@ -119,13 +127,15 @@ File explorers struggle with large, nested image collections. This app improves 
 **Goal:** Deliver the core UX (browsing, searching, tagging, and viewing)
 
 ### Masonry Grid (Frontend)
-- [ ] Infinite scroll masonry layout
-- [ ] Hover interactions
-- [ ] Click to inspect image
+
+- [x] Infinite scroll masonry layout
+- [x] Hover interactions
+- [x] Click to inspect image
 
 ### Manual Tagging
 
 #### Backend
+
 - [ ] `tags` table
 - [ ] `image_tags` table
 - [ ] Commands:
@@ -135,11 +145,13 @@ File explorers struggle with large, nested image collections. This app improves 
   - `filter_by_tag(name)`
 
 #### Frontend
+
 - [ ] Add/remove tag UI
 - [ ] Tag chips under images
 - [ ] Tag filtering via search bar
 
 ### Search Bar (Phase 1: Tag/Filename Search)
+
 - [ ] Global search input
 - [ ] Filter image results:
   - Tags
@@ -147,6 +159,7 @@ File explorers struggle with large, nested image collections. This app improves 
   - Pack roots (optional)
 
 ### Slideshow Mode
+
 - [ ] Fullscreen slideshow
 - [ ] Timer (N seconds per image)
 - [ ] Next/Previous
@@ -164,14 +177,16 @@ File explorers struggle with large, nested image collections. This app improves 
 **Goal:** "View Similar Images" using CLIP image embeddings
 
 ### Backend
+
 - [ ] Add `embeddings` table
-- [ ] Integrate CLIP image encoder
+- [x] Integrate CLIP image encoder
 - [ ] Generate embeddings on indexing
 - [ ] Normalise vectors
 - [ ] Load into memory on startup
 - [ ] `get_similar(image_id, limit)`
 
 ### Frontend
+
 - [ ] "View Similar" button on image click
 - [ ] Masonry layout for similarity results
 - [ ] Slideshow support
@@ -185,6 +200,7 @@ File explorers struggle with large, nested image collections. This app improves 
 **Goal:** Upgrade the existing search bar to support natural language search
 
 ### Backend
+
 - [ ] Integrate CLIP text encoder
 - [ ] Replace/extend search logic:
   - `search_images(query_text, limit)`
@@ -192,11 +208,13 @@ File explorers struggle with large, nested image collections. This app improves 
 - [ ] Cosine similarity ranking
 
 ### Frontend
+
 - [ ] Search bar stays the same
 - [ ] Switch result rendering to semantic mode
 - [ ] Tag search and semantic search coexist naturally
 
 **Example Queries:**
+
 - "skull"
 - "female portrait"
 - "forest path"
@@ -211,6 +229,7 @@ File explorers struggle with large, nested image collections. This app improves 
 ## Milestone 6: Reserved for Future Extensions
 
 **Possible expansions:**
+
 - Auto-tagging with CLIP
 - GIF/video embedding (frame sampling)
 - Saved collections and boards
