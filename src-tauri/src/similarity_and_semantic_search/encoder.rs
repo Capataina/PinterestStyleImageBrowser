@@ -1,4 +1,4 @@
-use ort::{session::Session, value::{Tensor, Value}};
+use ort::{execution_providers::CUDAExecutionProvider, session::Session, value::{Tensor, Value}};
 use ndarray;
 use std::{error::Error, path::Path};
 use image::ImageReader;
@@ -9,12 +9,39 @@ pub struct Encoder {
 
 impl Encoder {
     pub fn new(model_path: &Path) -> Result<Self, Box<dyn Error>> {
-        // ort will automatically use CUDA if available, otherwise falls back to CPU
-        // if it doesn't do that, we are going to have a LOT of issues later on but uhhhh
-        let session = Session::builder()?
-            .commit_from_file(model_path)?;
+        println!("=== Initializing Encoder ===");
+        println!("Attempting to enable CUDA...");
         
-        Ok(Encoder { session })
+        // Try to build with CUDA explicitly
+        let builder_result = Session::builder()?
+            .with_execution_providers([
+                CUDAExecutionProvider::default().build()
+            ]);
+        
+        // for some reason, the session says it's initialised with CUDA but the encoding is incredibly slow, to the point
+        // where it's either not using the GPU at all or something is very wrong
+        // so we do a test run here to see if it actually works, if it fails we fall back to CPU
+        // this is a bit hacky but idk how else to do it with the current ort api
+        // and to be fair, it's definitely using the CPU not GPU despite saying it initialised with the GPU so yeah idk
+
+        // wait actually it seems like during debug, the PC uses the CPU even if CUDA is enabled
+        // but in release mode it uses the GPU, so maybe this is just a debug vs release issue?
+        // leaving this fallback in for now just in case though
+        match builder_result {
+            Ok(builder) => {
+                println!("✓ CUDA execution provider accepted");
+                let session = builder.commit_from_file(model_path)?;
+                println!("✓ Session created with CUDA");
+                Ok(Encoder { session })
+            }
+            Err(e) => {
+                println!("✗ CUDA execution provider failed: {}", e);
+                println!("Falling back to CPU...");
+                let session = Session::builder()?
+                    .commit_from_file(model_path)?;
+                Ok(Encoder { session })
+            }
+        }
     }
 
     pub fn inspect_model(&self) {
@@ -212,6 +239,107 @@ mod tests {
             0.0
         } else {
             dot_product / (norm_a * norm_b)
+        }
+    }
+
+    #[test]
+    fn test_check_execution_providers() {
+        println!("=== Checking ONNX Runtime Configuration ===\n");
+        
+        // Check if CUDA libraries are available at runtime
+        println!("Attempting to create a session...");
+        
+        let model_path = std::path::Path::new("models/model.onnx");
+        if !model_path.exists() {
+            println!("Model file not found, skipping test");
+            return;
+        }
+        
+        match Session::builder() {
+            Ok(builder) => {
+                println!("✓ Session builder created successfully");
+                
+                match builder.commit_from_file(model_path) {
+                    Ok(session) => {
+                        println!("✓ Session loaded successfully");
+                        println!("\nSession info:");
+                        println!("  Inputs: {}", session.inputs.len());
+                        println!("  Outputs: {}", session.outputs.len());
+                        
+                        // The session was created, but we can't directly query which EP is being used
+                        // in this version of ort. However, if CUDA is available, it will be used automatically.
+                        println!("\n⚠ Note: This version of ort doesn't expose which execution provider is active.");
+                        println!("If you have CUDA enabled in Cargo.toml and CUDA installed, it should be used automatically.");
+                    }
+                    Err(e) => {
+                        println!("✗ Failed to load session: {}", e);
+                    }
+                }
+            }
+
+            Err(e) => {
+                println!("✗ Failed to create session builder: {}", e);
+            }
+        }
+        
+        println!("\n=== System Checks ===");
+        println!("Run these commands to verify CUDA setup:");
+        println!("  1. Check GPU: nvidia-smi");
+        println!("  2. Check CUDA version: nvcc --version");
+        println!("  3. Check ort features: cargo tree -p ort");
+    }
+
+    #[test]
+    fn test_inference_speed() {
+        use std::time::Instant;
+        
+        let mut encoder = Encoder::new(std::path::Path::new("models/model.onnx")).unwrap();
+        
+        // Use one of your actual test images
+        let test_image = std::path::Path::new("test_images/66bb951dcab9c27a144292c8_WestStudio-LOL-Splash-Vol2-021.jpg");
+        
+        if !test_image.exists() {
+            println!("Test image not found, skipping");
+            return;
+        }
+        
+        println!("=== Inference Speed Test ===\n");
+        
+        // Warm up (first inference is always slower)
+        println!("Warming up...");
+        let _ = encoder.encode(test_image);
+        
+        // Time 5 inferences
+        println!("Running 5 inference tests...\n");
+        let mut times = Vec::new();
+        
+        for i in 1..=5 {
+            let start = Instant::now();
+            let _ = encoder.encode(test_image).unwrap();
+            let elapsed = start.elapsed();
+            times.push(elapsed);
+            println!("  Run {}: {:.3}s ({:.0}ms)", i, elapsed.as_secs_f64(), elapsed.as_millis());
+        }
+        
+        let avg_time = times.iter().map(|t| t.as_secs_f64()).sum::<f64>() / times.len() as f64;
+        
+        println!("\n=== Results ===");
+        println!("Average time: {:.3}s ({:.0}ms)", avg_time, avg_time * 1000.0);
+        
+        println!("\n=== Expected Times ===");
+        println!("CPU:  0.5 - 1.5 seconds (500-1500ms)");
+        println!("GPU:  0.02 - 0.1 seconds (20-100ms)");
+        
+        println!("\n=== Verdict ===");
+        if avg_time > 0.3 {
+            println!("⚠ RUNNING ON CPU - CUDA IS NOT WORKING");
+            println!("  Your time: {:.3}s ({:.0}ms)", avg_time, avg_time * 1000.0);
+        } else if avg_time > 0.1 {
+            println!("⚠ UNCLEAR - Might be CPU or slow GPU");
+            println!("  Your time: {:.3}s ({:.0}ms)", avg_time, avg_time * 1000.0);
+        } else {
+            println!("✓ RUNNING ON GPU - CUDA IS WORKING!");
+            println!("  Your time: {:.3}s ({:.0}ms)", avg_time, avg_time * 1000.0);
         }
     }
     
