@@ -1,14 +1,25 @@
 import { useState } from "react";
-import Masonry from "../components/Masonry";
+import Masonry, { MasonryItemData } from "../components/Masonry";
 import { useImages } from "../queries/useImages";
 import { ImageItem } from "../types";
+import { FullscreenImage } from "../components/FullscreenImage";
+import { AnimatePresence } from "framer-motion";
 
 export default function Home() {
   const [selectedItem, setSelectedItem] = useState<ImageItem | null>(null);
+  const [focusedItem, setFocusedItem] = useState<MasonryItemData | null>(null);
   const { data, isFetching, refetch } = useImages();
 
   return (
     <main className="w-screen h-screen overflow-hidden">
+      <AnimatePresence>
+        {focusedItem && (
+          <FullscreenImage
+            setFocusItem={setFocusedItem}
+            masonryItem={focusedItem}
+          />
+        )}
+      </AnimatePresence>
       <div className="px-48 py-6 w-full h-full overflow-y-auto box-border">
         {data && (
           <Masonry
@@ -19,6 +30,10 @@ export default function Home() {
             selectedItem={selectedItem}
             onItemClick={(item) => {
               setSelectedItem(item);
+            }}
+            focusedItem={focusedItem}
+            onItemFocus={(item) => {
+              setFocusedItem(item);
             }}
           />
         )}
