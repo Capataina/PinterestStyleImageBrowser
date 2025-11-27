@@ -1,0 +1,319 @@
+use ort::{session::Session, value::{Tensor, Value}};
+use ndarray;
+use std::path::Path;
+use image::ImageReader;
+
+pub struct Encoder {
+    session: Session,
+}
+
+impl Encoder {
+    pub fn new(model_path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        // Make sure you've called `ort::init().commit()?` once in main before any sessions
+        // I don't know why this is important but its from the docs so here we are
+        let session = Session::builder()?.commit_from_file(model_path)?;
+        Ok(Encoder { session })
+    }
+
+    pub fn inspect_model(&self) {
+        println!("Model inputs:");
+        for input in self.session.inputs.iter() {
+            println!("  Name: {:?}", input.name);
+        }
+        
+        println!("\nModel outputs:");
+        for output in self.session.outputs.iter() {
+            println!("  Name: {:?}", output.name);
+        }
+    }
+    
+    pub fn preprocess_image(
+        &self,
+        image_path: &Path,
+    ) -> Result<ndarray::Array4<f32>, Box<dyn std::error::Error>> {
+        let img = ImageReader::open(image_path)?
+            .decode()?
+            .resize_exact(224, 224, image::imageops::FilterType::Nearest)
+            .to_rgb8();
+
+        let mut input_tensor: Vec<f32> = Vec::with_capacity((224 * 224 * 3) as usize);
+
+        // Change layout from RGBRGB... to RRR...GGG...BBB...
+        // for some reason ONNX wants it like this
+        let mut r = Vec::with_capacity((224 * 224) as usize);
+        let mut g = Vec::with_capacity((224 * 224) as usize);
+        let mut b = Vec::with_capacity((224 * 224) as usize);
+        
+        for pixel in img.pixels() {
+            r.push(pixel[0] as f32 / 255.0);
+            g.push(pixel[1] as f32 / 255.0);
+            b.push(pixel[2] as f32 / 255.0);
+        }
+
+        input_tensor.extend(r);
+        input_tensor.extend(g);
+        input_tensor.extend(b);
+
+        // CLIP-style normalization, we use IMGNET stats here
+        let mean = [0.485, 0.456, 0.406];
+        let std = [0.229, 0.224, 0.225];
+
+        for c in 0..3 {
+            for i in 0..(224 * 224) {
+                let idx = c * 224 * 224 + i;
+                input_tensor[idx] = (input_tensor[idx] - mean[c]) / std[c];
+            }
+        }
+
+        // we create a 4d array using ndarray bc otherwise ort tensor creation is a pain
+        let input_array =
+            ndarray::Array4::from_shape_vec((1, 3, 224, 224), input_tensor)?;
+        Ok(input_array)
+    }
+
+    pub fn encode(&mut self, image_path: &Path) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        let input_array = self.preprocess_image(image_path)?;
+
+        // TODO: Optimize this to avoid copies
+        // this is a temp workaround for now, idk how to fix this but basically, the way Tensor::from_array works
+        // is that it requires ownership of the data vec so we have to extract it from the ndarray first
+        // the wiki shows them using 2 diff methods, one with a pure ndarray and one with a shape and vec
+        // when I tried to use the pure ndarray one it gave lifetime issues so this is the workaround
+        // ideally we would just be able to pass the ndarray directly but idk how to do that yet
+        let shape = [1usize, 3, 224, 224];
+        let (data, _offset) = input_array.into_raw_vec_and_offset();
+
+        // use the shape and data to create the tensor
+        let onnx_input: Tensor<f32> = Tensor::from_array((shape, data))?;
+
+        // Create dummy inputs for the text branch to prevent ONNX crashes,
+        // honestly annoying as hell and will most likely break something later on but we can always refactor right hahah ha 
+        // TODO: Fix this when it breaks in the future...
+        // The model expects these to exist even if we are only doing image encoding
+        let text_shape = [1usize, 1]; 
+        let dummy_text_data = vec![0i64; 1]; // Batch size 1, sequence length 1, value 0
+        
+        // We clone dummy_text_data for the first one because Tensor takes ownership
+        let input_ids: Tensor<i64> = Tensor::from_array((text_shape, dummy_text_data.clone()))?;
+        let attention_mask: Tensor<i64> = Tensor::from_array((text_shape, dummy_text_data))?;
+        // --------------------------------------------------------------------------
+
+        // Use hardcoded input/output names since we know them from inspection
+        // do not change these unless your model uses different names
+        // so probs never
+        let input_name = "pixel_values";
+        let output_name = "image_embeds";
+
+        // Now run the model (mutable borrow happens here)
+        // Updated to include the text branch inputs required by the graph
+        let outputs = self
+            .session
+            .run(ort::inputs![
+                input_name => onnx_input,
+                "input_ids" => input_ids,
+                "attention_mask" => attention_mask
+            ])?;
+
+        // Extract from outputs using the name we got earlier
+        let dyn_tensor: &Value<_> = &outputs[output_name];
+
+        // this is an absolute pain to fix
+        // it always keeps breaking because if we get a tuple from the tensor
+        // tuples do not have view, as slice or any of the other methods for us to turn them into a vec soooooo
+        // we use try_extract_tensor which gives us both the shape and a view we can turn into a vec
+        let (_out_shape, data_view) = dyn_tensor.try_extract_tensor::<f32>()?;
+        let embedding = data_view.to_vec();
+
+        Ok(embedding)
+    }
+
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    // Helper function to calculate cosine similarity between two embeddings
+    fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len(), "Embeddings must be same length");
+        
+        let dot_product: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+        let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+        
+        if norm_a == 0.0 || norm_b == 0.0 {
+            0.0
+        } else {
+            dot_product / (norm_a * norm_b)
+        }
+    }
+    
+    #[test]
+    fn test_preprocess_image() {
+        let encoder = Encoder::new(Path::new("models/model.onnx")).unwrap();
+        
+        let result = encoder
+            .preprocess_image(Path::new(
+                "C:\\image-browser\\src-tauri\\test_images\\66bb951dcab9c27a144292c8_WestStudio-LOL-Splash-Vol2-021.jpg",
+            ))
+            .unwrap();
+        
+        // Check shape
+        assert_eq!(result.shape(), &[1, 3, 224, 224]);
+        
+        // Check that values are in a reasonable range after normalization
+        let min = result.iter().cloned().fold(f32::INFINITY, f32::min);
+        let max = result.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        
+        // After normalization, values should roughly be in [-3, 3]
+        assert!(min > -5.0);
+        assert!(max < 5.0);
+        
+        println!("Preprocessing - Min: {}, Max: {}", min, max);
+    }
+    
+    #[test]
+    fn test_inspect_model() {
+        let encoder = Encoder::new(Path::new("models/model.onnx")).unwrap();
+        encoder.inspect_model();
+    }
+    
+    #[test]
+    fn test_encode_basic() {
+        let mut encoder = Encoder::new(Path::new("models/model.onnx")).unwrap();
+        
+        let embedding = encoder
+            .encode(Path::new("C:\\image-browser\\src-tauri\\test_images\\66bb951dcab9c27a144292c8_WestStudio-LOL-Splash-Vol2-021.jpg"))
+            .unwrap();
+        
+        // CLIP ViT-B/32 produces 512-dimensional embeddings
+        assert_eq!(embedding.len(), 512, "Embedding should be 512-dimensional");
+        
+        // Check that embedding values are finite
+        for val in &embedding {
+            assert!(val.is_finite(), "All embedding values should be finite");
+        }
+        
+        // Check that embedding is not all zeros
+        let sum: f32 = embedding.iter().sum();
+        assert!(sum.abs() > 0.001, "Embedding should not be all zeros");
+        
+        // Calculate L2 norm
+        let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+        println!("Embedding L2 norm: {}", norm);
+        
+        // CLIP embeddings are usually normalized, so norm should be close to 1
+        assert!(norm > 0.9 && norm < 1.1, "Embedding should be approximately normalized");
+    }
+    
+    #[test]
+    fn test_encode_consistency() {
+        let mut encoder = Encoder::new(Path::new("models/model.onnx")).unwrap();
+        
+        let image_path = Path::new("C:\\image-browser\\src-tauri\\test_images\\66bb951dcab9c27a144292c8_WestStudio-LOL-Splash-Vol2-021.jpg");
+        
+        // Encode the same image twice
+        let embedding1 = encoder.encode(image_path).unwrap();
+        let embedding2 = encoder.encode(image_path).unwrap();
+        
+        // They should be identical (or extremely close due to floating point)
+        for (v1, v2) in embedding1.iter().zip(embedding2.iter()) {
+            let diff = (v1 - v2).abs();
+            assert!(diff < 1e-6, "Same image should produce identical embeddings");
+        }
+        
+        println!("Consistency test passed: same image produces identical embeddings");
+    }
+    
+    #[test]
+    fn test_encode_multiple_images() {
+        let mut encoder = Encoder::new(Path::new("models/model.onnx")).unwrap();
+        
+        // You'll need at least 2-3 test images for this
+        let image_paths = vec![
+            "test_images/image1.jpg",
+            "C:\\image-browser\\src-tauri\\test_images\\66bb951dcab9c27a144292c8_WestStudio-LOL-Splash-Vol2-021.jpg",
+            "C:\\image-browser\\src-tauri\\test_images\\joaquin-castro-uribe-1653436027503.jpg",
+            "C:\\image-browser\\src-tauri\\test_images\\main-qimg-281979616ac1176d214c72ef38c73478-lq.jpeg",
+        ];
+        
+        let mut embeddings = Vec::new();
+        
+        for path in &image_paths {
+            match encoder.encode(Path::new(path)) {
+                Ok(emb) => {
+                    assert_eq!(emb.len(), 512);
+                    embeddings.push(emb);
+                    println!("Successfully encoded: {}", path);
+                }
+                Err(e) => {
+                    println!("Warning: Could not encode {}: {}", path, e);
+                }
+            }
+        }
+        
+        // Verify we encoded at least some images
+        assert!(!embeddings.is_empty(), "Should successfully encode at least one image");
+        
+        // All embeddings should have same dimensions
+        for emb in &embeddings {
+            assert_eq!(emb.len(), 512);
+        }
+    }
+    
+    #[test]
+    fn test_similarity_same_vs_different() {
+        let mut encoder = Encoder::new(Path::new("models/model.onnx")).unwrap();
+        
+        // You need at least 2 different images for this test
+        let image1_path = Path::new("C:\\image-browser\\src-tauri\\test_images\\66bb951dcab9c27a144292c8_WestStudio-LOL-Splash-Vol2-021.jpg");
+        let image2_path = Path::new("C:\\image-browser\\src-tauri\\test_images\\joaquin-castro-uribe-1653436027503.jpg");
+        
+        let emb1_first = encoder.encode(image1_path).unwrap();
+        let emb1_second = encoder.encode(image1_path).unwrap();
+        let emb2 = encoder.encode(image2_path).unwrap();
+        
+        // Similarity between same image should be ~1.0
+        let same_similarity = cosine_similarity(&emb1_first, &emb1_second);
+        println!("Same image similarity: {}", same_similarity);
+        assert!(same_similarity > 0.999, "Same image should have similarity ~1.0");
+        
+        // Similarity between different images should be less than 1.0
+        let diff_similarity = cosine_similarity(&emb1_first, &emb2);
+        println!("Different images similarity: {}", diff_similarity);
+        assert!(diff_similarity < 0.999, "Different images should have similarity < 1.0");
+    }
+    
+    #[test]
+    fn test_encode_invalid_path() {
+        let mut encoder = Encoder::new(Path::new("models/model.onnx")).unwrap();
+        
+        let result = encoder.encode(Path::new("nonexistent_image.jpg"));
+        
+        assert!(result.is_err(), "Should return error for nonexistent image");
+        println!("Correctly handled invalid path: {:?}", result.err());
+    }
+    
+    #[test]
+    fn test_embedding_value_ranges() {
+        let mut encoder = Encoder::new(Path::new("models/model.onnx")).unwrap();
+        
+        let embedding = encoder
+            .encode(Path::new("C:\\image-browser\\src-tauri\\test_images\\66bb951dcab9c27a144292c8_WestStudio-LOL-Splash-Vol2-021.jpg"))
+            .unwrap();
+        
+        // Calculate statistics
+        let min = embedding.iter().cloned().fold(f32::INFINITY, f32::min);
+        let max = embedding.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mean = embedding.iter().sum::<f32>() / embedding.len() as f32;
+        
+        println!("Embedding statistics:");
+        println!("  Min: {}", min);
+        println!("  Max: {}", max);
+        println!("  Mean: {}", mean);
+        
+        // CLIP embeddings typically have reasonable value ranges
+        assert!(min > -5.0 && min < 5.0, "Min value should be reasonable");
+        assert!(max > -5.0 && max < 5.0, "Max value should be reasonable");
+    }
+}
