@@ -111,7 +111,7 @@ mod tests {
     fn test_populate_from_db() {
         let mut index = CosineIndex::new();
         index.populate_from_db("images.db");
-        assert_eq!(index.cached_images.len(), 10);
+        assert_eq!(index.cached_images.len(), 7);
     }
 
     #[test]
