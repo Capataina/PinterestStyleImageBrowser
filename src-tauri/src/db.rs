@@ -157,9 +157,20 @@ impl ImageDatabase {
         let conn = self.connection.lock().unwrap();
         let mut stmt = conn.prepare("SELECT embedding FROM images WHERE id = ?1")?;
         let mut rows = stmt.query([image_id])?;
-        let row = rows.next()?;
-        let embedding: Vec<f32> = row.get("embedding")?;
-        Ok(embedding)
+        if let Some(row) = rows.next()? {
+            let embedding_bytes: Vec<u8> = row.get("embedding")?;
+            // Convert bytes back to Vec<f32>
+            let embedding: Vec<f32> = unsafe {
+                std::slice::from_raw_parts(
+                    embedding_bytes.as_ptr() as *const f32,
+                    embedding_bytes.len() / std::mem::size_of::<f32>(),
+                )
+                .to_vec()
+            };
+            Ok(embedding)
+        } else {
+            Err(rusqlite::Error::QueryReturnedNoRows)
+        }
     }
 }
 
