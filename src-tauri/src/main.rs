@@ -2,6 +2,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use image_browser_lib::{db::ImageDatabase, *};
+use similarity_and_semantic_search::encoder;
+use std::path::Path;
 
 fn index_directory(path: &std::path::Path, db: &mut ImageDatabase) {
     let scanner = filesystem::ImageScanner::new();
@@ -26,5 +28,10 @@ fn main() {
     database.initialize().expect("failed to create tables");
 
     index_directory(test_path, &mut database);
+
+    let mut encoder = encoder::Encoder::new(Path::new("models/model.onnx")).unwrap();
+    encoder
+        .encode_all_images_in_database(32, &mut database)
+        .unwrap();
     image_browser_lib::run(database)
 }
