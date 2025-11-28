@@ -21,7 +21,8 @@ impl ImageDatabase {
             "
             CREATE TABLE IF NOT EXISTS images (
                 id INTEGER PRIMARY KEY,
-                path TEXT NOT NULL UNIQUE
+                path TEXT NOT NULL UNIQUE,
+                embedding BLOB
             );",
             [],
         )?;
@@ -129,6 +130,36 @@ impl ImageDatabase {
             .collect();
 
         Ok(images)
+    }
+
+    // update the embedding of an image
+    pub fn update_image_embedding(
+        &mut self,
+        image_id: ID,
+        embedding: Vec<f32>,
+    ) -> rusqlite::Result<()> {
+        // Convert Vec<f32> to bytes for BLOB storage
+        let embedding_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                embedding.as_ptr() as *const u8,
+                embedding.len() * std::mem::size_of::<f32>(),
+            )
+        };
+        self.connection.lock().unwrap().execute(
+            "UPDATE images SET embedding = ?1 WHERE id = ?2",
+            rusqlite::params![embedding_bytes, image_id],
+        )?;
+        Ok(())
+    }
+
+    // function to get the embedding of an image
+    pub fn get_image_embedding(&self, image_id: ID) -> rusqlite::Result<Vec<f32>> {
+        let conn = self.connection.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT embedding FROM images WHERE id = ?1")?;
+        let mut rows = stmt.query([image_id])?;
+        let row = rows.next()?;
+        let embedding: Vec<f32> = row.get("embedding")?;
+        Ok(embedding)
     }
 }
 

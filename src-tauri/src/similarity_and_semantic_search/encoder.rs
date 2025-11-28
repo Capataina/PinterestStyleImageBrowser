@@ -7,6 +7,8 @@ use ort::{
 };
 use std::{error::Error, path::Path};
 
+use crate::db;
+
 pub struct Encoder {
     session: Session,
 }
@@ -260,6 +262,33 @@ impl Encoder {
         }
 
         Ok(embeddings)
+    }
+
+    // Encode all images in the database and store the embeddings in the database as blob,
+    // this function will run once every startup after we call it. Its going to take all images from the db,
+    // check which ones have no embedding, encode them and store the embeddings in the database as blob.
+    pub fn encode_all_images_in_database(
+        &mut self,
+        batch_size: usize,
+        db: &mut db::ImageDatabase,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let images = db.get_all_images()?;
+
+        if images.is_empty() {
+            return Ok(());
+        }
+
+        // use batch embedding to speed up the process
+        let batches = images.chunks(batch_size);
+        for batch in batches {
+            let batch_paths: Vec<&Path> =
+                images.iter().map(|image| Path::new(&image.path)).collect();
+            let embeddings = self.encode_batch(&batch_paths)?;
+            for (image, embedding) in batch.iter().zip(embeddings.iter()) {
+                db.update_image_embedding(image.id, embedding.clone())?;
+            }
+        }
+        Ok(())
     }
 }
 
