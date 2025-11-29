@@ -34,6 +34,16 @@ fn add_tag_to_image(
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn remove_tag_from_image(
+    db: State<'_, ImageDatabase>,
+    image_id: i64,
+    tag_id: i64,
+) -> Result<(), String> {
+    db.remove_tag_from_image(image_id, tag_id)
+        .map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run(db: ImageDatabase) {
     tauri::Builder::default()
@@ -43,7 +53,8 @@ pub fn run(db: ImageDatabase) {
             get_all_images,
             get_tags,
             create_tag,
-            add_tag_to_image
+            add_tag_to_image,
+            remove_tag_from_image
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

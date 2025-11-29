@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 export async function fetchTags(): Promise<Tag[]> {
   try {
     const tags: Tag[] = await invoke("get_tags");
-    return tags;
+    return tags.map((t) => ({ ...t }));
   } catch (error) {
     throw new Error(`Failed to fetch tags: ${error}`);
   }

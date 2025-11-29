@@ -1,6 +1,10 @@
 import { useEffect, useState } from "react";
 import Masonry, { MasonryItemData } from "../components/Masonry";
-import { useImages, useAssignTagToImage } from "../queries/useImages";
+import {
+  useImages,
+  useAssignTagToImage,
+  useRemoveTagFromImage,
+} from "../queries/useImages";
 import { ImageItem } from "../types";
 import { FullscreenImage } from "../components/FullscreenImage";
 import { AnimatePresence } from "framer-motion";
@@ -14,6 +18,7 @@ export default function Home() {
   const tags = useTags();
   const createTagMutation = useCreateTag();
   const assignTagMutation = useAssignTagToImage();
+  const removeTagMutation = useRemoveTagFromImage();
 
   const location = useLocation();
   const navigate = useNavigate();
@@ -23,7 +28,8 @@ export default function Home() {
       console.log(location.pathname);
       const item = images.data.find(
         (i) =>
-          i.id === location.pathname.substring(1, location.pathname.length - 1)
+          i.id.toString() ===
+          location.pathname.substring(1, location.pathname.length - 1)
       );
       if (item) {
         setSelectedItem(item);
@@ -71,6 +77,9 @@ export default function Home() {
             }}
             onAssignTag={(imageId, tagId) =>
               assignTagMutation.mutate({ imageId, tagId })
+            }
+            onRemoveTag={(imageId, tagId) =>
+              removeTagMutation.mutate({ imageId, tagId })
             }
           />
         )}

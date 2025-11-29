@@ -12,12 +12,13 @@ interface MasonrySelectedItemProps {
   navigateBack: () => void;
   tags?: Tag[] | null;
   onCreateTag: (name: string, color: string) => Promise<Tag>;
-  onAssignTag: (imageId: string, tagId: string) => void;
+  onAssignTag: (imageId: number, tagId: number) => void;
+  onRemoveTag: (imageId: number, tagId: number) => void;
 }
 
 export function MasonrySelectedFrame(props: MasonrySelectedItemProps) {
   const [comboboxOpen, setComboboxOpen] = useState(false);
-  const [selectedTags, setSelectedTags] = useState<string[]>([]);
+  const [selectedTags, setSelectedTags] = useState<number[]>([]);
 
   useEffect(() => {
     if (props.item) setSelectedTags(props.item.tags.map((t) => t.id));
@@ -50,11 +51,11 @@ export function MasonrySelectedFrame(props: MasonrySelectedItemProps) {
             selected={selectedTags}
             setSelected={setSelectedTags}
             placeholder="Tags"
-            emptyMessage="Create tag"
             instruction="Select tags to add"
             onCreateTag={props.onCreateTag}
             imageId={props.item?.id}
             onAssignTag={props.onAssignTag}
+            onRemoveTag={props.onRemoveTag}
           />
         </div>
       </CardHeader>
