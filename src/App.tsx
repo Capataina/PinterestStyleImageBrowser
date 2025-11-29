@@ -22,8 +22,8 @@ function App() {
           id="measure-root"
           style={{
             position: "absolute",
-            top: 0,
-            left: 0,
+            top: "-100000px",
+            left: "-100000px",
             visibility: "hidden",
             pointerEvents: "none",
             zIndex: -1,
