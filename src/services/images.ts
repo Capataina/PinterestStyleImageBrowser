@@ -10,7 +10,7 @@ export async function fetchImages() {
       imagesDB.map(async (img) => {
         const url = convertFileSrc(img.path);
         const { width, height } = await getImageSize(url);
-        return { ...img, url, width, height, id: img.id.toString() };
+        return { ...img, url, width, height };
       })
     );
 
@@ -21,16 +21,31 @@ export async function fetchImages() {
 }
 
 export async function assignTagToImage(
-  imageId: string,
-  tagId: string
+  imageId: number,
+  tagId: number
 ): Promise<void> {
   try {
     await invoke("add_tag_to_image", {
-      imageId: parseInt(imageId),
-      tagId: parseInt(tagId),
+      imageId,
+      tagId,
     });
   } catch (error) {
     console.error(`Failed to assign tag: ${error}`);
     throw new Error(`Failed to assign tag: ${error}`);
+  }
+}
+
+export async function removeTagFromImage(
+  imageId: number,
+  tagId: number
+): Promise<void> {
+  try {
+    await invoke("remove_tag_from_image", {
+      imageId,
+      tagId,
+    });
+  } catch (error) {
+    console.error(`Failed to remove tag: ${error}`);
+    throw new Error(`Failed to remove tag: ${error}`);
   }
 }

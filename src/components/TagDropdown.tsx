@@ -24,14 +24,14 @@ interface TagDropdownProps {
   tags?: Tag[] | null;
   open: boolean;
   setOpen: (open: boolean) => void;
-  selected: string[];
-  setSelected: (vals: string[]) => void;
+  selected: number[];
+  setSelected: (vals: number[]) => void;
   placeholder: string;
-  emptyMessage: string;
   instruction: string;
   onCreateTag: (name: string, color: string) => Promise<Tag>;
-  imageId?: string;
-  onAssignTag: (imageId: string, tagId: string) => void;
+  imageId?: number;
+  onAssignTag: (imageId: number, tagId: number) => void;
+  onRemoveTag: (imageId: number, tagId: number) => void;
 }
 
 export function TagDropdown(props: TagDropdownProps) {
@@ -88,11 +88,14 @@ export function TagDropdown(props: TagDropdownProps) {
                       key={tag.id}
                       value={tag.id.toString()}
                       onSelect={(id) => {
+                        const numId = parseInt(id);
                         if (!props.imageId) return;
-                        const wasSelected = props.selected.includes(id);
-                        if (!wasSelected) {
-                          console.log("assigning");
-                          props.onAssignTag(props.imageId, id);
+                        const wasSelected = props.selected.includes(numId);
+                        console.log(props.selected);
+                        if (wasSelected) {
+                          props.onRemoveTag(props.imageId, numId);
+                        } else {
+                          props.onAssignTag(props.imageId, numId);
                         }
                         setInput("");
                       }}
