@@ -24,7 +24,7 @@ export function useCreateTag() {
 
       queryClient.setQueryData(["tags"], (old: Tag[] = []) => [
         ...old,
-        { ...newTag, id: "temp", optimistic: true },
+        { ...newTag, id: -1, optimistic: true },
       ]);
 
       return { prevTags };
@@ -34,6 +34,12 @@ export function useCreateTag() {
       if (context?.prevTags) {
         queryClient.setQueryData(["tags"], context.prevTags);
       }
+    },
+
+    onSuccess: (newTag) => {
+      queryClient.setQueryData<Tag[]>(["tags"], (old = []) =>
+        old.map((tag) => (tag.id === -1 ? newTag : tag))
+      );
     },
   });
 }
