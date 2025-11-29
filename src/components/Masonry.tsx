@@ -23,6 +23,7 @@ interface MasonryProps {
   onItemClick: (item: ImageItem) => void;
   focusedItem: MasonryItemData | null;
   onItemFocus: (item: MasonryItemData) => void;
+  navigateBack: () => void;
 }
 
 export default function Masonry(props: MasonryProps) {
@@ -50,7 +51,10 @@ export default function Masonry(props: MasonryProps) {
       const selectedFrameWidth =
         columnWidth * selectionCols + props.columnGap * (selectionCols - 1);
       const { height: selectedFrameHeight } = await locate(
-        <MasonrySelectedFrame item={props.selectedItem} />,
+        <MasonrySelectedFrame
+          item={props.selectedItem}
+          navigateBack={props.navigateBack}
+        />,
         selectedFrameWidth
       );
       selectedFrameWidthRef.current = selectedFrameWidth;
@@ -61,7 +65,10 @@ export default function Masonry(props: MasonryProps) {
         y,
         width: imgWidth,
       } = await locate(
-        <MasonrySelectedFrame item={props.selectedItem} />,
+        <MasonrySelectedFrame
+          item={props.selectedItem}
+          navigateBack={props.navigateBack}
+        />,
         selectedFrameWidth,
         "img"
       );
@@ -157,6 +164,7 @@ export default function Masonry(props: MasonryProps) {
         <MasonrySelectedFrame
           height={selectedFrameHeightRef.current}
           item={props.selectedItem}
+          navigateBack={props.navigateBack}
         />
       </MasonryAnchor>
       {items.map((item, index) => (

@@ -2,10 +2,13 @@ import { useState } from "react";
 import { ImageItem } from "../types";
 import { Card, CardContent, CardFooter, CardHeader } from "./ui/card";
 import { Combobox } from "./ui/combobox";
+import { Button } from "./ui/button";
+import { FaChevronLeft } from "react-icons/fa";
 
 interface MasonrySelectedItemProps {
   item: ImageItem | undefined | null;
   height?: number;
+  navigateBack: () => void;
 }
 
 export function MasonrySelectedFrame(props: MasonrySelectedItemProps) {
@@ -23,7 +26,15 @@ export function MasonrySelectedFrame(props: MasonrySelectedItemProps) {
       }}
     >
       <CardHeader>
-        <div className="w-full flex flex-row justify-end">
+        <div className="w-full flex flex-row justify-between">
+          <Button
+            variant="outline"
+            size="icon"
+            className="hover:cursor-pointer"
+            onClick={props.navigateBack}
+          >
+            <FaChevronLeft />
+          </Button>
           <Combobox
             items={[
               {
