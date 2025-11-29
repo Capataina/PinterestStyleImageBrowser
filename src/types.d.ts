@@ -1,7 +1,7 @@
 export type ImageData = {
   path: string;
   name: string;
-  tags: string[];
+  tags: Tag[];
   id: string;
 };
 
@@ -11,5 +11,11 @@ export type ImageItem = {
   width: number;
   height: number;
   name: string;
-  tags: string[];
+  tags: Tag[];
+};
+
+export type Tag = {
+  id: string;
+  name: string;
+  color: string;
 };

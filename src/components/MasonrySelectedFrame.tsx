@@ -1,19 +1,25 @@
-import { useState } from "react";
-import { ImageItem } from "../types";
+import { useEffect, useState } from "react";
+import { ImageItem, Tag } from "../types";
 import { Card, CardContent, CardFooter, CardHeader } from "./ui/card";
-import { Combobox } from "./ui/combobox";
+import { TagDropdown } from "./TagDropdown";
 import { Button } from "./ui/button";
 import { FaChevronLeft } from "react-icons/fa";
+import { Badge } from "./ui/badge";
 
 interface MasonrySelectedItemProps {
-  item: ImageItem | undefined | null;
+  item?: ImageItem | null;
   height?: number;
   navigateBack: () => void;
+  tags?: Tag[] | null;
 }
 
 export function MasonrySelectedFrame(props: MasonrySelectedItemProps) {
   const [comboboxOpen, setComboboxOpen] = useState(false);
-  const [comboboxValue, setComboboxValue] = useState("");
+  const [selectedTags, setSelectedTags] = useState<string[]>([]);
+
+  useEffect(() => {
+    if (props.item) setSelectedTags(props.item.tags.map((t) => t.id));
+  }, [props.item]);
 
   if (!props.item) return;
 
@@ -35,21 +41,12 @@ export function MasonrySelectedFrame(props: MasonrySelectedItemProps) {
           >
             <FaChevronLeft />
           </Button>
-          <Combobox
-            items={[
-              {
-                value: "test-1",
-                label: "Test 1",
-              },
-              {
-                value: "test-2",
-                label: "Test 2",
-              },
-            ]}
+          <TagDropdown
+            tags={props.tags}
             open={comboboxOpen}
             setOpen={setComboboxOpen}
-            value={comboboxValue}
-            setValue={setComboboxValue}
+            selected={selectedTags}
+            setSelected={setSelectedTags}
             placeholder="Tags"
             emptyMessage="Create tag"
             instruction="Select tags to add"
@@ -63,8 +60,11 @@ export function MasonrySelectedFrame(props: MasonrySelectedItemProps) {
       </CardContent>
       <div className="grow" />
       <CardFooter>
-        <hr />
-        <h1>Test</h1>
+        {props.item.tags.length > 0 ? (
+          props.item.tags.map((tag) => <Badge>{tag.name}</Badge>)
+        ) : (
+          <p>Untaged</p>
+        )}
       </CardFooter>
     </Card>
   );

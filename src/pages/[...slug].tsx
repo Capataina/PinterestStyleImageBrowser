@@ -4,20 +4,22 @@ import { useImages } from "../queries/useImages";
 import { ImageItem } from "../types";
 import { FullscreenImage } from "../components/FullscreenImage";
 import { AnimatePresence } from "framer-motion";
-import { useLocation, useNavigate, useParams } from "react-router";
+import { useLocation, useNavigate } from "react-router";
+import { useTags } from "@/queries/useTags";
 
 export default function Home() {
   const [selectedItem, setSelectedItem] = useState<ImageItem | null>(null);
   const [focusedItem, setFocusedItem] = useState<MasonryItemData | null>(null);
-  const { data, isFetching, refetch } = useImages();
+  const images = useImages();
+  const tags = useTags();
 
   const location = useLocation();
   const navigate = useNavigate();
 
   useEffect(() => {
-    if (data) {
+    if (images.data) {
       console.log(location.pathname);
-      const item = data.find(
+      const item = images.data.find(
         (i) =>
           i.id === location.pathname.substring(1, location.pathname.length - 1)
       );
@@ -27,7 +29,7 @@ export default function Home() {
         setSelectedItem(null);
       }
     }
-  }, [location, data]);
+  }, [location, images.data]);
 
   const navigatgeBack = () => {
     console.log("bruh");
@@ -45,9 +47,10 @@ export default function Home() {
         )}
       </AnimatePresence>
       <div className="px-48 py-6 w-full h-full overflow-y-auto box-border">
-        {data && (
+        {images.data && tags.data && (
           <Masonry
-            items={data}
+            items={images.data}
+            tags={tags.data}
             columnGap={25}
             verticalGap={25}
             minItemWidth={300}
