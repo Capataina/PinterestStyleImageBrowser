@@ -1,17 +1,19 @@
 import { useEffect, useState } from "react";
 import Masonry, { MasonryItemData } from "../components/Masonry";
-import { useImages } from "../queries/useImages";
+import { useImages, useAssignTagToImage } from "../queries/useImages";
 import { ImageItem } from "../types";
 import { FullscreenImage } from "../components/FullscreenImage";
 import { AnimatePresence } from "framer-motion";
 import { useLocation, useNavigate } from "react-router";
-import { useTags } from "@/queries/useTags";
+import { useTags, useCreateTag } from "@/queries/useTags";
 
 export default function Home() {
   const [selectedItem, setSelectedItem] = useState<ImageItem | null>(null);
   const [focusedItem, setFocusedItem] = useState<MasonryItemData | null>(null);
   const images = useImages();
   const tags = useTags();
+  const createTagMutation = useCreateTag();
+  const assignTagMutation = useAssignTagToImage();
 
   const location = useLocation();
   const navigate = useNavigate();
@@ -63,6 +65,13 @@ export default function Home() {
               setFocusedItem(item);
             }}
             navigateBack={navigatgeBack}
+            onCreateTag={async (name, color) => {
+              const tag = await createTagMutation.mutateAsync({ name, color });
+              return tag;
+            }}
+            onAssignTag={(imageId, tagId) =>
+              assignTagMutation.mutate({ imageId, tagId })
+            }
           />
         )}
       </div>
