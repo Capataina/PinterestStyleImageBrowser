@@ -25,6 +25,8 @@ interface MasonryProps {
   focusedItem: MasonryItemData | null;
   onItemFocus: (item: MasonryItemData) => void;
   navigateBack: () => void;
+  onCreateTag: (name: string, color: string) => Promise<Tag>;
+  onAssignTag: (imageId: string, tagId: string) => void;
 }
 
 export default function Masonry(props: MasonryProps) {
@@ -55,6 +57,9 @@ export default function Masonry(props: MasonryProps) {
         <MasonrySelectedFrame
           item={props.selectedItem}
           navigateBack={props.navigateBack}
+          tags={props.tags}
+          onCreateTag={props.onCreateTag}
+          onAssignTag={props.onAssignTag}
         />,
         selectedFrameWidth
       );
@@ -69,6 +74,9 @@ export default function Masonry(props: MasonryProps) {
         <MasonrySelectedFrame
           item={props.selectedItem}
           navigateBack={props.navigateBack}
+          tags={props.tags}
+          onCreateTag={props.onCreateTag}
+          onAssignTag={props.onAssignTag}
         />,
         selectedFrameWidth,
         "img"
@@ -167,6 +175,8 @@ export default function Masonry(props: MasonryProps) {
           item={props.selectedItem}
           navigateBack={props.navigateBack}
           tags={props.tags}
+          onCreateTag={props.onCreateTag}
+          onAssignTag={props.onAssignTag}
         />
       </MasonryAnchor>
       {items.map((item, index) => (

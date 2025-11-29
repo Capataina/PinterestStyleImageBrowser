@@ -29,6 +29,9 @@ interface TagDropdownProps {
   placeholder: string;
   emptyMessage: string;
   instruction: string;
+  onCreateTag: (name: string, color: string) => Promise<Tag>;
+  imageId?: string;
+  onAssignTag: (imageId: string, tagId: string) => void;
 }
 
 export function TagDropdown(props: TagDropdownProps) {
@@ -85,11 +88,11 @@ export function TagDropdown(props: TagDropdownProps) {
                       key={tag.id}
                       value={tag.id}
                       onSelect={(id) => {
-                        props.setSelected(
-                          props.selected.includes(id)
-                            ? props.selected.filter((s) => s !== id)
-                            : [...props.selected, id]
-                        );
+                        if (!props.imageId) return;
+                        const wasSelected = props.selected.includes(id);
+                        if (!wasSelected) {
+                          props.onAssignTag(props.imageId, id);
+                        }
                         setInput("");
                       }}
                     >
@@ -107,8 +110,11 @@ export function TagDropdown(props: TagDropdownProps) {
                 ) : (
                   <CommandItem
                     value={input.trimEnd()}
-                    onSelect={(val) => {
-                      console.log(val);
+                    onSelect={async (val) => {
+                      const newTag = await props.onCreateTag(val, "#3B82F6");
+                      if (props.imageId && newTag) {
+                        props.onAssignTag(props.imageId, newTag.id);
+                      }
                       setInput("");
                     }}
                     className="text-center p-4"

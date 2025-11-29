@@ -11,6 +11,8 @@ interface MasonrySelectedItemProps {
   height?: number;
   navigateBack: () => void;
   tags?: Tag[] | null;
+  onCreateTag: (name: string, color: string) => Promise<Tag>;
+  onAssignTag: (imageId: string, tagId: string) => void;
 }
 
 export function MasonrySelectedFrame(props: MasonrySelectedItemProps) {
@@ -50,6 +52,9 @@ export function MasonrySelectedFrame(props: MasonrySelectedItemProps) {
             placeholder="Tags"
             emptyMessage="Create tag"
             instruction="Select tags to add"
+            onCreateTag={props.onCreateTag}
+            imageId={props.item?.id}
+            onAssignTag={props.onAssignTag}
           />
         </div>
       </CardHeader>

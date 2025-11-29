@@ -24,6 +24,16 @@ fn create_tag(db: State<'_, ImageDatabase>, name: String, color: String) -> Resu
     return db.create_tag(name, color).map_err(|e| e.to_string());
 }
 
+#[tauri::command]
+fn add_tag_to_image(
+    db: State<'_, ImageDatabase>,
+    image_id: i64,
+    tag_id: i64,
+) -> Result<(), String> {
+    db.add_tag_to_image(image_id, tag_id)
+        .map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run(db: ImageDatabase) {
     tauri::Builder::default()
@@ -32,7 +42,8 @@ pub fn run(db: ImageDatabase) {
         .invoke_handler(tauri::generate_handler![
             get_all_images,
             get_tags,
-            create_tag
+            create_tag,
+            add_tag_to_image
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
