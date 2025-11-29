@@ -1,5 +1,7 @@
 use std::{collections::HashMap, sync::Mutex};
 
+use rusqlite::fallible_iterator::FallibleIterator;
+
 use crate::{image_struct::ImageData, tag_struct::Tag};
 
 pub struct ImageDatabase {
@@ -53,7 +55,7 @@ impl ImageDatabase {
         default_path
     }
 
-    pub fn add_image(&mut self, path: String) -> rusqlite::Result<()> {
+    pub fn add_image(&self, path: String) -> rusqlite::Result<()> {
         self.connection
             .lock()
             .unwrap()
@@ -61,15 +63,16 @@ impl ImageDatabase {
         Ok(())
     }
 
-    pub fn create_tag(&mut self, name: String, color: String) -> rusqlite::Result<()> {
-        self.connection.lock().unwrap().execute(
-            "INSERT OR IGNORE INTO tags (name, color) VALUES (?1, ?2)",
-            [name, color],
+    pub fn create_tag(&self, name: String, color: String) -> rusqlite::Result<Tag> {
+        let conn = self.connection.lock().unwrap();
+        conn.execute(
+            "INSERT INTO tags (name, color) VALUES (?1, ?2)",
+            [name.clone(), color.clone()],
         )?;
-        Ok(())
+        return Ok(Tag::new(conn.last_insert_rowid(), name, color));
     }
 
-    pub fn delete_tag(&mut self, tag_id: ID) -> rusqlite::Result<()> {
+    pub fn delete_tag(&self, tag_id: ID) -> rusqlite::Result<()> {
         self.connection
             .lock()
             .unwrap()
@@ -77,7 +80,7 @@ impl ImageDatabase {
         Ok(())
     }
 
-    pub fn remove_tag_from_image(&mut self, image_id: ID, tag_id: ID) -> rusqlite::Result<()> {
+    pub fn remove_tag_from_image(&self, image_id: ID, tag_id: ID) -> rusqlite::Result<()> {
         self.connection.lock().unwrap().execute(
             "DELETE FROM images_tags WHERE image_id = ?1 AND tag_id = ?2",
             [image_id, tag_id],
@@ -85,12 +88,23 @@ impl ImageDatabase {
         Ok(())
     }
 
-    pub fn add_tag_to_image(&mut self, image_id: ID, tag_id: ID) -> rusqlite::Result<()> {
+    pub fn add_tag_to_image(&self, image_id: ID, tag_id: ID) -> rusqlite::Result<()> {
         self.connection.lock().unwrap().execute(
             "INSERT OR IGNORE INTO images_tags (image_id, tag_id) VALUES (?1, ?2)",
             [image_id, tag_id],
         )?;
         Ok(())
+    }
+
+    pub fn get_tags(&self) -> rusqlite::Result<Vec<Tag>> {
+        let conn = self.connection.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT * FROM tags;")?;
+
+        let rows = stmt.query([])?;
+
+        return rows
+            .map(|r| Ok(Tag::new(r.get("id")?, r.get("name")?, r.get("color")?)))
+            .collect();
     }
 
     pub fn get_all_images(&self) -> rusqlite::Result<Vec<ImageData>> {

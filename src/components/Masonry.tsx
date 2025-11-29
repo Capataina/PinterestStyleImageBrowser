@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ImageItem } from "../types";
+import { ImageItem, Tag } from "../types";
 import { MasonryItem } from "./MasonryItem";
 import debounce from "lodash/debounce";
 import { MasonryAnchor } from "./MasonryAnchor";
@@ -16,6 +16,7 @@ export type MasonryItemData = {
 
 interface MasonryProps {
   items: ImageItem[];
+  tags: Tag[];
   minItemWidth: number;
   columnGap: number;
   verticalGap: number;
@@ -165,6 +166,7 @@ export default function Masonry(props: MasonryProps) {
           height={selectedFrameHeightRef.current}
           item={props.selectedItem}
           navigateBack={props.navigateBack}
+          tags={props.tags}
         />
       </MasonryAnchor>
       {items.map((item, index) => (
