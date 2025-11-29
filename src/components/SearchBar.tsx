@@ -11,10 +11,9 @@ import {
 } from "./ui/command";
 import { Popover, PopoverContent, PopoverAnchor } from "./ui/popover";
 import { Tag } from "@/types";
-import { cn } from "@/lib/utils";
 
 interface SearchBarProps {
-  tags: Tag[];
+  tags?: Tag[];
   onSearchChange: (selectedTags: Tag[], searchText: string) => void;
   placeholder?: string;
   onCreateTag?: (name: string, color: string) => Promise<Tag>;
@@ -47,11 +46,13 @@ export function SearchBar(props: SearchBarProps) {
   // Also exclude tags that are already added
   const selectedTagIds = selectedTags.map((tag) => tag.id);
 
-  const filteredTags = props.tags.filter(
-    (tag) =>
-      tag.name.toLowerCase().includes(suggestionsFilter.toLowerCase()) &&
-      !selectedTagIds.includes(tag.id)
-  );
+  const filteredTags = props.tags
+    ? props.tags.filter(
+        (tag) =>
+          tag.name.toLowerCase().includes(suggestionsFilter.toLowerCase()) &&
+          !selectedTagIds.includes(tag.id)
+      )
+    : [];
 
   // Extract state for parent
   useEffect(() => {

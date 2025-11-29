@@ -1,6 +1,10 @@
 use tauri::State;
 
-use crate::{db::ImageDatabase, image_struct::ImageData, tag_struct::Tag};
+use crate::{
+    db::{ImageDatabase, ID},
+    image_struct::ImageData,
+    tag_struct::Tag,
+};
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 pub mod db;
@@ -10,8 +14,14 @@ pub mod similarity_and_semantic_search;
 pub mod tag_struct;
 
 #[tauri::command]
-fn get_all_images(db: State<'_, ImageDatabase>) -> Result<Vec<ImageData>, String> {
-    return db.get_all_images().map_err(|e| e.to_string());
+fn get_images(
+    db: State<'_, ImageDatabase>,
+    filter_tag_ids: Vec<ID>,
+    filter_string: String,
+) -> Result<Vec<ImageData>, String> {
+    return db
+        .get_images(filter_tag_ids, filter_string)
+        .map_err(|e| e.to_string());
 }
 
 #[tauri::command]
@@ -50,7 +60,7 @@ pub fn run(db: ImageDatabase) {
         .plugin(tauri_plugin_opener::init())
         .manage(db)
         .invoke_handler(tauri::generate_handler![
-            get_all_images,
+            get_images,
             get_tags,
             create_tag,
             add_tag_to_image,

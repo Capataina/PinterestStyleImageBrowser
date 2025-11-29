@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::Mutex};
 
-use rusqlite::fallible_iterator::FallibleIterator;
+use rusqlite::{fallible_iterator::FallibleIterator, params_from_iter};
 
 use crate::{image_struct::ImageData, tag_struct::Tag};
 
@@ -99,7 +99,7 @@ impl ImageDatabase {
 
     pub fn get_tags(&self) -> rusqlite::Result<Vec<Tag>> {
         let conn = self.connection.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT * FROM tags;")?;
+        let mut stmt = conn.prepare("SELECT * FROM tags ORDER BY id;")?;
 
         let rows = stmt.query([])?;
 
@@ -108,17 +108,40 @@ impl ImageDatabase {
             .collect();
     }
 
-    pub fn get_all_images(&self) -> rusqlite::Result<Vec<ImageData>> {
+    pub fn get_images(
+        &self,
+        filter_tag_ids: Vec<ID>,
+        filter_string: String,
+    ) -> rusqlite::Result<Vec<ImageData>> {
         let conn = self.connection.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT images.id AS img_id, images.path AS img_path, 
+
+        let sql = if (filter_tag_ids.len() > 0) {
+            let placeholders = vec!["?"; filter_tag_ids.len()].join(", ");
+            format!(
+                "SELECT images.id AS img_id, images.path AS img_path,
             tags.id AS tag_id, tags.name AS tag_name, tags.color AS tag_color
             FROM images
             LEFT JOIN images_tags ON images.id = images_tags.image_id
-            LEFT JOIN tags ON tags.id = images_tags.tag_id;",
-        )?;
+            LEFT JOIN tags ON tags.id = images_tags.tag_id
+            WHERE EXISTS (
+                SELECT 1
+                FROM images_tags it2
+                WHERE it2.image_id = images.id
+                AND it2.tag_id IN ({})
+            );",
+                placeholders
+            )
+        } else {
+            "SELECT images.id AS img_id, images.path AS img_path,
+            tags.id AS tag_id, tags.name AS tag_name, tags.color AS tag_color
+            FROM images
+            LEFT JOIN images_tags ON images.id = images_tags.image_id
+            LEFT JOIN tags ON tags.id = images_tags.tag_id;"
+                .to_string()
+        };
+        let mut stmt = conn.prepare(&sql)?;
 
-        let mut rows = stmt.query([])?;
+        let mut rows = stmt.query(params_from_iter(filter_tag_ids))?;
         let mut map: HashMap<ID, (String, Vec<Tag>)> = HashMap::new();
 
         // aggregate tags
@@ -160,7 +183,7 @@ mod tests {
         let test_image_path = "/path/to/image.jpg";
         db.add_image(test_image_path.to_owned()).unwrap();
 
-        let images = db.get_all_images().unwrap();
+        let images = db.get_images(vec![], "".to_string()).unwrap();
         assert_eq!(images.len(), 1);
     }
 
@@ -173,7 +196,7 @@ mod tests {
         db.add_image(test_image_path.to_owned()).unwrap();
         db.add_image(test_image_path.to_owned()).unwrap(); // Attempt to add duplicate
 
-        let images = db.get_all_images().unwrap();
+        let images = db.get_images(vec![], "".to_string()).unwrap();
         assert_eq!(images.len(), 1); // Should still be only one image
     }
 
@@ -182,7 +205,7 @@ mod tests {
         let db = ImageDatabase::new(":memory:").unwrap();
         db.initialize().unwrap();
 
-        let images = db.get_all_images().unwrap();
+        let images = db.get_images(vec![], "".to_string()).unwrap();
         assert_eq!(images.len(), 0); // No images should be present
     }
 }

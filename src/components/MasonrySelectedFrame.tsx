@@ -42,6 +42,7 @@ export function MasonrySelectedFrame(props: MasonrySelectedItemProps) {
   const [selectedTags, setSelectedTags] = useState<number[]>([]);
 
   useEffect(() => {
+    console.log(props.item);
     if (props.item) setSelectedTags(props.item.tags.map((t) => t.id));
   }, [props.item]);
 

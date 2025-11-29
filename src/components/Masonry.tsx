@@ -4,7 +4,7 @@ import { MasonryItem } from "./MasonryItem";
 import debounce from "lodash/debounce";
 import { MasonryAnchor } from "./MasonryAnchor";
 import { MasonrySelectedFrame } from "./MasonrySelectedFrame";
-import { useLocate } from "@/hooks/useLocate";
+import { useMeasure } from "@/hooks/useMeasure";
 import { MasonryItemSelected } from "./MasonryItemSelected";
 
 export type MasonryItemData = {
@@ -15,8 +15,8 @@ export type MasonryItemData = {
 };
 
 interface MasonryProps {
-  items: ImageItem[];
-  tags: Tag[];
+  items?: ImageItem[];
+  tags?: Tag[];
   minItemWidth: number;
   columnGap: number;
   verticalGap: number;
@@ -34,13 +34,14 @@ export default function Masonry(props: MasonryProps) {
   const [items, setItems] = useState<MasonryItemData[]>([]);
   const [height, setHeight] = useState(0);
   const containerRef = useRef<HTMLDivElement>(null);
-  const { locate } = useLocate();
+  const { measure: locate } = useMeasure();
 
   const selectedFrameWidthRef = useRef(0);
   const selectedFrameHeightRef = useRef(0);
 
   const refreshLayout = useCallback(async () => {
     if (!containerRef.current) return;
+    if (!props.items) return;
 
     const width = containerRef.current.clientWidth;
     const colCount = Math.floor(width / props.minItemWidth);
@@ -158,11 +159,11 @@ export default function Masonry(props: MasonryProps) {
     refreshLayout();
   }, [props.items, props.selectedItem]);
 
-  const toNextItem = () => {
-    const index = props.items.findIndex(
-      (i) => i.url == props.selectedItem!.url
-    );
-  };
+  // const toNextItem = () => {
+  //   const index = props.items.findIndex(
+  //     (i) => i.url == props.selectedItem!.url
+  //   );
+  // };
 
   return (
     <div ref={containerRef} className="w-full relative" style={{ height }}>

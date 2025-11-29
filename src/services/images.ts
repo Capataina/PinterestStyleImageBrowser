@@ -2,9 +2,15 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { getImageSize } from "../utils";
 import { ImageData } from "../types";
 
-export async function fetchImages() {
+export async function fetchImages(
+  filterTagIds: number[] = [],
+  filterString: string = ""
+) {
   try {
-    const imagesDB: ImageData[] = await invoke("get_all_images");
+    const imagesDB: ImageData[] = await invoke("get_images", {
+      filterTagIds,
+      filterString,
+    });
     console.log(imagesDB);
     const images = await Promise.all(
       imagesDB.map(async (img) => {
