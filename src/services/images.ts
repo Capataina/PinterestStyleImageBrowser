@@ -9,7 +9,7 @@ export async function fetchImages() {
     imagesDB.map(async (img) => {
       const url = convertFileSrc(img.path);
       const { width, height } = await getImageSize(url);
-      return { ...img, url, width, height };
+      return { ...img, url, width, height, id: img.id.toString() };
     })
   );
 
