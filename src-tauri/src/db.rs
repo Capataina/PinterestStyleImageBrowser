@@ -1,5 +1,7 @@
 use std::{collections::HashMap, sync::Mutex};
 
+use rusqlite::{fallible_iterator::FallibleIterator, params_from_iter};
+
 use crate::{image_struct::ImageData, tag_struct::Tag};
 
 pub struct ImageDatabase {
@@ -49,11 +51,11 @@ impl ImageDatabase {
     }
 
     pub fn default_database_path() -> String {
-        let default_path = "./images.db".to_string();
+        let default_path = "../images.db".to_string();
         default_path
     }
 
-    pub fn add_image(&mut self, path: String) -> rusqlite::Result<()> {
+    pub fn add_image(&self, path: String) -> rusqlite::Result<()> {
         self.connection
             .lock()
             .unwrap()
@@ -61,15 +63,16 @@ impl ImageDatabase {
         Ok(())
     }
 
-    pub fn create_tag(&mut self, name: String, color: String) -> rusqlite::Result<()> {
-        self.connection.lock().unwrap().execute(
-            "INSERT OR IGNORE INTO tags (name, color) VALUES (?1, ?2)",
-            [name, color],
+    pub fn create_tag(&self, name: String, color: String) -> rusqlite::Result<Tag> {
+        let conn = self.connection.lock().unwrap();
+        conn.execute(
+            "INSERT INTO tags (name, color) VALUES (?1, ?2)",
+            [name.clone(), color.clone()],
         )?;
-        Ok(())
+        return Ok(Tag::new(conn.last_insert_rowid(), name, color));
     }
 
-    pub fn delete_tag(&mut self, tag_id: ID) -> rusqlite::Result<()> {
+    pub fn delete_tag(&self, tag_id: ID) -> rusqlite::Result<()> {
         self.connection
             .lock()
             .unwrap()
@@ -77,7 +80,7 @@ impl ImageDatabase {
         Ok(())
     }
 
-    pub fn remove_tag_from_image(&mut self, image_id: ID, tag_id: ID) -> rusqlite::Result<()> {
+    pub fn remove_tag_from_image(&self, image_id: ID, tag_id: ID) -> rusqlite::Result<()> {
         self.connection.lock().unwrap().execute(
             "DELETE FROM images_tags WHERE image_id = ?1 AND tag_id = ?2",
             [image_id, tag_id],
@@ -85,25 +88,60 @@ impl ImageDatabase {
         Ok(())
     }
 
-    pub fn add_tag_to_image(&mut self, image_id: ID, tag_id: ID) -> rusqlite::Result<()> {
+    pub fn add_tag_to_image(&self, image_id: ID, tag_id: ID) -> rusqlite::Result<()> {
+        println!("adding to {image_id}, {tag_id}");
         self.connection.lock().unwrap().execute(
-            "INSERT OR IGNORE INTO images_tags (image_id, tag_id) VALUES (?1, ?2)",
+            "INSERT INTO images_tags (image_id, tag_id) VALUES (?1, ?2)",
             [image_id, tag_id],
         )?;
         Ok(())
     }
 
-    pub fn get_all_images(&self) -> rusqlite::Result<Vec<ImageData>> {
+    pub fn get_tags(&self) -> rusqlite::Result<Vec<Tag>> {
         let conn = self.connection.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT images.id AS img_id, images.path AS img_path, 
+        let mut stmt = conn.prepare("SELECT * FROM tags ORDER BY id;")?;
+
+        let rows = stmt.query([])?;
+
+        return rows
+            .map(|r| Ok(Tag::new(r.get("id")?, r.get("name")?, r.get("color")?)))
+            .collect();
+    }
+
+    pub fn get_images(
+        &self,
+        filter_tag_ids: Vec<ID>,
+        filter_string: String,
+    ) -> rusqlite::Result<Vec<ImageData>> {
+        let conn = self.connection.lock().unwrap();
+
+        let sql = if (filter_tag_ids.len() > 0) {
+            let placeholders = vec!["?"; filter_tag_ids.len()].join(", ");
+            format!(
+                "SELECT images.id AS img_id, images.path AS img_path,
             tags.id AS tag_id, tags.name AS tag_name, tags.color AS tag_color
             FROM images
             LEFT JOIN images_tags ON images.id = images_tags.image_id
-            LEFT JOIN tags ON tags.id = images_tags.tag_id;",
-        )?;
+            LEFT JOIN tags ON tags.id = images_tags.tag_id
+            WHERE EXISTS (
+                SELECT 1
+                FROM images_tags it2
+                WHERE it2.image_id = images.id
+                AND it2.tag_id IN ({})
+            );",
+                placeholders
+            )
+        } else {
+            "SELECT images.id AS img_id, images.path AS img_path,
+            tags.id AS tag_id, tags.name AS tag_name, tags.color AS tag_color
+            FROM images
+            LEFT JOIN images_tags ON images.id = images_tags.image_id
+            LEFT JOIN tags ON tags.id = images_tags.tag_id;"
+                .to_string()
+        };
+        let mut stmt = conn.prepare(&sql)?;
 
-        let mut rows = stmt.query([])?;
+        let mut rows = stmt.query(params_from_iter(filter_tag_ids))?;
         let mut map: HashMap<ID, (String, Vec<Tag>)> = HashMap::new();
 
         // aggregate tags
@@ -123,10 +161,11 @@ impl ImageDatabase {
             }
         }
 
-        let images = map
+        let mut images: Vec<ImageData> = map
             .into_iter()
             .map(|(id, (path, tags))| ImageData::new(id, std::path::Path::new(&path), tags))
             .collect();
+        images.sort_by_key(|img| img.id);
 
         Ok(images)
     }
@@ -144,7 +183,7 @@ mod tests {
         let test_image_path = "/path/to/image.jpg";
         db.add_image(test_image_path.to_owned()).unwrap();
 
-        let images = db.get_all_images().unwrap();
+        let images = db.get_images(vec![], "".to_string()).unwrap();
         assert_eq!(images.len(), 1);
     }
 
@@ -157,7 +196,7 @@ mod tests {
         db.add_image(test_image_path.to_owned()).unwrap();
         db.add_image(test_image_path.to_owned()).unwrap(); // Attempt to add duplicate
 
-        let images = db.get_all_images().unwrap();
+        let images = db.get_images(vec![], "".to_string()).unwrap();
         assert_eq!(images.len(), 1); // Should still be only one image
     }
 
@@ -166,7 +205,7 @@ mod tests {
         let db = ImageDatabase::new(":memory:").unwrap();
         db.initialize().unwrap();
 
-        let images = db.get_all_images().unwrap();
+        let images = db.get_images(vec![], "".to_string()).unwrap();
         assert_eq!(images.len(), 0); // No images should be present
     }
 }

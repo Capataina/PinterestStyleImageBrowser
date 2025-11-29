@@ -1,16 +1,50 @@
-import { useState } from "react";
-import { ImageItem } from "../types";
+import { useEffect, useState } from "react";
+import { ImageItem, Tag } from "../types";
 import { Card, CardContent, CardFooter, CardHeader } from "./ui/card";
-import { Combobox } from "./ui/combobox";
+import { TagDropdown } from "./TagDropdown";
+import { Button } from "./ui/button";
+import { FaChevronLeft } from "react-icons/fa";
+import { Badge } from "./ui/badge";
+import { RxCrossCircled } from "react-icons/rx";
+import { AnimatePresence, motion } from "framer-motion";
+
+const container = {
+  hidden: {},
+  show: {
+    transition: {
+      staggerChildren: 0.06,
+    },
+  },
+};
+
+const item = {
+  hidden: { opacity: 0, y: 8 },
+  show: { opacity: 1, y: 0, transition: { duration: 0.18 } },
+  exit: (i: number) => ({
+    opacity: 0,
+    y: 8,
+    transition: { duration: 0.16, delay: i * 0.04 },
+  }),
+};
 
 interface MasonrySelectedItemProps {
-  item: ImageItem | undefined | null;
+  item?: ImageItem | null;
   height?: number;
+  navigateBack: () => void;
+  tags?: Tag[] | null;
+  onCreateTag: (name: string, color: string) => Promise<Tag>;
+  onAssignTag: (imageId: number, tagId: number) => void;
+  onRemoveTag: (imageId: number, tagId: number) => void;
 }
 
 export function MasonrySelectedFrame(props: MasonrySelectedItemProps) {
   const [comboboxOpen, setComboboxOpen] = useState(false);
-  const [comboboxValue, setComboboxValue] = useState("");
+  const [selectedTags, setSelectedTags] = useState<number[]>([]);
+
+  useEffect(() => {
+    console.log(props.item);
+    if (props.item) setSelectedTags(props.item.tags.map((t) => t.id));
+  }, [props.item]);
 
   if (!props.item) return;
 
@@ -23,25 +57,27 @@ export function MasonrySelectedFrame(props: MasonrySelectedItemProps) {
       }}
     >
       <CardHeader>
-        <div className="w-full flex flex-row justify-end">
-          <Combobox
-            items={[
-              {
-                value: "test-1",
-                label: "Test 1",
-              },
-              {
-                value: "test-2",
-                label: "Test 2",
-              },
-            ]}
+        <div className="w-full flex flex-row justify-between">
+          <Button
+            variant="outline"
+            size="icon"
+            className="hover:cursor-pointer"
+            onClick={props.navigateBack}
+          >
+            <FaChevronLeft />
+          </Button>
+          <TagDropdown
+            tags={props.tags}
             open={comboboxOpen}
             setOpen={setComboboxOpen}
-            value={comboboxValue}
-            setValue={setComboboxValue}
+            selected={selectedTags}
+            setSelected={setSelectedTags}
             placeholder="Tags"
-            emptyMessage="Create tag"
             instruction="Select tags to add"
+            onCreateTag={props.onCreateTag}
+            imageId={props.item?.id}
+            onAssignTag={props.onAssignTag}
+            onRemoveTag={props.onRemoveTag}
           />
         </div>
       </CardHeader>
@@ -52,8 +88,37 @@ export function MasonrySelectedFrame(props: MasonrySelectedItemProps) {
       </CardContent>
       <div className="grow" />
       <CardFooter>
-        <hr />
-        <h1>Test</h1>
+        <motion.div
+          variants={container}
+          initial="hidden"
+          animate="show"
+          className="flex flex-row gap-2"
+        >
+          <AnimatePresence mode="popLayout">
+            {props.item.tags.map((tag, i) => (
+              <motion.div
+                key={tag.id}
+                layout
+                variants={item}
+                custom={i}
+                initial="hidden"
+                animate="show"
+                exit="exit"
+                transition={{ layout: { duration: 0.2 } }}
+              >
+                <Badge className="px-3 py-1">
+                  <span className="text-sm">{tag.name}</span>
+                  <div
+                    className="ml-0.5 hover:cursor-pointer"
+                    onClick={() => props.onRemoveTag(props.item!.id, tag.id)}
+                  >
+                    <RxCrossCircled className="size-[15px]!" />
+                  </div>
+                </Badge>
+              </motion.div>
+            ))}
+          </AnimatePresence>
+        </motion.div>
       </CardFooter>
     </Card>
   );
