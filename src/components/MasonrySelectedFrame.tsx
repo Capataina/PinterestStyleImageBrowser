@@ -5,6 +5,27 @@ import { TagDropdown } from "./TagDropdown";
 import { Button } from "./ui/button";
 import { FaChevronLeft } from "react-icons/fa";
 import { Badge } from "./ui/badge";
+import { RxCrossCircled } from "react-icons/rx";
+import { AnimatePresence, motion } from "framer-motion";
+
+const container = {
+  hidden: {},
+  show: {
+    transition: {
+      staggerChildren: 0.06,
+    },
+  },
+};
+
+const item = {
+  hidden: { opacity: 0, y: 8 },
+  show: { opacity: 1, y: 0, transition: { duration: 0.18 } },
+  exit: (i: number) => ({
+    opacity: 0,
+    y: 8,
+    transition: { duration: 0.16, delay: i * 0.04 },
+  }),
+};
 
 interface MasonrySelectedItemProps {
   item?: ImageItem | null;
@@ -66,11 +87,37 @@ export function MasonrySelectedFrame(props: MasonrySelectedItemProps) {
       </CardContent>
       <div className="grow" />
       <CardFooter>
-        {props.item.tags.length > 0 ? (
-          props.item.tags.map((tag) => <Badge>{tag.name}</Badge>)
-        ) : (
-          <p>Untaged</p>
-        )}
+        <motion.div
+          variants={container}
+          initial="hidden"
+          animate="show"
+          className="flex flex-row gap-2"
+        >
+          <AnimatePresence mode="popLayout">
+            {props.item.tags.map((tag, i) => (
+              <motion.div
+                key={tag.id}
+                layout
+                variants={item}
+                custom={i}
+                initial="hidden"
+                animate="show"
+                exit="exit"
+                transition={{ layout: { duration: 0.2 } }}
+              >
+                <Badge className="px-3 py-1">
+                  <span className="text-sm">{tag.name}</span>
+                  <div
+                    className="ml-0.5 hover:cursor-pointer"
+                    onClick={() => props.onRemoveTag(props.item!.id, tag.id)}
+                  >
+                    <RxCrossCircled className="size-[15px]!" />
+                  </div>
+                </Badge>
+              </motion.div>
+            ))}
+          </AnimatePresence>
+        </motion.div>
       </CardFooter>
     </Card>
   );

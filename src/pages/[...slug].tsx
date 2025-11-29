@@ -61,7 +61,7 @@ export default function Home() {
             tags={tags.data}
             columnGap={25}
             verticalGap={25}
-            minItemWidth={300}
+            minItemWidth={250}
             selectedItem={selectedItem}
             onItemClick={(item) => {
               navigate(`/${item.id}/`);
