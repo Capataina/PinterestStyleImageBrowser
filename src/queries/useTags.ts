@@ -35,9 +35,5 @@ export function useCreateTag() {
         queryClient.setQueryData(["tags"], context.prevTags);
       }
     },
-
-    onSettled: () => {
-      queryClient.invalidateQueries({ queryKey: ["tags"] });
-    },
   });
 }

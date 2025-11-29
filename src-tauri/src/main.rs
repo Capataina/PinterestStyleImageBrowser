@@ -8,7 +8,6 @@ fn index_directory(path: &std::path::Path, db: &mut ImageDatabase) {
     match scanner.scan_directory(path) {
         Ok(paths) => {
             for path in paths {
-                println!("Found image: {:?}", path);
                 db.add_image(path).unwrap();
             }
         }

@@ -86,11 +86,12 @@ export function TagDropdown(props: TagDropdownProps) {
                   filtered.map((tag) => (
                     <CommandItem
                       key={tag.id}
-                      value={tag.id}
+                      value={tag.id.toString()}
                       onSelect={(id) => {
                         if (!props.imageId) return;
                         const wasSelected = props.selected.includes(id);
                         if (!wasSelected) {
+                          console.log("assigning");
                           props.onAssignTag(props.imageId, id);
                         }
                         setInput("");

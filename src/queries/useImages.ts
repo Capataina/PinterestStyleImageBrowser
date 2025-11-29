@@ -26,6 +26,8 @@ export function useAssignTagToImage() {
       const tags = queryClient.getQueryData<Tag[]>(["tags"]);
       const tagToAdd = tags?.find((t) => t.id === params.tagId);
 
+      console.log(params.tagId);
+
       // Optimistically update images
       if (tagToAdd) {
         queryClient.setQueryData<ImageItem[]>(["images"], (old = []) =>
@@ -44,10 +46,6 @@ export function useAssignTagToImage() {
       if (context?.prevImages) {
         queryClient.setQueryData(["images"], context.prevImages);
       }
-    },
-
-    onSettled: () => {
-      queryClient.invalidateQueries({ queryKey: ["images"] });
     },
   });
 }
