@@ -6,10 +6,16 @@ import {
   removeTagFromImage,
 } from "../services/images";
 
-export function useImages() {
+export function useImages(filters?: {
+  tagIds?: number[];
+  searchText?: string;
+}) {
+  const tagIds = filters?.tagIds ?? [];
+  const searchText = filters?.searchText ?? "";
+
   return useQuery<ImageItem[]>({
-    queryKey: ["images"],
-    queryFn: fetchImages,
+    queryKey: ["images", tagIds, searchText],
+    queryFn: () => fetchImages(tagIds, searchText),
     enabled: true,
   });
 }
@@ -34,12 +40,14 @@ export function useAssignTagToImage() {
 
       // Optimistically update images
       if (tagToAdd) {
-        queryClient.setQueryData<ImageItem[]>(["images"], (old = []) =>
-          old.map((img) =>
-            img.id === params.imageId
-              ? { ...img, tags: [...img.tags, tagToAdd] }
-              : img
-          )
+        queryClient.setQueriesData<ImageItem[]>(
+          { queryKey: ["images"], exact: false },
+          (old = []) =>
+            old.map((img) =>
+              img.id === params.imageId
+                ? { ...img, tags: [...img.tags, tagToAdd] }
+                : img
+            )
         );
       }
 
@@ -67,12 +75,14 @@ export function useRemoveTagFromImage() {
       const prevImages = queryClient.getQueryData(["images"]);
 
       // Optimistically remove the tag from the image
-      queryClient.setQueryData<ImageItem[]>(["images"], (old = []) =>
-        old.map((img) =>
-          img.id === params.imageId
-            ? { ...img, tags: img.tags.filter((t) => t.id !== params.tagId) }
-            : img
-        )
+      queryClient.setQueriesData<ImageItem[]>(
+        { queryKey: ["images"], exact: false },
+        (old = []) =>
+          old.map((img) =>
+            img.id === params.imageId
+              ? { ...img, tags: img.tags.filter((t) => t.id !== params.tagId) }
+              : img
+          )
       );
 
       return { prevImages };
