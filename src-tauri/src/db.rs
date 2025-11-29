@@ -51,7 +51,7 @@ impl ImageDatabase {
     }
 
     pub fn default_database_path() -> String {
-        let default_path = "./images.db".to_string();
+        let default_path = "../images.db".to_string();
         default_path
     }
 
@@ -89,8 +89,9 @@ impl ImageDatabase {
     }
 
     pub fn add_tag_to_image(&self, image_id: ID, tag_id: ID) -> rusqlite::Result<()> {
+        println!("adding to {image_id}, {tag_id}");
         self.connection.lock().unwrap().execute(
-            "INSERT OR IGNORE INTO images_tags (image_id, tag_id) VALUES (?1, ?2)",
+            "INSERT INTO images_tags (image_id, tag_id) VALUES (?1, ?2)",
             [image_id, tag_id],
         )?;
         Ok(())
@@ -137,10 +138,11 @@ impl ImageDatabase {
             }
         }
 
-        let images = map
+        let mut images: Vec<ImageData> = map
             .into_iter()
             .map(|(id, (path, tags))| ImageData::new(id, std::path::Path::new(&path), tags))
             .collect();
+        images.sort_by_key(|img| img.id);
 
         Ok(images)
     }

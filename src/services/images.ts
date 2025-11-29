@@ -26,10 +26,11 @@ export async function assignTagToImage(
 ): Promise<void> {
   try {
     await invoke("add_tag_to_image", {
-      image_id: parseInt(imageId),
-      tag_id: parseInt(tagId),
+      imageId: parseInt(imageId),
+      tagId: parseInt(tagId),
     });
   } catch (error) {
+    console.error(`Failed to assign tag: ${error}`);
     throw new Error(`Failed to assign tag: ${error}`);
   }
 }

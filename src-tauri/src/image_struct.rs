@@ -13,7 +13,6 @@ pub struct ImageData {
 
 impl ImageData {
     pub fn new(id: ID, path: &Path, tags: Vec<Tag>) -> Self {
-        println!("{}", path.to_str().unwrap());
         let path_str = path
             .canonicalize()
             .unwrap()
