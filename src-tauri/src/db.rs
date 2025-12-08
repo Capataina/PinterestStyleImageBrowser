@@ -23,7 +23,8 @@ impl ImageDatabase {
             "
             CREATE TABLE IF NOT EXISTS images (
                 id INTEGER PRIMARY KEY,
-                path TEXT NOT NULL UNIQUE
+                path TEXT NOT NULL UNIQUE,
+                embedding BLOB
             );",
             [],
         )?;
@@ -168,6 +169,47 @@ impl ImageDatabase {
         images.sort_by_key(|img| img.id);
 
         Ok(images)
+    }
+
+    // update the embedding of an image
+    pub fn update_image_embedding(
+        &mut self,
+        image_id: ID,
+        embedding: Vec<f32>,
+    ) -> rusqlite::Result<()> {
+        // Convert Vec<f32> to bytes for BLOB storage
+        let embedding_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                embedding.as_ptr() as *const u8,
+                embedding.len() * std::mem::size_of::<f32>(),
+            )
+        };
+        self.connection.lock().unwrap().execute(
+            "UPDATE images SET embedding = ?1 WHERE id = ?2",
+            rusqlite::params![embedding_bytes, image_id],
+        )?;
+        Ok(())
+    }
+
+    // function to get the embedding of an image
+    pub fn get_image_embedding(&self, image_id: ID) -> rusqlite::Result<Vec<f32>> {
+        let conn = self.connection.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT embedding FROM images WHERE id = ?1")?;
+        let mut rows = stmt.query([image_id])?;
+        if let Some(row) = rows.next()? {
+            let embedding_bytes: Vec<u8> = row.get("embedding")?;
+            // Convert bytes back to Vec<f32>
+            let embedding: Vec<f32> = unsafe {
+                std::slice::from_raw_parts(
+                    embedding_bytes.as_ptr() as *const f32,
+                    embedding_bytes.len() / std::mem::size_of::<f32>(),
+                )
+                .to_vec()
+            };
+            Ok(embedding)
+        } else {
+            Err(rusqlite::Error::QueryReturnedNoRows)
+        }
     }
 }
 
