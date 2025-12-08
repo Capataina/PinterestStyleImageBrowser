@@ -193,14 +193,6 @@ impl Encoder {
         Ok(embedding)
     }
 
-    // TODO! - we need to use preprocess batch function here instead of the preprocess image function but that will come later because right now this works and i don't want to break it...
-    // also this is not a very efficient way to do it, we should probably use a more efficient way to do it, like using a tensor directly from the ndarray
-
-    // this is a temp workaround for now, idk how to fix this but basically, the way Tensor::from_array works
-    // is that it requires ownership of the data vec so we have to extract it from the ndarray first
-    // the wiki shows them using 2 diff methods, one with a pure ndarray and one with a shape and vec
-    // when I tried to use the pure ndarray one it gave lifetime issues so this is the workaround
-    // ideally we would just be able to pass the ndarray directly but idk how to do that yet
     pub fn encode_batch(
         &mut self,
         image_paths: &[&Path],
@@ -209,59 +201,52 @@ impl Encoder {
             return Ok(Vec::new());
         }
 
-        // Step 1: Preprocess all images
-        let mut preprocessed = Vec::new();
-        for path in image_paths {
-            let input_array = self.preprocess_image(path)?;
-            preprocessed.push(input_array);
+        // Use a reasonable default batch size for preprocessing
+        // This helps manage memory usage for large numbers of images
+        let preprocessing_batch_size = 32;
+
+        // Step 1: Preprocess images in batches using the batch_preprocess_image function
+        let batched_arrays = self.batch_preprocess_image(image_paths, preprocessing_batch_size)?;
+
+        // Step 2: Process each preprocessed batch through the model
+        let mut all_embeddings = Vec::new();
+
+        for batch_array in batched_arrays {
+            let batch_size = batch_array.shape()[0];
+
+            // Step 3: Convert to ONNX tensor
+            let shape = [batch_size, 3, 224, 224];
+            let (data, _offset) = batch_array.into_raw_vec_and_offset();
+            let onnx_input: Tensor<f32> = Tensor::from_array((shape, data))?;
+
+            // Step 4: Create dummy text inputs
+            let text_shape = [batch_size, 1];
+            let dummy_text_data = vec![0i64; batch_size];
+            let input_ids: Tensor<i64> = Tensor::from_array((text_shape, dummy_text_data.clone()))?;
+            let attention_mask: Tensor<i64> = Tensor::from_array((text_shape, dummy_text_data))?;
+
+            // Step 5: Run inference
+            let outputs = self.session.run(ort::inputs![
+                "pixel_values" => onnx_input,
+                "input_ids" => input_ids,
+                "attention_mask" => attention_mask
+            ])?;
+
+            // Step 6: Split output into individual embeddings
+            let dyn_tensor: &Value<_> = &outputs["image_embeds"];
+            let (out_shape, data_view) = dyn_tensor.try_extract_tensor::<f32>()?;
+
+            let data_slice = data_view.to_vec();
+            let embedding_size = out_shape[1] as usize;
+
+            for i in 0..batch_size {
+                let start = i * embedding_size;
+                let end = start + embedding_size;
+                all_embeddings.push(data_slice[start..end].to_vec());
+            }
         }
 
-        // Step 2: Concatenate (not stack!) into single batch tensor
-        let batch_array = ndarray::concatenate(
-            ndarray::Axis(0),
-            &preprocessed.iter().map(|a| a.view()).collect::<Vec<_>>(),
-        )?;
-
-        // Verify the shape is correct
-        assert_eq!(
-            batch_array.shape(),
-            &[image_paths.len(), 3, 224, 224],
-            "Batch array has wrong shape"
-        );
-
-        // Step 3: Convert to ONNX tensor
-        let shape = [image_paths.len(), 3, 224, 224];
-        let (data, _offset) = batch_array.into_raw_vec_and_offset();
-        let onnx_input: Tensor<f32> = Tensor::from_array((shape, data))?;
-
-        // Step 4: Create dummy text inputs
-        let text_shape = [image_paths.len(), 1];
-        let dummy_text_data = vec![0i64; image_paths.len()];
-        let input_ids: Tensor<i64> = Tensor::from_array((text_shape, dummy_text_data.clone()))?;
-        let attention_mask: Tensor<i64> = Tensor::from_array((text_shape, dummy_text_data))?;
-
-        // Step 5: Run inference
-        let outputs = self.session.run(ort::inputs![
-            "pixel_values" => onnx_input,
-            "input_ids" => input_ids,
-            "attention_mask" => attention_mask
-        ])?;
-
-        // Step 6: Split output into individual embeddings
-        let dyn_tensor: &Value<_> = &outputs["image_embeds"];
-        let (out_shape, data_view) = dyn_tensor.try_extract_tensor::<f32>()?;
-
-        let data_slice = data_view.to_vec();
-        let embedding_size = out_shape[1] as usize;
-
-        let mut embeddings = Vec::new();
-        for i in 0..image_paths.len() {
-            let start = i * embedding_size;
-            let end = start + embedding_size;
-            embeddings.push(data_slice[start..end].to_vec());
-        }
-
-        Ok(embeddings)
+        Ok(all_embeddings)
     }
 
     // Encode all images in the database and store the embeddings in the database as blob,
