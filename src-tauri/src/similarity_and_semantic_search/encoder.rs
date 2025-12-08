@@ -7,6 +7,8 @@ use ort::{
 };
 use std::{error::Error, path::Path};
 
+use crate::db;
+
 pub struct Encoder {
     session: Session,
 }
@@ -261,6 +263,33 @@ impl Encoder {
 
         Ok(embeddings)
     }
+
+    // Encode all images in the database and store the embeddings in the database as blob,
+    // this function will run once every startup after we call it. Its going to take all images from the db,
+    // check which ones have no embedding, encode them and store the embeddings in the database as blob.
+    pub fn encode_all_images_in_database(
+        &mut self,
+        batch_size: usize,
+        db: &mut db::ImageDatabase,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let images = db.get_all_images()?;
+
+        if images.is_empty() {
+            return Ok(());
+        }
+
+        // use batch embedding to speed up the process
+        let batches = images.chunks(batch_size);
+        for batch in batches {
+            let batch_paths: Vec<&Path> =
+                images.iter().map(|image| Path::new(&image.path)).collect();
+            let embeddings = self.encode_batch(&batch_paths)?;
+            for (image, embedding) in batch.iter().zip(embeddings.iter()) {
+                db.update_image_embedding(image.id, embedding.clone())?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -416,6 +445,86 @@ mod tests {
         assert!(max < 5.0);
 
         println!("Preprocessing - Min: {}, Max: {}", min, max);
+    }
+
+    // preprocess image speed test for single image vs batch images
+    #[test]
+    fn test_preprocess_image_speed_single_vs_batch() {
+        use std::time::{Duration, Instant};
+
+        let mut encoder = Encoder::new(Path::new("models/model.onnx")).unwrap();
+        let image_paths = vec![
+            Path::new("C:\\image-browser\\src-tauri\\test_images\\66bb951dcab9c27a144292c8_WestStudio-LOL-Splash-Vol2-021.jpg"),
+            Path::new("C:\\image-browser\\src-tauri\\test_images\\613syV-a1sL._AC_UF894,1000_QL80_.jpg"),
+            Path::new("C:\\image-browser\\src-tauri\\test_images\\joaquin-castro-uribe-1653436027503.jpg"),
+            Path::new("C:\\image-browser\\src-tauri\\test_images\\main-qimg-281979616ac1176d214c72ef38c73478-lq.jpeg"),
+        ];
+        let batch_size = 4;
+
+        println!("=== Preprocessing Speed Benchmark: Individual vs Batch ===\n");
+
+        // Test 1: Preprocess images individually
+        println!("Processing 4 images individually...");
+        let mut individual_times = Vec::new();
+        let mut elapsed_total_individual = Duration::from_secs(0);
+
+        for (idx, image_path) in image_paths.iter().enumerate() {
+            let start = Instant::now();
+            let _ = encoder.preprocess_image(image_path).unwrap();
+            let elapsed = start.elapsed();
+            individual_times.push(elapsed);
+            elapsed_total_individual += elapsed;
+            println!(
+                "  Image {} ({}): {:.3}ms",
+                idx + 1,
+                image_path.file_name().unwrap().to_string_lossy(),
+                elapsed.as_secs_f64() * 1000.0
+            );
+        }
+
+        println!(
+            "\nTotal time for individual preprocessing: {:.3}ms ({:.3}s)",
+            elapsed_total_individual.as_secs_f64() * 1000.0,
+            elapsed_total_individual.as_secs_f64()
+        );
+
+        // Test 2: Preprocess images in batch
+        println!("\nProcessing 4 images in batch...");
+        let image_path_refs: Vec<&Path> = image_paths.iter().map(|p| *p).collect();
+        let batch_start = Instant::now();
+        let _ = encoder
+            .batch_preprocess_image(&image_path_refs, batch_size)
+            .unwrap();
+        let batch_elapsed = batch_start.elapsed();
+        println!(
+            "Batch preprocessing time: {:.3}ms ({:.3}s)",
+            batch_elapsed.as_secs_f64() * 1000.0,
+            batch_elapsed.as_secs_f64()
+        );
+
+        // Calculate and display results
+        println!("\n=== Results ===");
+        println!(
+            "Individual (sum): {:.3}ms ({:.3}s)",
+            elapsed_total_individual.as_secs_f64() * 1000.0,
+            elapsed_total_individual.as_secs_f64()
+        );
+        println!(
+            "Batch:          {:.3}ms ({:.3}s)",
+            batch_elapsed.as_secs_f64() * 1000.0,
+            batch_elapsed.as_secs_f64()
+        );
+
+        if batch_elapsed < elapsed_total_individual {
+            let speedup = elapsed_total_individual.as_secs_f64() / batch_elapsed.as_secs_f64();
+            println!("✓ Batch is {:.2}x faster", speedup);
+        } else {
+            let slowdown = batch_elapsed.as_secs_f64() / elapsed_total_individual.as_secs_f64();
+            println!(
+                "⚠ Batch is {:.2}x slower (no speedup from batching)",
+                slowdown
+            );
+        }
     }
 
     // write a test to test the batch preprocess image function
