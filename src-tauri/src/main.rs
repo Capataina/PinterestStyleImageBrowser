@@ -32,5 +32,5 @@ fn main() {
     encoder
         .encode_all_images_in_database(32, &mut database)
         .unwrap();
-    image_browser_lib::run(database)
+    image_browser_lib::run(database, db_path)
 }

@@ -55,3 +55,38 @@ export async function removeTagFromImage(
     throw new Error(`Failed to remove tag: ${error}`);
   }
 }
+
+export async function fetchSimilarImages(
+  imageId: number,
+  topN: number = 8
+) {
+  try {
+    const results: { id: number; path: string; score: number }[] = await invoke(
+      "get_similar_images",
+      {
+        imageId,
+        topN,
+      }
+    );
+
+    const images = await Promise.all(
+      results.map(async (res) => {
+        const url = convertFileSrc(res.path);
+        const { width, height } = await getImageSize(url);
+        return {
+          id: res.id,
+          path: res.path,
+          url,
+          width,
+          height,
+          score: res.score,
+          name: res.path.split(/[\\/]/).pop() ?? res.path,
+        };
+      })
+    );
+
+    return images;
+  } catch (error) {
+    throw new Error(`Failed to fetch similar images: ${error}`);
+  }
+}

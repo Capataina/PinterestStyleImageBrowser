@@ -5,6 +5,7 @@ import {
   useAssignTagToImage,
   useRemoveTagFromImage,
 } from "../queries/useImages";
+import { useSimilarImages } from "../queries/useSimilarImages";
 import { ImageItem, Tag } from "../types";
 import { FullscreenImage } from "../components/FullscreenImage";
 import { AnimatePresence, motion } from "framer-motion";
@@ -25,6 +26,7 @@ export default function Home() {
   const createTagMutation = useCreateTag();
   const assignTagMutation = useAssignTagToImage();
   const removeTagMutation = useRemoveTagFromImage();
+  const similarImages = useSimilarImages(selectedItem?.id, 8);
 
   const location = useLocation();
   const navigate = useNavigate();
@@ -119,6 +121,11 @@ export default function Home() {
             onRemoveTag={(imageId, tagId) =>
               removeTagMutation.mutate({ imageId, tagId })
             }
+            similarItems={similarImages.data}
+            similarLoading={similarImages.isFetching}
+            onSelectSimilar={(id) => {
+              navigate(`/${id}/`);
+            }}
           />
         </>
       </div>

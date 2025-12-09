@@ -266,8 +266,9 @@ impl Encoder {
         // use batch embedding to speed up the process
         let batches = images.chunks(batch_size);
         for batch in batches {
+            // Only encode the images in the current batch (not the whole list).
             let batch_paths: Vec<&Path> =
-                images.iter().map(|image| Path::new(&image.path)).collect();
+                batch.iter().map(|image| Path::new(&image.path)).collect();
             let embeddings = self.encode_batch(&batch_paths)?;
             for (image, embedding) in batch.iter().zip(embeddings.iter()) {
                 db.update_image_embedding(image.id, embedding.clone())?;
