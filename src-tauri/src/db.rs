@@ -171,6 +171,10 @@ impl ImageDatabase {
         Ok(images)
     }
 
+    pub fn get_all_images(&self) -> rusqlite::Result<Vec<ImageData>> {
+        self.get_images(Vec::new(), "".to_string())
+    }
+
     // update the embedding of an image
     pub fn update_image_embedding(
         &mut self,
@@ -207,6 +211,17 @@ impl ImageDatabase {
                 .to_vec()
             };
             Ok(embedding)
+        } else {
+            Err(rusqlite::Error::QueryReturnedNoRows)
+        }
+    }
+
+    pub fn get_image_id_by_path(&self, path: &str) -> rusqlite::Result<ID> {
+        let conn = self.connection.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id FROM images WHERE path = ?1 LIMIT 1")?;
+        let mut rows = stmt.query([path])?;
+        if let Some(row) = rows.next()? {
+            Ok(row.get("id")?)
         } else {
             Err(rusqlite::Error::QueryReturnedNoRows)
         }

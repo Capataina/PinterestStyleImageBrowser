@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ImageItem, Tag } from "../types";
+import { ImageItem, SimilarImageItem, Tag } from "../types";
 import { MasonryItem } from "./MasonryItem";
 import debounce from "lodash/debounce";
 import { MasonryAnchor } from "./MasonryAnchor";
@@ -28,6 +28,9 @@ interface MasonryProps {
   onCreateTag: (name: string, color: string) => Promise<Tag>;
   onAssignTag: (imageId: number, tagId: number) => void;
   onRemoveTag: (imageId: number, tagId: number) => void;
+  similarItems?: SimilarImageItem[];
+  similarLoading?: boolean;
+  onSelectSimilar?: (id: number) => void;
 }
 
 export default function Masonry(props: MasonryProps) {
@@ -182,6 +185,9 @@ export default function Masonry(props: MasonryProps) {
           onCreateTag={props.onCreateTag}
           onAssignTag={props.onAssignTag}
           onRemoveTag={props.onRemoveTag}
+          similarItems={props.similarItems}
+          similarLoading={props.similarLoading}
+          onSelectSimilar={props.onSelectSimilar}
         />
       </MasonryAnchor>
       {items.map((item, index) => (

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { ImageItem, Tag } from "../types";
+import { ImageItem, SimilarImageItem, Tag } from "../types";
 import { Card, CardContent, CardFooter, CardHeader } from "./ui/card";
 import { TagDropdown } from "./TagDropdown";
 import { Button } from "./ui/button";
@@ -35,6 +35,9 @@ interface MasonrySelectedItemProps {
   onCreateTag: (name: string, color: string) => Promise<Tag>;
   onAssignTag: (imageId: number, tagId: number) => void;
   onRemoveTag: (imageId: number, tagId: number) => void;
+  similarItems?: SimilarImageItem[];
+  similarLoading?: boolean;
+  onSelectSimilar?: (id: number) => void;
 }
 
 export function MasonrySelectedFrame(props: MasonrySelectedItemProps) {
@@ -86,6 +89,40 @@ export function MasonrySelectedFrame(props: MasonrySelectedItemProps) {
           <img id="img" className="w-full invisible" src={props.item.url} />
         </div>
       </CardContent>
+      <div className="px-6 pb-4">
+        <div className="flex items-center justify-between mb-3">
+          <span className="text-sm font-medium text-muted-foreground">
+            Similar images
+          </span>
+          {props.similarLoading && (
+            <span className="text-xs text-muted-foreground">Loading...</span>
+          )}
+        </div>
+        <div className="grid grid-cols-4 gap-2">
+          {props.similarItems?.map((sim) => (
+            <button
+              key={sim.id}
+              className="relative rounded-lg overflow-hidden border border-transparent hover:border-primary/40 transition-colors"
+              onClick={() => props.onSelectSimilar?.(sim.id)}
+              title={sim.name}
+            >
+              <img
+                src={sim.url}
+                className="w-full h-full object-cover"
+                loading="lazy"
+              />
+              <div className="absolute bottom-0 left-0 right-0 bg-black/40 text-white text-[10px] px-1 py-[2px] text-right">
+                {sim.score.toFixed(2)}
+              </div>
+            </button>
+          ))}
+          {!props.similarLoading && !props.similarItems?.length && (
+            <span className="text-xs text-muted-foreground col-span-4">
+              No similar images found.
+            </span>
+          )}
+        </div>
+      </div>
       <div className="grow" />
       <CardFooter>
         <motion.div
