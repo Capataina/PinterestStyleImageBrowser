@@ -255,17 +255,34 @@ impl Encoder {
     pub fn encode_all_images_in_database(
         &mut self,
         batch_size: usize,
-        db: &mut db::ImageDatabase,
+        db: &db::ImageDatabase,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let images = db.get_all_images()?;
+        // Only get images that don't have embeddings yet
+        let images = db.get_images_without_embeddings()?;
 
         if images.is_empty() {
+            println!("All images already have embeddings, skipping encoding.");
             return Ok(());
         }
 
+        println!(
+            "Found {} images without embeddings, encoding...",
+            images.len()
+        );
+
         // use batch embedding to speed up the process
-        let batches = images.chunks(batch_size);
-        for batch in batches {
+        let total_images = images.len();
+        let batches: Vec<_> = images.chunks(batch_size).collect();
+        let total_batches = batches.len();
+
+        for (batch_idx, batch) in batches.iter().enumerate() {
+            println!(
+                "Encoding batch {}/{} ({} images)...",
+                batch_idx + 1,
+                total_batches,
+                batch.len()
+            );
+
             // Only encode the images in the current batch (not the whole list).
             let batch_paths: Vec<&Path> =
                 batch.iter().map(|image| Path::new(&image.path)).collect();
@@ -274,6 +291,8 @@ impl Encoder {
                 db.update_image_embedding(image.id, embedding.clone())?;
             }
         }
+
+        println!("Successfully encoded {} images.", total_images);
         Ok(())
     }
 }

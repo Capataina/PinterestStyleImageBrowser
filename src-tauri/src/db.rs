@@ -112,11 +112,11 @@ impl ImageDatabase {
     pub fn get_images(
         &self,
         filter_tag_ids: Vec<ID>,
-        filter_string: String,
+        _filter_string: String,
     ) -> rusqlite::Result<Vec<ImageData>> {
         let conn = self.connection.lock().unwrap();
 
-        let sql = if (filter_tag_ids.len() > 0) {
+        let sql = if filter_tag_ids.len() > 0 {
             let placeholders = vec!["?"; filter_tag_ids.len()].join(", ");
             format!(
                 "SELECT images.id AS img_id, images.path AS img_path,
@@ -175,12 +175,62 @@ impl ImageDatabase {
         self.get_images(Vec::new(), "".to_string())
     }
 
+    // Get images that don't have embeddings yet
+    pub fn get_images_without_embeddings(&self) -> rusqlite::Result<Vec<ImageData>> {
+        let conn = self.connection.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT images.id AS img_id, images.path AS img_path,
+            tags.id AS tag_id, tags.name AS tag_name, tags.color AS tag_color
+            FROM images
+            LEFT JOIN images_tags ON images.id = images_tags.image_id
+            LEFT JOIN tags ON tags.id = images_tags.tag_id
+            WHERE images.embedding IS NULL;",
+        )?;
+
+        let mut rows = stmt.query([])?;
+        let mut map: HashMap<ID, (String, Vec<Tag>)> = HashMap::new();
+
+        // aggregate tags
+        while let Some(row) = rows.next()? {
+            let img_id: ID = row.get("img_id")?;
+            let img_path: String = row.get("img_path")?;
+            let tag_id_opt: Option<ID> = row.get("tag_id")?;
+
+            let entry = map.entry(img_id).or_insert((img_path, Vec::new()));
+            if let Some(tag_id) = tag_id_opt {
+                let tag = Tag {
+                    id: tag_id,
+                    name: row.get("tag_name")?,
+                    color: row.get("tag_color")?,
+                };
+                entry.1.push(tag);
+            }
+        }
+
+        let mut images: Vec<ImageData> = map
+            .into_iter()
+            .map(|(id, (path, tags))| ImageData::new(id, std::path::Path::new(&path), tags))
+            .collect();
+        images.sort_by_key(|img| img.id);
+
+        Ok(images)
+    }
+
     // update the embedding of an image
     pub fn update_image_embedding(
-        &mut self,
+        &self,
         image_id: ID,
         embedding: Vec<f32>,
     ) -> rusqlite::Result<()> {
+        // Handle empty embeddings explicitly
+        if embedding.is_empty() {
+            self.connection.lock().unwrap().execute(
+                "UPDATE images SET embedding = ?1 WHERE id = ?2",
+                rusqlite::params![&[] as &[u8], image_id],
+            )?;
+            return Ok(());
+        }
+
         // Convert Vec<f32> to bytes for BLOB storage
         let embedding_bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(
@@ -201,16 +251,43 @@ impl ImageDatabase {
         let mut stmt = conn.prepare("SELECT embedding FROM images WHERE id = ?1")?;
         let mut rows = stmt.query([image_id])?;
         if let Some(row) = rows.next()? {
-            let embedding_bytes: Vec<u8> = row.get("embedding")?;
-            // Convert bytes back to Vec<f32>
-            let embedding: Vec<f32> = unsafe {
-                std::slice::from_raw_parts(
-                    embedding_bytes.as_ptr() as *const f32,
-                    embedding_bytes.len() / std::mem::size_of::<f32>(),
-                )
-                .to_vec()
-            };
-            Ok(embedding)
+            // Handle NULL embeddings
+            let embedding_bytes: Option<Vec<u8>> = row.get("embedding")?;
+
+            match embedding_bytes {
+                None => Err(rusqlite::Error::QueryReturnedNoRows),
+                Some(bytes) => {
+                    // Handle empty embeddings
+                    if bytes.is_empty() {
+                        return Ok(Vec::new());
+                    }
+
+                    // Ensure the byte length is a multiple of f32 size
+                    let f32_size = std::mem::size_of::<f32>();
+                    if bytes.len() % f32_size != 0 {
+                        return Err(rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Blob,
+                            format!(
+                                "Embedding byte length {} is not a multiple of f32 size ({})",
+                                bytes.len(),
+                                f32_size
+                            )
+                            .into(),
+                        ));
+                    }
+
+                    // Convert bytes back to Vec<f32>
+                    let embedding: Vec<f32> = unsafe {
+                        std::slice::from_raw_parts(
+                            bytes.as_ptr() as *const f32,
+                            bytes.len() / f32_size,
+                        )
+                        .to_vec()
+                    };
+                    Ok(embedding)
+                }
+            }
         } else {
             Err(rusqlite::Error::QueryReturnedNoRows)
         }
@@ -234,7 +311,7 @@ mod tests {
 
     #[test]
     fn test_database_operations() {
-        let mut db = ImageDatabase::new(":memory:").unwrap();
+        let db = ImageDatabase::new(":memory:").unwrap();
         db.initialize().unwrap();
 
         let test_image_path = "/path/to/image.jpg";
@@ -246,7 +323,7 @@ mod tests {
 
     #[test]
     fn test_prevent_duplicate_images() {
-        let mut db = ImageDatabase::new(":memory:").unwrap();
+        let db = ImageDatabase::new(":memory:").unwrap();
         db.initialize().unwrap();
 
         let test_image_path = "/path/to/image.jpg";
@@ -264,5 +341,197 @@ mod tests {
 
         let images = db.get_images(vec![], "".to_string()).unwrap();
         assert_eq!(images.len(), 0); // No images should be present
+    }
+
+    #[test]
+    fn test_update_image_embedding_basic() {
+        let db = ImageDatabase::new(":memory:").unwrap();
+        db.initialize().unwrap();
+
+        // Add an image first
+        let test_image_path = "/path/to/image.jpg";
+        db.add_image(test_image_path.to_owned()).unwrap();
+
+        // Get the image ID
+        let image_id = db.get_image_id_by_path(test_image_path).unwrap();
+
+        // Create a test embedding (512 dimensions, typical for CLIP)
+        let test_embedding: Vec<f32> = (0..512).map(|i| i as f32 * 0.001).collect();
+
+        // Update the embedding
+        db.update_image_embedding(image_id, test_embedding.clone())
+            .expect("Failed to update embedding");
+
+        // Verify the embedding was stored correctly
+        let retrieved_embedding = db
+            .get_image_embedding(image_id)
+            .expect("Failed to retrieve embedding");
+
+        assert_eq!(
+            retrieved_embedding.len(),
+            test_embedding.len(),
+            "Embedding length mismatch"
+        );
+
+        // Verify the values match (with small tolerance for floating point)
+        for (retrieved, original) in retrieved_embedding.iter().zip(test_embedding.iter()) {
+            assert!(
+                (retrieved - original).abs() < 1e-6,
+                "Embedding value mismatch: {} vs {}",
+                retrieved,
+                original
+            );
+        }
+    }
+
+    #[test]
+    fn test_update_image_embedding_round_trip() {
+        let db = ImageDatabase::new(":memory:").unwrap();
+        db.initialize().unwrap();
+
+        let test_image_path = "/path/to/test_image.png";
+        db.add_image(test_image_path.to_owned()).unwrap();
+        let image_id = db.get_image_id_by_path(test_image_path).unwrap();
+
+        // Create a realistic embedding (normalized vector)
+        let mut embedding: Vec<f32> = (0..512).map(|i| (i as f32).sin()).collect();
+        // Normalize the embedding
+        let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+        embedding.iter_mut().for_each(|x| *x /= norm);
+
+        // Store it
+        db.update_image_embedding(image_id, embedding.clone())
+            .expect("Failed to store embedding");
+
+        // Retrieve it
+        let retrieved = db
+            .get_image_embedding(image_id)
+            .expect("Failed to retrieve embedding");
+
+        // Verify dimensions
+        assert_eq!(retrieved.len(), 512, "Embedding should be 512 dimensions");
+
+        // Verify values match
+        for (i, (ret, orig)) in retrieved.iter().zip(embedding.iter()).enumerate() {
+            assert!(
+                (ret - orig).abs() < 1e-5,
+                "Value mismatch at index {}: {} vs {}",
+                i,
+                ret,
+                orig
+            );
+        }
+    }
+
+    #[test]
+    fn test_update_image_embedding_overwrite() {
+        let db = ImageDatabase::new(":memory:").unwrap();
+        db.initialize().unwrap();
+
+        let test_image_path = "/path/to/image.jpg";
+        db.add_image(test_image_path.to_owned()).unwrap();
+        let image_id = db.get_image_id_by_path(test_image_path).unwrap();
+
+        // Store first embedding
+        let first_embedding: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+        db.update_image_embedding(image_id, first_embedding.clone())
+            .expect("Failed to store first embedding");
+
+        // Verify first embedding is stored
+        let retrieved1 = db.get_image_embedding(image_id).unwrap();
+        assert_eq!(retrieved1, first_embedding);
+
+        // Store second embedding (different size)
+        let second_embedding: Vec<f32> = vec![5.0, 6.0, 7.0, 8.0, 9.0];
+        db.update_image_embedding(image_id, second_embedding.clone())
+            .expect("Failed to overwrite embedding");
+
+        // Verify second embedding replaced the first
+        let retrieved2 = db.get_image_embedding(image_id).unwrap();
+        assert_eq!(retrieved2, second_embedding);
+        assert_ne!(retrieved2, first_embedding);
+    }
+
+    #[test]
+    fn test_update_image_embedding_nonexistent_image() {
+        let db = ImageDatabase::new(":memory:").unwrap();
+        db.initialize().unwrap();
+
+        // Try to update embedding for non-existent image
+        let fake_image_id = 99999;
+        let test_embedding: Vec<f32> = vec![1.0, 2.0, 3.0];
+
+        // This should succeed (UPDATE doesn't fail if no rows match, it just updates 0 rows)
+        // But we should verify the embedding wasn't actually stored
+        let result = db.update_image_embedding(fake_image_id, test_embedding.clone());
+
+        // The update itself should succeed (SQL UPDATE doesn't error on no matches)
+        assert!(
+            result.is_ok(),
+            "UPDATE should succeed even if no rows match"
+        );
+
+        // But retrieving should fail
+        let retrieve_result = db.get_image_embedding(fake_image_id);
+        assert!(
+            retrieve_result.is_err(),
+            "Should fail to retrieve embedding for non-existent image"
+        );
+    }
+
+    #[test]
+    fn test_update_image_embedding_empty_embedding() {
+        let db = ImageDatabase::new(":memory:").unwrap();
+        db.initialize().unwrap();
+
+        let test_image_path = "/path/to/image.jpg";
+        db.add_image(test_image_path.to_owned()).unwrap();
+        let image_id = db.get_image_id_by_path(test_image_path).unwrap();
+
+        // Store empty embedding
+        let empty_embedding: Vec<f32> = Vec::new();
+        db.update_image_embedding(image_id, empty_embedding.clone())
+            .expect("Failed to store empty embedding");
+
+        // Retrieve and verify
+        let retrieved = db.get_image_embedding(image_id).unwrap();
+        assert_eq!(retrieved.len(), 0);
+        assert_eq!(retrieved, empty_embedding);
+    }
+
+    #[test]
+    fn test_update_image_embedding_large_embedding() {
+        let db = ImageDatabase::new(":memory:").unwrap();
+        db.initialize().unwrap();
+
+        let test_image_path = "/path/to/image.jpg";
+        db.add_image(test_image_path.to_owned()).unwrap();
+        let image_id = db.get_image_id_by_path(test_image_path).unwrap();
+
+        // Create a large embedding (larger than typical 512)
+        let large_embedding: Vec<f32> = (0..2048).map(|i| i as f32).collect();
+
+        db.update_image_embedding(image_id, large_embedding.clone())
+            .expect("Failed to store large embedding");
+
+        let retrieved = db.get_image_embedding(image_id).unwrap();
+        assert_eq!(retrieved.len(), 2048);
+        assert_eq!(retrieved, large_embedding);
+    }
+
+    #[test]
+    fn test_get_image_embedding_before_update() {
+        let db = ImageDatabase::new(":memory:").unwrap();
+        db.initialize().unwrap();
+
+        let test_image_path = "/path/to/image.jpg";
+        db.add_image(test_image_path.to_owned()).unwrap();
+        let image_id = db.get_image_id_by_path(test_image_path).unwrap();
+
+        // Try to get embedding before it's set (should be NULL in DB)
+        let result = db.get_image_embedding(image_id);
+
+        // This should fail because the embedding is NULL
+        assert!(result.is_err(), "Should fail to retrieve NULL embedding");
     }
 }

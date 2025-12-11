@@ -99,6 +99,16 @@ export function MasonrySelectedFrame(props: MasonrySelectedItemProps) {
           )}
         </div>
         <div className="grid grid-cols-4 gap-2">
+          {(() => {
+            console.log("[Component] MasonrySelectedFrame rendering similar images", {
+              similarLoading: props.similarLoading,
+              similarItemsCount: props.similarItems?.length || 0,
+              similarItems: props.similarItems?.map(item => ({ id: item.id, name: item.name, score: item.score })) || [],
+              hasSimilarItems: !!props.similarItems,
+              similarItemsIsArray: Array.isArray(props.similarItems),
+            });
+            return null;
+          })()}
           {props.similarItems?.map((sim) => (
             <button
               key={sim.id}

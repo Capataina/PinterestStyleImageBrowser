@@ -20,17 +20,44 @@ impl CosineIndex {
 
     // add a function thats going to connect to our sql database, query all images and their embeddings, and populate the cached_images vector
     pub fn populate_from_db(&mut self, _db_path: &str) {
+        println!(
+            "[CosineIndex] populate_from_db called with db_path: {}",
+            _db_path
+        );
         let db = db::ImageDatabase::new(_db_path).expect("failed to init db");
         let images = db.get_all_images().expect("failed to get all images");
+        println!(
+            "[CosineIndex] Found {} total images in database",
+            images.len()
+        );
+
+        let mut added_count = 0;
+        let mut skipped_no_embedding = 0;
+        let mut skipped_empty = 0;
+
         for image in images {
-            let embedding = db
-                .get_image_embedding(image.id)
-                .expect("failed to get image embedding");
-            self.add_image(
-                PathBuf::from(image.path.clone()),
-                Array1::from_vec(embedding),
-            );
+            // Skip images without embeddings instead of panicking
+            match db.get_image_embedding(image.id) {
+                Ok(embedding) => {
+                    // Also skip empty embeddings
+                    if embedding.is_empty() {
+                        skipped_empty += 1;
+                    } else {
+                        self.add_image(
+                            PathBuf::from(image.path.clone()),
+                            Array1::from_vec(embedding),
+                        );
+                        added_count += 1;
+                    }
+                }
+                Err(_) => {
+                    skipped_no_embedding += 1;
+                }
+            }
         }
+
+        println!("[CosineIndex] Population complete - Added: {}, Skipped (no embedding): {}, Skipped (empty): {}", 
+            added_count, skipped_no_embedding, skipped_empty);
     }
 
     // Function to compute cosine similarity between two embeddings
@@ -49,15 +76,44 @@ impl CosineIndex {
 
     // write the return images function. This function is going to take an embedding and return the top n most similar images from the cached_images vector
     // the images that ir returns will be a top x percent of the cached images based on cosine similarity to encourage diversity
-    pub fn get_similar_images(&self, embedding: &Array1<f32>, top_n: usize) -> Vec<(PathBuf, f32)> {
+    // exclude_path: optional path to exclude from results (e.g., the query image itself)
+    pub fn get_similar_images(
+        &self,
+        embedding: &Array1<f32>,
+        top_n: usize,
+        exclude_path: Option<&PathBuf>,
+    ) -> Vec<(PathBuf, f32)> {
+        println!("[CosineIndex] get_similar_images called - cached_images: {}, top_n: {}, exclude_path: {:?}", 
+            self.cached_images.len(), top_n, exclude_path);
+
+        let mut excluded_count = 0;
         let mut similarities: Vec<(PathBuf, f32)> = self
             .cached_images
             .iter()
-            .map(|(path, emb)| {
+            .filter_map(|(path, emb)| {
+                // Exclude the query image itself
+                if let Some(exclude) = exclude_path {
+                    if path == exclude {
+                        excluded_count += 1;
+                        println!(
+                            "[CosineIndex] Excluding query image: {:?}",
+                            path.file_name().unwrap_or_default()
+                        );
+                        return None;
+                    }
+                }
                 let sim = Self::cosine_similarity(embedding, emb);
-                (path.clone(), sim)
+                Some((path.clone(), sim))
             })
             .collect();
+
+        println!("[CosineIndex] Calculated similarities for {} images (excluded {}), query embedding length: {}", 
+            similarities.len(), excluded_count, embedding.len());
+
+        if similarities.is_empty() {
+            println!("[CosineIndex] WARNING: No similarities calculated! Returning empty result.");
+            return Vec::new();
+        }
 
         similarities.sort_by(|a, b| {
             // Sort in descending order (highest similarity first)
@@ -70,10 +126,26 @@ impl CosineIndex {
             }
         });
 
+        println!("[CosineIndex] Sorted similarities - top 5:");
+        for (i, (path, sim)) in similarities.iter().take(5).enumerate() {
+            println!(
+                "  {}. {:?} - score: {:.4}",
+                i + 1,
+                path.file_name().unwrap_or_default(),
+                sim
+            );
+        }
+
         // Select top N percent to encourage diversity, but ensure pool is at least top_n size
         let base_pool = (similarities.len() as f32 * 0.2).ceil() as usize;
         let select_count = base_pool.max(top_n).min(similarities.len());
         let diverse_pool = &similarities[..select_count];
+        println!(
+            "[CosineIndex] Diversity pool - base_pool: {}, select_count: {}, diverse_pool size: {}",
+            base_pool,
+            select_count,
+            diverse_pool.len()
+        );
 
         // Randomly select top_n from the diverse pool
         let mut rng = rand::rng();
@@ -81,6 +153,19 @@ impl CosineIndex {
             .choose_multiple(&mut rng, top_n.min(diverse_pool.len()))
             .cloned()
             .collect();
+
+        println!(
+            "[CosineIndex] Final selected results: {} images",
+            selected.len()
+        );
+        for (i, (path, sim)) in selected.iter().enumerate() {
+            println!(
+                "  {}. {:?} - score: {:.4}",
+                i + 1,
+                path.file_name().unwrap_or_default(),
+                sim
+            );
+        }
 
         selected
     }
@@ -273,7 +358,7 @@ mod tests {
         index.add_image(PathBuf::from("/images/dissimilar.jpg"), dissimilar);
 
         // Search for images similar to query
-        let results = index.get_similar_images(&query_embedding, 2);
+        let results = index.get_similar_images(&query_embedding, 2, None);
 
         // Should return 2 results
         assert_eq!(results.len(), 2);
@@ -313,7 +398,7 @@ mod tests {
         }
 
         // Request top 10
-        let results = index.get_similar_images(&query, 10);
+        let results = index.get_similar_images(&query, 10, None);
 
         assert_eq!(results.len(), 10);
 
@@ -335,7 +420,7 @@ mod tests {
         }
 
         // Request 10 (more than available)
-        let results = index.get_similar_images(&query, 10);
+        let results = index.get_similar_images(&query, 10, None);
 
         // Should return only what's available (3 or fewer due to 20% sampling)
         assert!(results.len() <= 3, "Returned more images than available");
@@ -346,7 +431,7 @@ mod tests {
         let index = CosineIndex::new();
         let query = array![1.0, 2.0, 3.0];
 
-        let results = index.get_similar_images(&query, 5);
+        let results = index.get_similar_images(&query, 5, None);
 
         assert_eq!(results.len(), 0, "Empty index should return no results");
     }

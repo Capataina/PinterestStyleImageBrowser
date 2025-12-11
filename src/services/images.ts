@@ -60,7 +60,10 @@ export async function fetchSimilarImages(
   imageId: number,
   topN: number = 8
 ) {
+  console.log("[Frontend] fetchSimilarImages called", { imageId, topN });
+  
   try {
+    console.log("[Frontend] Invoking get_similar_images command...");
     const results: { id: number; path: string; score: number }[] = await invoke(
       "get_similar_images",
       {
@@ -69,6 +72,12 @@ export async function fetchSimilarImages(
       }
     );
 
+    console.log("[Frontend] Received results from backend:", {
+      count: results.length,
+      results: results.map(r => ({ id: r.id, path: r.path.split(/[\\/]/).pop(), score: r.score }))
+    });
+
+    console.log("[Frontend] Processing results, converting file paths...");
     const images = await Promise.all(
       results.map(async (res) => {
         const url = convertFileSrc(res.path);
@@ -85,8 +94,14 @@ export async function fetchSimilarImages(
       })
     );
 
+    console.log("[Frontend] Final images to return:", {
+      count: images.length,
+      images: images.map(img => ({ id: img.id, name: img.name, score: img.score }))
+    });
+
     return images;
   } catch (error) {
+    console.error("[Frontend] Error in fetchSimilarImages:", error);
     throw new Error(`Failed to fetch similar images: ${error}`);
   }
 }

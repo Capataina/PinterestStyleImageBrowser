@@ -13,16 +13,17 @@ pub struct ImageData {
 
 impl ImageData {
     pub fn new(id: ID, path: &Path, tags: Vec<Tag>) -> Self {
+        // Try to canonicalize the path, but fall back to the original path if it doesn't exist
+        // This handles cases where paths in the database point to files that have been moved/deleted
         let path_str = path
             .canonicalize()
-            .unwrap()
-            .to_str()
-            .unwrap_or_default()
-            .to_string();
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| path.to_string_lossy().to_string());
+
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
-            .unwrap()
+            .unwrap_or("unknown")
             .to_string();
 
         return ImageData {
