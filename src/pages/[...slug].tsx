@@ -28,6 +28,17 @@ export default function Home() {
   const removeTagMutation = useRemoveTagFromImage();
   const similarImages = useSimilarImages(selectedItem?.id, 8);
 
+  useEffect(() => {
+    console.log("[Page] similarImages state changed", {
+      selectedItemId: selectedItem?.id,
+      similarImagesData: similarImages.data,
+      similarImagesCount: similarImages.data?.length || 0,
+      similarImagesIsFetching: similarImages.isFetching,
+      similarImagesIsError: similarImages.isError,
+      similarImagesError: similarImages.error,
+    });
+  }, [similarImages.data, similarImages.isFetching, similarImages.isError, selectedItem?.id]);
+
   const location = useLocation();
   const navigate = useNavigate();
 

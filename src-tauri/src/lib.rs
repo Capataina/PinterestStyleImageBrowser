@@ -76,36 +76,125 @@ fn get_similar_images(
     top_n: usize,
 ) -> Result<Vec<SimilarImage>, String> {
     use ndarray::Array1;
+    use std::path::PathBuf;
+
+    println!(
+        "[Backend] get_similar_images called - image_id: {}, top_n: {}",
+        image_id, top_n
+    );
 
     let mut index = cosine_state
         .index
         .lock()
         .map_err(|e| format!("Failed to lock cosine index: {e}"))?;
 
+    println!(
+        "[Backend] Cache state - cached_images count: {}",
+        index.cached_images.len()
+    );
+
     if index.cached_images.is_empty() {
+        println!("[Backend] Cache is empty, populating from database...");
         index.populate_from_db(&cosine_state.db_path);
+        println!(
+            "[Backend] Cache populated - cached_images count: {}",
+            index.cached_images.len()
+        );
     }
 
+    // Get the path of the clicked image to exclude it from results
+    println!("[Backend] Looking up image path for image_id: {}", image_id);
+    let exclude_path = {
+        let all_images = db
+            .get_all_images()
+            .map_err(|e| format!("Failed to get images: {e}"))?;
+        println!("[Backend] Total images in database: {}", all_images.len());
+        let found = all_images.iter().find(|img| img.id == image_id).map(|img| {
+            println!("[Backend] Found image - id: {}, path: {}", img.id, img.path);
+            PathBuf::from(&img.path)
+        });
+        if found.is_none() {
+            println!(
+                "[Backend] WARNING: Could not find image with id: {}",
+                image_id
+            );
+        }
+        found
+    };
+
+    println!("[Backend] Fetching embedding for image_id: {}", image_id);
     let embedding = db
         .get_image_embedding(image_id)
         .map_err(|e| format!("Failed to fetch embedding: {e}"))?;
+    println!(
+        "[Backend] Retrieved embedding - length: {}",
+        embedding.len()
+    );
 
     let query = Array1::from_vec(embedding);
-    let results = index
-        .get_similar_images(&query, top_n)
+    println!(
+        "[Backend] Calling index.get_similar_images with top_n: {}, exclude_path: {:?}",
+        top_n, exclude_path
+    );
+    let raw_results = index.get_similar_images(&query, top_n, exclude_path.as_ref());
+    println!(
+        "[Backend] index.get_similar_images returned {} results",
+        raw_results.len()
+    );
+
+    if !raw_results.is_empty() {
+        println!("[Backend] Raw results (first 5):");
+        for (i, (path, score)) in raw_results.iter().take(5).enumerate() {
+            println!("  {}. path: {:?}, score: {:.4}", i + 1, path, score);
+        }
+    }
+
+    println!("[Backend] Converting results to SimilarImage structs...");
+    let results: Vec<SimilarImage> = raw_results
         .into_iter()
         .filter_map(|(path, score)| {
             let path_str = path.to_string_lossy().to_string();
             match db.get_image_id_by_path(&path_str) {
-                Ok(id) => Some(SimilarImage {
-                    id,
-                    path: path_str,
-                    score,
-                }),
-                Err(_) => None,
+                Ok(id) => {
+                    println!(
+                        "  [Backend] Mapped path to id - path: {:?}, id: {}, score: {:.4}",
+                        path.file_name().unwrap_or_default(),
+                        id,
+                        score
+                    );
+                    Some(SimilarImage {
+                        id,
+                        path: path_str,
+                        score,
+                    })
+                }
+                Err(e) => {
+                    println!(
+                        "  [Backend] Failed to map path to id - path: {:?}, error: {}",
+                        path.file_name().unwrap_or_default(),
+                        e
+                    );
+                    None
+                }
             }
         })
         .collect();
+
+    println!("[Backend] Final results count: {}", results.len());
+    if !results.is_empty() {
+        println!("[Backend] Final results (first 5):");
+        for (i, sim) in results.iter().take(5).enumerate() {
+            println!(
+                "  {}. id: {}, path: {:?}, score: {:.4}",
+                i + 1,
+                sim.id,
+                std::path::Path::new(&sim.path)
+                    .file_name()
+                    .unwrap_or_default(),
+                sim.score
+            );
+        }
+    }
 
     Ok(results)
 }

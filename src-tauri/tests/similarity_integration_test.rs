@@ -121,7 +121,8 @@ fn test_real_image_similarity_search() {
         .get(query_path)
         .expect("Query image not encoded");
 
-    let similar_images = index.get_similar_images(&Array1::from_vec(query_embedding.clone()), 5);
+    let similar_images =
+        index.get_similar_images(&Array1::from_vec(query_embedding.clone()), 5, None);
 
     println!("Query image: {:?}", query_path.file_name().unwrap());
     println!("Top 5 similar images:");
@@ -162,7 +163,7 @@ fn test_real_image_similarity_search() {
             query_path.file_name().unwrap()
         );
 
-        let results = index.get_similar_images(&Array1::from_vec(query_embedding.clone()), 3);
+        let results = index.get_similar_images(&Array1::from_vec(query_embedding.clone()), 3, None);
 
         println!("  Top 3 matches:");
         for (i, (path, sim)) in results.iter().enumerate() {
