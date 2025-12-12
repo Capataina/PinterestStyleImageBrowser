@@ -150,11 +150,34 @@ fn get_similar_images(
     }
 
     println!("[Backend] Converting results to SimilarImage structs...");
+    
+    // Helper function to normalize path for database lookup
+    // Removes Windows extended path prefix (\\?\) if present
+    let normalize_path = |path_str: &str| -> String {
+        if path_str.starts_with("\\\\?\\") {
+            path_str[4..].to_string()
+        } else {
+            path_str.to_string()
+        }
+    };
+    
+    // Get all images once for flexible matching if needed
+    let all_images = match db.get_all_images() {
+        Ok(images) => Some(images),
+        Err(e) => {
+            println!("[Backend] Warning: Failed to get all images for flexible matching: {}", e);
+            None
+        }
+    };
+    
     let results: Vec<SimilarImage> = raw_results
         .into_iter()
         .filter_map(|(path, score)| {
             let path_str = path.to_string_lossy().to_string();
-            match db.get_image_id_by_path(&path_str) {
+            let normalized_path = normalize_path(&path_str);
+            
+            // Try normalized path first (most common case)
+            match db.get_image_id_by_path(&normalized_path) {
                 Ok(id) => {
                     println!(
                         "  [Backend] Mapped path to id - path: {:?}, id: {}, score: {:.4}",
@@ -164,17 +187,75 @@ fn get_similar_images(
                     );
                     Some(SimilarImage {
                         id,
-                        path: path_str,
+                        path: normalized_path,
                         score,
                     })
                 }
-                Err(e) => {
-                    println!(
-                        "  [Backend] Failed to map path to id - path: {:?}, error: {}",
-                        path.file_name().unwrap_or_default(),
-                        e
-                    );
-                    None
+                Err(_) => {
+                    // Try original path format
+                    match db.get_image_id_by_path(&path_str) {
+                        Ok(id) => {
+                            println!(
+                                "  [Backend] Mapped path to id (original format) - path: {:?}, id: {}, score: {:.4}",
+                                path.file_name().unwrap_or_default(),
+                                id,
+                                score
+                            );
+                            Some(SimilarImage {
+                                id,
+                                path: path_str,
+                                score,
+                            })
+                        }
+                        Err(_) => {
+                            // Fallback: flexible matching by comparing canonicalized paths
+                            if let Some(ref images) = all_images {
+                                let search_path = path.canonicalize()
+                                    .ok()
+                                    .map(|p| p.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| normalize_path(&path_str));
+                                
+                                if let Some(matching_image) = images.iter().find(|img| {
+                                    let img_normalized = normalize_path(&img.path);
+                                    let img_canon = std::path::Path::new(&img.path)
+                                        .canonicalize()
+                                        .ok()
+                                        .map(|p| p.to_string_lossy().to_string())
+                                        .unwrap_or_else(|| normalize_path(&img.path));
+                                    
+                                    img_normalized == normalized_path ||
+                                    img_normalized == path_str ||
+                                    img.path == normalized_path ||
+                                    img.path == path_str ||
+                                    img_canon == search_path
+                                }) {
+                                    println!(
+                                        "  [Backend] Mapped path to id (flexible match) - path: {:?}, id: {}, score: {:.4}",
+                                        path.file_name().unwrap_or_default(),
+                                        matching_image.id,
+                                        score
+                                    );
+                                    Some(SimilarImage {
+                                        id: matching_image.id,
+                                        path: matching_image.path.clone(),
+                                        score,
+                                    })
+                                } else {
+                                    println!(
+                                        "  [Backend] Failed to map path to id - path: {:?}",
+                                        path.file_name().unwrap_or_default()
+                                    );
+                                    None
+                                }
+                            } else {
+                                println!(
+                                    "  [Backend] Failed to map path to id - path: {:?}",
+                                    path.file_name().unwrap_or_default()
+                                );
+                                None
+                            }
+                        }
+                    }
                 }
             }
         })
