@@ -19,3 +19,13 @@ export type Tag = {
   name: string;
   color: string;
 };
+
+export type SimilarImageItem = {
+  id: number;
+  path: string;
+  url: string;
+  width: number;
+  height: number;
+  score: number;
+  name?: string;
+};

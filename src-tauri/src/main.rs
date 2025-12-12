@@ -30,7 +30,7 @@ fn main() {
 
     let mut encoder = encoder::Encoder::new(Path::new("models/model.onnx")).unwrap();
     encoder
-        .encode_all_images_in_database(32, &mut database)
+        .encode_all_images_in_database(32, &database)
         .unwrap();
-    image_browser_lib::run(database)
+    image_browser_lib::run(database, db_path)
 }
