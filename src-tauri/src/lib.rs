@@ -21,6 +21,7 @@ pub mod filesystem;
 pub mod image_struct;
 pub mod similarity_and_semantic_search;
 pub mod tag_struct;
+pub mod thumbnail;
 
 pub struct CosineIndexState {
     pub index: Mutex<CosineIndex>,
@@ -33,8 +34,9 @@ fn get_images(
     filter_tag_ids: Vec<ID>,
     filter_string: String,
 ) -> Result<Vec<ImageData>, String> {
+    // Use the new method that includes thumbnail info
     return db
-        .get_images(filter_tag_ids, filter_string)
+        .get_images_with_thumbnails(filter_tag_ids, filter_string)
         .map_err(|e| e.to_string());
 }
 

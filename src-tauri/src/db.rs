@@ -19,15 +19,22 @@ impl ImageDatabase {
     }
 
     pub fn initialize(&self) -> rusqlite::Result<()> {
+        // Create images table with all columns including thumbnail support
         self.connection.lock().unwrap().execute(
             "
             CREATE TABLE IF NOT EXISTS images (
                 id INTEGER PRIMARY KEY,
                 path TEXT NOT NULL UNIQUE,
-                embedding BLOB
+                embedding BLOB,
+                thumbnail_path TEXT,
+                width INTEGER,
+                height INTEGER
             );",
             [],
         )?;
+
+        // Migration: Add thumbnail columns if they don't exist (for existing databases)
+        self.migrate_add_thumbnail_columns()?;
 
         self.connection.lock().unwrap().execute(
             "CREATE TABLE IF NOT EXISTS tags (
@@ -48,6 +55,28 @@ impl ImageDatabase {
             );",
             [],
         )?;
+        Ok(())
+    }
+
+    /// Migrate existing databases to add thumbnail columns if they don't exist
+    fn migrate_add_thumbnail_columns(&self) -> rusqlite::Result<()> {
+        let conn = self.connection.lock().unwrap();
+
+        // Check if thumbnail_path column exists
+        let mut stmt = conn.prepare("PRAGMA table_info(images)")?;
+        let columns: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        if !columns.contains(&"thumbnail_path".to_string()) {
+            println!("Migrating database: Adding thumbnail columns...");
+            conn.execute("ALTER TABLE images ADD COLUMN thumbnail_path TEXT", [])?;
+            conn.execute("ALTER TABLE images ADD COLUMN width INTEGER", [])?;
+            conn.execute("ALTER TABLE images ADD COLUMN height INTEGER", [])?;
+            println!("Migration complete.");
+        }
+
         Ok(())
     }
 
@@ -302,6 +331,170 @@ impl ImageDatabase {
         } else {
             Err(rusqlite::Error::QueryReturnedNoRows)
         }
+    }
+
+    // ==================== Thumbnail Methods ====================
+
+    /// Get images that don't have thumbnails yet
+    pub fn get_images_without_thumbnails(&self) -> rusqlite::Result<Vec<ImageData>> {
+        let conn = self.connection.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT images.id AS img_id, images.path AS img_path,
+            images.thumbnail_path, images.width, images.height,
+            tags.id AS tag_id, tags.name AS tag_name, tags.color AS tag_color
+            FROM images
+            LEFT JOIN images_tags ON images.id = images_tags.image_id
+            LEFT JOIN tags ON tags.id = images_tags.tag_id
+            WHERE images.thumbnail_path IS NULL OR images.thumbnail_path = '';",
+        )?;
+
+        let mut rows = stmt.query([])?;
+        let mut map: HashMap<ID, (String, Vec<Tag>)> = HashMap::new();
+
+        // aggregate tags
+        while let Some(row) = rows.next()? {
+            let img_id: ID = row.get("img_id")?;
+            let img_path: String = row.get("img_path")?;
+            let tag_id_opt: Option<ID> = row.get("tag_id")?;
+
+            let entry = map.entry(img_id).or_insert((img_path, Vec::new()));
+            if let Some(tag_id) = tag_id_opt {
+                let tag = Tag {
+                    id: tag_id,
+                    name: row.get("tag_name")?,
+                    color: row.get("tag_color")?,
+                };
+                entry.1.push(tag);
+            }
+        }
+
+        let mut images: Vec<ImageData> = map
+            .into_iter()
+            .map(|(id, (path, tags))| ImageData::new(id, std::path::Path::new(&path), tags))
+            .collect();
+        images.sort_by_key(|img| img.id);
+
+        Ok(images)
+    }
+
+    /// Update thumbnail path and original dimensions for an image
+    pub fn update_image_thumbnail(
+        &self,
+        image_id: ID,
+        thumbnail_path: &std::path::Path,
+        width: u32,
+        height: u32,
+    ) -> rusqlite::Result<()> {
+        let thumbnail_path_str = thumbnail_path.to_string_lossy().to_string();
+        self.connection.lock().unwrap().execute(
+            "UPDATE images SET thumbnail_path = ?1, width = ?2, height = ?3 WHERE id = ?4",
+            rusqlite::params![thumbnail_path_str, width as i64, height as i64, image_id],
+        )?;
+        Ok(())
+    }
+
+    /// Get thumbnail info for an image (thumbnail_path, width, height)
+    pub fn get_image_thumbnail_info(
+        &self,
+        image_id: ID,
+    ) -> rusqlite::Result<Option<(String, u32, u32)>> {
+        let conn = self.connection.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT thumbnail_path, width, height FROM images WHERE id = ?1")?;
+
+        let mut rows = stmt.query([image_id])?;
+        if let Some(row) = rows.next()? {
+            let thumbnail_path: Option<String> = row.get(0)?;
+            let width: Option<i64> = row.get(1)?;
+            let height: Option<i64> = row.get(2)?;
+
+            if let (Some(path), Some(w), Some(h)) = (thumbnail_path, width, height) {
+                if !path.is_empty() {
+                    return Ok(Some((path, w as u32, h as u32)));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Get images with their thumbnail info included
+    pub fn get_images_with_thumbnails(
+        &self,
+        filter_tag_ids: Vec<ID>,
+        _filter_string: String,
+    ) -> rusqlite::Result<Vec<ImageData>> {
+        let conn = self.connection.lock().unwrap();
+
+        let sql = if filter_tag_ids.len() > 0 {
+            let placeholders = vec!["?"; filter_tag_ids.len()].join(", ");
+            format!(
+                "SELECT images.id AS img_id, images.path AS img_path,
+                images.thumbnail_path, images.width, images.height,
+                tags.id AS tag_id, tags.name AS tag_name, tags.color AS tag_color
+                FROM images
+                LEFT JOIN images_tags ON images.id = images_tags.image_id
+                LEFT JOIN tags ON tags.id = images_tags.tag_id
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM images_tags it2
+                    WHERE it2.image_id = images.id
+                    AND it2.tag_id IN ({})
+                );",
+                placeholders
+            )
+        } else {
+            "SELECT images.id AS img_id, images.path AS img_path,
+            images.thumbnail_path, images.width, images.height,
+            tags.id AS tag_id, tags.name AS tag_name, tags.color AS tag_color
+            FROM images
+            LEFT JOIN images_tags ON images.id = images_tags.image_id
+            LEFT JOIN tags ON tags.id = images_tags.tag_id;"
+                .to_string()
+        };
+        let mut stmt = conn.prepare(&sql)?;
+
+        let mut rows = stmt.query(params_from_iter(filter_tag_ids))?;
+
+        // Map: image_id -> (path, tags, thumbnail_path, width, height)
+        let mut map: HashMap<ID, (String, Vec<Tag>, Option<String>, Option<i64>, Option<i64>)> =
+            HashMap::new();
+
+        // aggregate tags and thumbnail info
+        while let Some(row) = rows.next()? {
+            let img_id: ID = row.get("img_id")?;
+            let img_path: String = row.get("img_path")?;
+            let thumbnail_path: Option<String> = row.get("thumbnail_path")?;
+            let width: Option<i64> = row.get("width")?;
+            let height: Option<i64> = row.get("height")?;
+            let tag_id_opt: Option<ID> = row.get("tag_id")?;
+
+            let entry =
+                map.entry(img_id)
+                    .or_insert((img_path, Vec::new(), thumbnail_path, width, height));
+            if let Some(tag_id) = tag_id_opt {
+                let tag = Tag {
+                    id: tag_id,
+                    name: row.get("tag_name")?,
+                    color: row.get("tag_color")?,
+                };
+                entry.1.push(tag);
+            }
+        }
+
+        let mut images: Vec<ImageData> = map
+            .into_iter()
+            .map(|(id, (path, tags, thumbnail_path, width, height))| {
+                let mut img = ImageData::new(id, std::path::Path::new(&path), tags);
+                img.thumbnail_path = thumbnail_path;
+                img.width = width.map(|w| w as u32);
+                img.height = height.map(|h| h as u32);
+                img
+            })
+            .collect();
+        images.sort_by_key(|img| img.id);
+
+        Ok(images)
     }
 }
 

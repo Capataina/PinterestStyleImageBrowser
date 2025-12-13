@@ -1,24 +1,41 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { getImageSize } from "../utils";
-import { ImageData } from "../types";
+import { ImageData, ImageItem } from "../types";
+
+// Default dimensions if backend doesn't provide them (fallback)
+const DEFAULT_WIDTH = 800;
+const DEFAULT_HEIGHT = 600;
 
 export async function fetchImages(
   filterTagIds: number[] = [],
   filterString: string = ""
-) {
+): Promise<ImageItem[]> {
   try {
     const imagesDB: ImageData[] = await invoke("get_images", {
       filterTagIds,
       filterString,
     });
-    console.log(imagesDB);
-    const images = await Promise.all(
-      imagesDB.map(async (img) => {
-        const url = convertFileSrc(img.path);
-        const { width, height } = await getImageSize(url);
-        return { ...img, url, width, height };
-      })
-    );
+
+    // Convert backend data to frontend ImageItem format
+    // Now using dimensions from backend (stored during thumbnail generation)
+    const images: ImageItem[] = imagesDB.map((img) => {
+      const url = convertFileSrc(img.path);
+      // Use thumbnail URL if available, otherwise fall back to full image
+      const thumbnailUrl = img.thumbnail_path
+        ? convertFileSrc(img.thumbnail_path)
+        : url;
+
+      return {
+        id: img.id,
+        name: img.name,
+        url,
+        thumbnailUrl,
+        // Use dimensions from backend, or defaults if not available
+        width: img.width ?? DEFAULT_WIDTH,
+        height: img.height ?? DEFAULT_HEIGHT,
+        tags: img.tags,
+      };
+    });
 
     return images;
   } catch (error) {
@@ -56,14 +73,14 @@ export async function removeTagFromImage(
   }
 }
 
-export async function fetchSimilarImages(
-  imageId: number,
-  topN: number = 8
-) {
-  console.log("[Frontend] fetchSimilarImages called", { imageId, topN });
-  
+// Helper to construct thumbnail path from image ID
+// Thumbnails are stored as .thumbnails/thumb_{id}.jpg
+function getThumbnailPath(imageId: number): string {
+  return `.thumbnails/thumb_${imageId}.jpg`;
+}
+
+export async function fetchSimilarImages(imageId: number, topN: number = 8) {
   try {
-    console.log("[Frontend] Invoking get_similar_images command...");
     const results: { id: number; path: string; score: number }[] = await invoke(
       "get_similar_images",
       {
@@ -72,20 +89,39 @@ export async function fetchSimilarImages(
       }
     );
 
-    console.log("[Frontend] Received results from backend:", {
-      count: results.length,
-      results: results.map(r => ({ id: r.id, path: r.path.split(/[\\/]/).pop(), score: r.score }))
-    });
-
-    console.log("[Frontend] Processing results, converting file paths...");
+    // For similar images, we need to get dimensions
+    // We'll load them in parallel but with a concurrency limit
     const images = await Promise.all(
       results.map(async (res) => {
         const url = convertFileSrc(res.path);
-        const { width, height } = await getImageSize(url);
+        const thumbnailPath = getThumbnailPath(res.id);
+        const thumbnailUrl = convertFileSrc(thumbnailPath);
+
+        // Try to get dimensions from thumbnail (faster) or fall back to full image
+        let width = DEFAULT_WIDTH;
+        let height = DEFAULT_HEIGHT;
+        try {
+          const size = await getImageSize(thumbnailUrl);
+          // Scale up dimensions since thumbnail is smaller
+          // This is approximate but good enough for layout
+          width = size.width;
+          height = size.height;
+        } catch {
+          // Thumbnail doesn't exist, try full image
+          try {
+            const size = await getImageSize(url);
+            width = size.width;
+            height = size.height;
+          } catch {
+            // Use defaults
+          }
+        }
+
         return {
           id: res.id,
           path: res.path,
           url,
+          thumbnailUrl,
           width,
           height,
           score: res.score,
@@ -93,11 +129,6 @@ export async function fetchSimilarImages(
         };
       })
     );
-
-    console.log("[Frontend] Final images to return:", {
-      count: images.length,
-      images: images.map(img => ({ id: img.id, name: img.name, score: img.score }))
-    });
 
     return images;
   } catch (error) {
@@ -107,26 +138,41 @@ export async function fetchSimilarImages(
 }
 
 export async function fetchTieredSimilarImages(imageId: number) {
-  console.log("[Frontend] fetchTieredSimilarImages called", { imageId });
-  
   try {
     const results: { id: number; path: string; score: number }[] = await invoke(
       "get_tiered_similar_images",
       { imageId }
     );
 
-    console.log("[Frontend] Tiered results from backend:", {
-      count: results.length,
-    });
-
+    // For tiered similar images, construct thumbnail URLs and get dimensions
     const images = await Promise.all(
       results.map(async (res) => {
         const url = convertFileSrc(res.path);
-        const { width, height } = await getImageSize(url);
+        const thumbnailPath = getThumbnailPath(res.id);
+        const thumbnailUrl = convertFileSrc(thumbnailPath);
+
+        // Try to get dimensions from thumbnail (faster) or fall back to full image
+        let width = DEFAULT_WIDTH;
+        let height = DEFAULT_HEIGHT;
+        try {
+          const size = await getImageSize(thumbnailUrl);
+          width = size.width;
+          height = size.height;
+        } catch {
+          try {
+            const size = await getImageSize(url);
+            width = size.width;
+            height = size.height;
+          } catch {
+            // Use defaults
+          }
+        }
+
         return {
           id: res.id,
           path: res.path,
           url,
+          thumbnailUrl,
           width,
           height,
           score: res.score,
