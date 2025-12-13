@@ -1,120 +1,72 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ImageItem, SimilarImageItem, Tag } from "../types";
+import { ImageItem } from "../types";
 import { MasonryItem } from "./MasonryItem";
 import debounce from "lodash/debounce";
 import { MasonryAnchor } from "./MasonryAnchor";
-import { MasonrySelectedFrame } from "./MasonrySelectedFrame";
-import { useMeasure } from "@/hooks/useMeasure";
-import { MasonryItemSelected } from "./MasonryItemSelected";
 
 export type MasonryItemData = {
   itemData: ImageItem;
   x: number;
   y: number;
   width: number;
+  isSelected?: boolean;
 };
 
 interface MasonryProps {
   items?: ImageItem[];
-  tags?: Tag[];
+  selectedItem?: ImageItem | null;
   minItemWidth: number;
   columnGap: number;
   verticalGap: number;
-  selectedItem?: ImageItem | null;
   onItemClick: (item: ImageItem) => void;
-  focusedItem: MasonryItemData | null;
-  onItemFocus: (item: MasonryItemData) => void;
-  navigateBack: () => void;
-  onCreateTag: (name: string, color: string) => Promise<Tag>;
-  onAssignTag: (imageId: number, tagId: number) => void;
-  onRemoveTag: (imageId: number, tagId: number) => void;
-  similarItems?: SimilarImageItem[];
-  similarLoading?: boolean;
-  onSelectSimilar?: (id: number) => void;
 }
 
 export default function Masonry(props: MasonryProps) {
   const [items, setItems] = useState<MasonryItemData[]>([]);
   const [height, setHeight] = useState(0);
   const containerRef = useRef<HTMLDivElement>(null);
-  const { measure: locate } = useMeasure();
 
-  const selectedFrameWidthRef = useRef(0);
-  const selectedFrameHeightRef = useRef(0);
-
-  const refreshLayout = useCallback(async () => {
+  const refreshLayout = useCallback(() => {
     if (!containerRef.current) return;
     if (!props.items) return;
 
     const width = containerRef.current.clientWidth;
-    const colCount = Math.floor(width / props.minItemWidth);
-    let selectionCols = Math.min(colCount, 2);
-
+    const colCount = Math.max(1, Math.floor(width / props.minItemWidth));
     const columnWidth = (width - (colCount - 1) * props.columnGap) / colCount;
 
     const newItems: MasonryItemData[] = [];
-    const colHeights: number[] = [];
+    const colHeights: number[] = new Array(colCount).fill(0);
 
+    // If there's a selected item, place it first spanning 2 columns (or 1 if only 1 column)
     if (props.selectedItem) {
-      const selectedFrameWidth =
-        columnWidth * selectionCols + props.columnGap * (selectionCols - 1);
-      const { height: selectedFrameHeight } = await locate(
-        <MasonrySelectedFrame
-          item={props.selectedItem}
-          navigateBack={props.navigateBack}
-          tags={props.tags}
-          onCreateTag={props.onCreateTag}
-          onAssignTag={props.onAssignTag}
-          onRemoveTag={props.onRemoveTag}
-        />,
-        selectedFrameWidth
-      );
-      selectedFrameWidthRef.current = selectedFrameWidth;
-      selectedFrameHeightRef.current = selectedFrameHeight;
-
-      const {
-        x,
-        y,
-        width: imgWidth,
-      } = await locate(
-        <MasonrySelectedFrame
-          item={props.selectedItem}
-          navigateBack={props.navigateBack}
-          tags={props.tags}
-          onCreateTag={props.onCreateTag}
-          onAssignTag={props.onAssignTag}
-          onRemoveTag={props.onRemoveTag}
-        />,
-        selectedFrameWidth,
-        "img"
-      );
+      const selectedCols = Math.min(colCount, 2);
+      const selectedWidth = columnWidth * selectedCols + props.columnGap * (selectedCols - 1);
+      const ratio = selectedWidth / props.selectedItem.width;
+      const selectedHeight = props.selectedItem.height * ratio;
 
       newItems.push({
-        x,
-        y,
         itemData: props.selectedItem,
-        width: imgWidth,
+        x: 0,
+        y: 0,
+        width: selectedWidth,
+        isSelected: true,
       });
 
-      for (let i = 0; i < colCount; i++) {
-        if (i < selectionCols) {
-          colHeights[i] = selectedFrameHeight + props.verticalGap;
-        } else {
-          colHeights[i] = 0;
-        }
-      }
-    } else {
-      for (let i = 0; i < colCount; i++) {
-        colHeights[i] = 0;
+      // Update column heights for the columns the selected item spans
+      for (let i = 0; i < selectedCols; i++) {
+        colHeights[i] = selectedHeight + props.verticalGap;
       }
     }
 
+    // Place the rest of the items
     for (const img of props.items) {
-      if (props.selectedItem && img.url === props.selectedItem.url) continue;
+      // Skip the selected item since we already placed it
+      if (props.selectedItem && img.id === props.selectedItem.id) continue;
 
-      let minVal = Number.POSITIVE_INFINITY;
+      // Find shortest column
       let minIndex = 0;
-      for (let j = 0; j < colCount; j++) {
+      let minVal = colHeights[0];
+      for (let j = 1; j < colCount; j++) {
         if (colHeights[j] < minVal) {
           minIndex = j;
           minVal = colHeights[j];
@@ -128,22 +80,15 @@ export default function Masonry(props: MasonryProps) {
         x: minIndex * (columnWidth + props.columnGap),
         y: colHeights[minIndex],
         width: columnWidth,
+        isSelected: false,
       });
       colHeights[minIndex] += img.height * ratio + props.verticalGap;
     }
 
-    let colMax = 0;
-    colHeights.forEach((h) => (colMax = Math.max(colMax, h)));
-
+    const colMax = Math.max(...colHeights, 0);
     setHeight(colMax);
     setItems(newItems);
-  }, [
-    props.items,
-    props.verticalGap,
-    props.columnGap,
-    props.minItemWidth,
-    props.selectedItem,
-  ]);
+  }, [props.items, props.selectedItem, props.verticalGap, props.columnGap, props.minItemWidth]);
 
   const refreshLayoutDebounced = useMemo(() => {
     return debounce(() => {
@@ -153,63 +98,30 @@ export default function Masonry(props: MasonryProps) {
 
   useEffect(() => {
     const resizeHandle = () => refreshLayoutDebounced();
-
     window.addEventListener("resize", resizeHandle);
     return () => window.removeEventListener("resize", resizeHandle);
   }, [refreshLayoutDebounced]);
 
   useEffect(() => {
     refreshLayout();
-  }, [props.items, props.selectedItem]);
-
-  // const toNextItem = () => {
-  //   const index = props.items.findIndex(
-  //     (i) => i.url == props.selectedItem!.url
-  //   );
-  // };
+  }, [props.items, props.selectedItem, refreshLayout]);
 
   return (
     <div ref={containerRef} className="w-full relative" style={{ height }}>
-      <MasonryAnchor
-        visible={props.selectedItem != null}
-        x={0}
-        y={0}
-        width={selectedFrameWidthRef.current}
-        onTop={true}
-      >
-        <MasonrySelectedFrame
-          height={selectedFrameHeightRef.current}
-          item={props.selectedItem}
-          navigateBack={props.navigateBack}
-          tags={props.tags}
-          onCreateTag={props.onCreateTag}
-          onAssignTag={props.onAssignTag}
-          onRemoveTag={props.onRemoveTag}
-          similarItems={props.similarItems}
-          similarLoading={props.similarLoading}
-          onSelectSimilar={props.onSelectSimilar}
-        />
-      </MasonryAnchor>
       {items.map((item, index) => (
         <MasonryAnchor
-          key={item.itemData.url}
+          key={`${item.itemData.id}-${item.itemData.url}`}
           x={item.x}
           y={item.y}
           width={item.width}
-          onTop={props.selectedItem?.url == item.itemData.url}
+          onTop={item.isSelected || false}
         >
-          {props.selectedItem?.url == item.itemData.url ? (
-            <MasonryItemSelected
-              item={item.itemData}
-              onClick={props.onItemFocus}
-            />
-          ) : (
-            <MasonryItem
-              item={item.itemData}
-              onClick={props.onItemClick}
-              animationDelay={index * 0.1 + 0.1}
-            />
-          )}
+          <MasonryItem
+            item={item.itemData}
+            isSelected={item.isSelected}
+            onClick={props.onItemClick}
+            animationDelay={Math.min(index * 0.03, 0.5)}
+          />
         </MasonryAnchor>
       ))}
     </div>

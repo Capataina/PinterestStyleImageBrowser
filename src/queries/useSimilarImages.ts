@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { fetchSimilarImages } from "../services/images";
+import { fetchSimilarImages, fetchTieredSimilarImages } from "../services/images";
 import { SimilarImageItem } from "../types";
 
 export function useSimilarImages(imageId?: number, topN: number = 8) {
@@ -21,6 +21,14 @@ export function useSimilarImages(imageId?: number, topN: number = 8) {
     onError: (error) => {
       console.error("[React Query] Query error:", error);
     },
+  });
+}
+
+export function useTieredSimilarImages(imageId?: number) {
+  return useQuery<SimilarImageItem[]>({
+    queryKey: ["tiered-similar-images", imageId],
+    queryFn: () => fetchTieredSimilarImages(imageId!),
+    enabled: !!imageId,
   });
 }
 
