@@ -105,3 +105,39 @@ export async function fetchSimilarImages(
     throw new Error(`Failed to fetch similar images: ${error}`);
   }
 }
+
+export async function fetchTieredSimilarImages(imageId: number) {
+  console.log("[Frontend] fetchTieredSimilarImages called", { imageId });
+  
+  try {
+    const results: { id: number; path: string; score: number }[] = await invoke(
+      "get_tiered_similar_images",
+      { imageId }
+    );
+
+    console.log("[Frontend] Tiered results from backend:", {
+      count: results.length,
+    });
+
+    const images = await Promise.all(
+      results.map(async (res) => {
+        const url = convertFileSrc(res.path);
+        const { width, height } = await getImageSize(url);
+        return {
+          id: res.id,
+          path: res.path,
+          url,
+          width,
+          height,
+          score: res.score,
+          name: res.path.split(/[\\/]/).pop() ?? res.path,
+        };
+      })
+    );
+
+    return images;
+  } catch (error) {
+    console.error("[Frontend] Error in fetchTieredSimilarImages:", error);
+    throw new Error(`Failed to fetch tiered similar images: ${error}`);
+  }
+}

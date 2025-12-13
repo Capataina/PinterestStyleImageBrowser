@@ -1,41 +1,67 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { MasonryItemData } from "./Masonry";
+import { ImageItem } from "../types";
 import { motion } from "framer-motion";
 
+// Legacy type for backwards compatibility with masonry
+export interface MasonryItemData {
+  itemData: ImageItem;
+  x: number;
+  y: number;
+  width: number;
+}
+
 interface FullscreenImageProps {
-  masonryItem: MasonryItemData;
-  setFocusItem: (item: MasonryItemData | null) => void;
+  // Support both masonry item and direct image with rect
+  masonryItem?: MasonryItemData;
+  image?: ImageItem;
+  initialRect?: DOMRect;
+  onClose: () => void;
 }
 
 export function FullscreenImage(props: FullscreenImageProps) {
   const imgRef = useRef<HTMLImageElement>(null);
+  
+  // Get initial values from either masonryItem or initialRect
+  const imageData = props.masonryItem?.itemData || props.image;
+  const initialX = props.masonryItem?.x ?? props.initialRect?.left ?? 0;
+  const initialY = props.masonryItem?.y ?? props.initialRect?.top ?? 0;
+  const initialWidth = props.masonryItem?.width ?? props.initialRect?.width ?? 300;
+  
   const initialData = useMemo(
     () => ({
-      x: props.masonryItem.x,
-      y: props.masonryItem.y,
-      width: props.masonryItem.width,
+      x: initialX,
+      y: initialY,
+      width: initialWidth,
     }),
-    [props.masonryItem]
+    [initialX, initialY, initialWidth]
   );
+  
   const [data, setData] = useState({
-    x: props.masonryItem.x,
-    y: props.masonryItem.y,
-    width: props.masonryItem.width,
+    x: initialX,
+    y: initialY,
+    width: initialWidth,
   });
 
   const recalculatePosition = () => {
-    const rect = imgRef.current?.getBoundingClientRect()!;
-
-    let newWidth = 0;
-    let newHeight = 0;
-    if (rect.width > rect.height) {
-      newWidth = window.innerWidth * 0.6;
-      const ratio = newWidth / rect.width;
-      newHeight = rect.height * ratio;
+    if (!imageData) return;
+    
+    const aspectRatio = imageData.width / imageData.height;
+    
+    let newWidth: number;
+    let newHeight: number;
+    
+    // Fit image to 90% of viewport while maintaining aspect ratio
+    const maxWidth = window.innerWidth * 0.9;
+    const maxHeight = window.innerHeight * 0.9;
+    
+    if (maxWidth / aspectRatio <= maxHeight) {
+      // Width constrained
+      newWidth = maxWidth;
+      newHeight = maxWidth / aspectRatio;
     } else {
-      newHeight = window.innerHeight * 0.8;
-      const ratio = newHeight / rect.height;
-      newWidth = rect.width * ratio;
+      // Height constrained
+      newHeight = maxHeight;
+      newWidth = maxHeight * aspectRatio;
     }
 
     setData({
@@ -56,22 +82,35 @@ export function FullscreenImage(props: FullscreenImageProps) {
     };
   }, []);
 
+  // Handle escape key
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        props.onClose();
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [props.onClose]);
+
   const leaveFocus = () => {
     setData(initialData);
-    props.setFocusItem(null);
+    props.onClose();
   };
+
+  if (!imageData) return null;
 
   return (
     <motion.div
-      className="absolute top-0 left-0 right-0 bottom-0"
-      style={{ zIndex: 100 }}
+      className="fixed top-0 left-0 right-0 bottom-0"
+      style={{ zIndex: 200 }}
       initial={{
         backdropFilter: "blur(0px)",
         backgroundColor: "rgba(0, 0, 0, 0)",
       }}
       animate={{
-        backdropFilter: "blur(12px)",
-        backgroundColor: "rgba(0, 0, 0, 0.8)",
+        backdropFilter: "blur(16px)",
+        backgroundColor: "rgba(0, 0, 0, 0.9)",
       }}
       exit={{
         backdropFilter: "blur(0px)",
@@ -82,8 +121,9 @@ export function FullscreenImage(props: FullscreenImageProps) {
     >
       <img
         ref={imgRef}
-        className="absolute transition-all opacity-100 duration-300"
-        src={props.masonryItem.itemData.url}
+        className="absolute transition-all opacity-100 duration-300 rounded-lg shadow-2xl"
+        src={imageData.url}
+        alt={imageData.name}
         style={{
           transform: `translate(${data.x}px, ${data.y}px)`,
           width: `${data.width}px`,
