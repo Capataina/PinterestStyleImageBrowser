@@ -92,12 +92,14 @@ export function PinterestModal(props: PinterestModalProps) {
             </>
           )}
 
-          {/* Image Section */}
+          {/* Image Section - Uses full resolution URL (not thumbnail) for detailed viewing */}
           <div className="flex max-w-[60vw] items-center justify-center bg-gray-100">
             <img
               src={props.item.url}
               alt={props.item.name}
               className="max-h-[90vh] w-auto object-contain"
+              loading="eager"
+              decoding="async"
             />
           </div>
 

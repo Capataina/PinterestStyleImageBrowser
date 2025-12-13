@@ -37,9 +37,9 @@ export default function Masonry(props: MasonryProps) {
     const newItems: MasonryItemData[] = [];
     const colHeights: number[] = new Array(colCount).fill(0);
 
-    // If there's a selected item, place it first spanning 2 columns (or 1 if only 1 column)
+    // If there's a selected item, place it first spanning 3 columns (or fewer if not enough columns)
     if (props.selectedItem) {
-      const selectedCols = Math.min(colCount, 2);
+      const selectedCols = Math.min(colCount, 3); // Span up to 3 columns for larger display
       const selectedWidth = columnWidth * selectedCols + props.columnGap * (selectedCols - 1);
       const ratio = selectedWidth / props.selectedItem.width;
       const selectedHeight = props.selectedItem.height * ratio;
