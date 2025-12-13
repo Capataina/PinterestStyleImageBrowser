@@ -48,10 +48,11 @@ export default function Home() {
   // Otherwise show all images
   const displayImages = useMemo(() => {
     if (selectedItem && tieredSimilarImages.data) {
-      // Convert SimilarImageItem to ImageItem format
+      // Convert SimilarImageItem to ImageItem format (including thumbnailUrl)
       return tieredSimilarImages.data.map((sim) => ({
         id: sim.id,
         url: sim.url,
+        thumbnailUrl: sim.thumbnailUrl, // Use thumbnail for grid display
         width: sim.width,
         height: sim.height,
         name: sim.name || "",

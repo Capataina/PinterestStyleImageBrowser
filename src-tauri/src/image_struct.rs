@@ -9,6 +9,15 @@ pub struct ImageData {
     pub name: String,
     pub path: String,
     pub tags: Vec<Tag>,
+    /// Path to the thumbnail image (smaller version for grid display)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumbnail_path: Option<String>,
+    /// Original image width in pixels
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    /// Original image height in pixels
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
 }
 
 impl ImageData {
@@ -26,11 +35,30 @@ impl ImageData {
             .unwrap_or("unknown")
             .to_string();
 
-        return ImageData {
+        ImageData {
             id,
             name,
             path: path_str,
             tags,
-        };
+            thumbnail_path: None,
+            width: None,
+            height: None,
+        }
+    }
+
+    /// Create ImageData with thumbnail info
+    pub fn with_thumbnail(
+        id: ID,
+        path: &Path,
+        tags: Vec<Tag>,
+        thumbnail_path: Option<String>,
+        width: Option<u32>,
+        height: Option<u32>,
+    ) -> Self {
+        let mut data = Self::new(id, path, tags);
+        data.thumbnail_path = thumbnail_path;
+        data.width = width;
+        data.height = height;
+        data
     }
 }
