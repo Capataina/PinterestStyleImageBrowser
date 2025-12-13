@@ -4,6 +4,7 @@
 use image_browser_lib::{db::ImageDatabase, *};
 use similarity_and_semantic_search::encoder;
 use std::path::Path;
+use thumbnail::ThumbnailGenerator;
 
 fn index_directory(path: &std::path::Path, db: &mut ImageDatabase) {
     let scanner = filesystem::ImageScanner::new();
@@ -28,9 +29,25 @@ fn main() {
 
     index_directory(test_path, &mut database);
 
+    // Generate thumbnails for all missing images (before encoding for faster startup)
+    println!("=== Generating Thumbnails ===");
+    let thumbnail_dir = Path::new(".thumbnails");
+    let thumbnail_generator = ThumbnailGenerator::new(
+        thumbnail_dir,
+        400, // max width for thumbnails
+        400, // max height for thumbnails
+    )
+    .expect("failed to create thumbnail generator");
+
+    thumbnail_generator
+        .generate_all_missing_thumbnails(&database)
+        .expect("failed to generate thumbnails");
+
+    // Encode images for similarity search
     let mut encoder = encoder::Encoder::new(Path::new("models/model.onnx")).unwrap();
     encoder
         .encode_all_images_in_database(32, &database)
         .unwrap();
+
     image_browser_lib::run(database, db_path)
 }
