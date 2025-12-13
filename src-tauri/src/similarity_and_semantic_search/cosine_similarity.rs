@@ -169,6 +169,110 @@ impl CosineIndex {
 
         selected
     }
+
+    /// Get tiered similar images - Pinterest style
+    /// Samples images from progressively less similar tiers:
+    /// - 5 random from top 5%
+    /// - 5 random from top 5-10%
+    /// - 5 random from top 10-15%
+    /// ... and so on until top 50%
+    pub fn get_tiered_similar_images(
+        &self,
+        embedding: &Array1<f32>,
+        exclude_path: Option<&PathBuf>,
+    ) -> Vec<(PathBuf, f32)> {
+        println!("[CosineIndex] get_tiered_similar_images called - cached_images: {}, exclude_path: {:?}", 
+            self.cached_images.len(), exclude_path);
+
+        let mut similarities: Vec<(PathBuf, f32)> = self
+            .cached_images
+            .iter()
+            .filter_map(|(path, emb)| {
+                if let Some(exclude) = exclude_path {
+                    if path == exclude {
+                        return None;
+                    }
+                }
+                let sim = Self::cosine_similarity(embedding, emb);
+                Some((path.clone(), sim))
+            })
+            .collect();
+
+        if similarities.is_empty() {
+            println!("[CosineIndex] WARNING: No similarities calculated! Returning empty result.");
+            return Vec::new();
+        }
+
+        // Sort by similarity descending
+        similarities.sort_by(|a, b| match (b.1.is_nan(), a.1.is_nan()) {
+            (true, true) => std::cmp::Ordering::Equal,
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            (false, false) => b.1.partial_cmp(&a.1).unwrap(),
+        });
+
+        let total = similarities.len();
+        let mut result: Vec<(PathBuf, f32)> = Vec::new();
+        let mut rng = rand::rng();
+        let mut used_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+        // Sample from each tier: 0-5%, 5-10%, 10-15%, ..., 45-50%
+        let tiers = [
+            (0.0, 0.05, 5),  // top 5%: pick 5
+            (0.05, 0.10, 5), // 5-10%: pick 5
+            (0.10, 0.15, 5), // 10-15%: pick 5
+            (0.15, 0.20, 5), // 15-20%: pick 5
+            (0.20, 0.30, 5), // 20-30%: pick 5
+            (0.30, 0.40, 5), // 30-40%: pick 5
+            (0.40, 0.50, 5), // 40-50%: pick 5
+        ];
+
+        for (start_pct, end_pct, count) in tiers {
+            let start_idx = (total as f32 * start_pct).floor() as usize;
+            let end_idx = (total as f32 * end_pct).ceil() as usize;
+            let end_idx = end_idx.min(total);
+
+            if start_idx >= total {
+                break;
+            }
+
+            // Get indices in this tier that haven't been used
+            let available: Vec<usize> = (start_idx..end_idx)
+                .filter(|i| !used_indices.contains(i))
+                .collect();
+
+            // Randomly sample from available
+            let to_take = count.min(available.len());
+            let sampled: Vec<usize> = available
+                .choose_multiple(&mut rng, to_take)
+                .cloned()
+                .collect();
+
+            for idx in sampled {
+                used_indices.insert(idx);
+                result.push(similarities[idx].clone());
+            }
+        }
+
+        println!(
+            "[CosineIndex] Tiered sampling complete - returned {} images from {} total",
+            result.len(),
+            total
+        );
+
+        // Log score ranges
+        if !result.is_empty() {
+            let scores: Vec<f32> = result.iter().map(|(_, s)| *s).collect();
+            let min_score = scores.iter().cloned().fold(f32::INFINITY, f32::min);
+            let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            println!(
+                "[CosineIndex] Score range: {:.4} to {:.4}",
+                min_score, max_score
+            );
+        }
+
+        result
+    }
 }
 
 #[cfg(test)]

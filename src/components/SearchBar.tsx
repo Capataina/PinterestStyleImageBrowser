@@ -115,9 +115,9 @@ export function SearchBar(props: SearchBarProps) {
     <div className="relative w-full">
       <div
         ref={containerRef}
-        className="flex items-center gap-2 rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-within:ring-2 focus-within:ring-ring focus-within:ring-offset-2"
+        className="flex items-center gap-3 rounded-full border-0 bg-gray-100 px-5 py-3 text-base transition-all duration-200 focus-within:bg-white focus-within:shadow-lg focus-within:ring-2 focus-within:ring-gray-200"
       >
-        <SearchIcon className="size-4 shrink-0 opacity-50" />
+        <SearchIcon className="size-5 shrink-0 text-gray-500" />
 
         <div className="flex flex-1 flex-wrap items-center gap-1.5">
           {/* Tags on the left */}
@@ -141,7 +141,7 @@ export function SearchBar(props: SearchBarProps) {
             onChange={handleInputChange}
             onKeyDown={handleKeyDown}
             placeholder={props.placeholder || "Search..."}
-            className="flex-1 min-w-[120px] bg-transparent outline-none placeholder:text-muted-foreground"
+            className="flex-1 min-w-[120px] bg-transparent outline-none text-gray-800 placeholder:text-gray-400"
           />
         </div>
 
