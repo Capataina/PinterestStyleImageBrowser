@@ -64,7 +64,7 @@ File explorers struggle with large, nested image collections. This app improves 
 
 ## Roadmap and Milestones
 
-- [ ] **Milestone 1** – Basic Folder Viewer  
+- [x] **Milestone 1** – Basic Folder Viewer  
        Minimal grid, recursive scanning
 
 - [ ] **Milestone 2** – Database and Thumbnails  
@@ -96,7 +96,7 @@ File explorers struggle with large, nested image collections. This app improves 
 ### Frontend
 
 - [x] Simple grid showing full-resolution images
-- [ ] Folder picker or fixed path
+- [x] Folder picker or fixed path
 
 **Deliverable:** Basic viewer
 
@@ -110,13 +110,13 @@ File explorers struggle with large, nested image collections. This app improves 
 
 - [x] SQLite integration
 - [x] `images` table with metadata
-- [ ] Thumbnail generation stored in `/thumbs/`
-- [ ] `list_images(offset, limit)`
+- [x] Thumbnail generation stored in `/thumbs/`
+- [x] `list_images(offset, limit)`
 
 ### Frontend
 
-- [ ] Render thumbnails
-- [ ] Pagination → infinite scroll preparation
+- [x] Render thumbnails
+- [x] Pagination → infinite scroll preparation
 
 **Deliverable:** Thumbnail-based image library
 
@@ -136,8 +136,8 @@ File explorers struggle with large, nested image collections. This app improves 
 
 #### Backend
 
-- [ ] `tags` table
-- [ ] `image_tags` table
+- [x] `tags` table
+- [x] `image_tags` table
 - [ ] Commands:
   - `add_tag(image_id, name)`
   - `remove_tag(image_id, name)`
@@ -148,11 +148,11 @@ File explorers struggle with large, nested image collections. This app improves 
 
 - [ ] Add/remove tag UI
 - [ ] Tag chips under images
-- [ ] Tag filtering via search bar
+- [x] Tag filtering via search bar
 
 ### Search Bar (Phase 1: Tag/Filename Search)
 
-- [ ] Global search input
+- [x] Global search input
 - [ ] Filter image results:
   - Tags
   - Filenames (optional)
@@ -160,7 +160,7 @@ File explorers struggle with large, nested image collections. This app improves 
 
 ### Slideshow Mode
 
-- [ ] Fullscreen slideshow
+- [x] Fullscreen slideshow
 - [ ] Timer (N seconds per image)
 - [ ] Next/Previous
 - [ ] Works on:
@@ -178,18 +178,18 @@ File explorers struggle with large, nested image collections. This app improves 
 
 ### Backend
 
-- [ ] Add `embeddings` table
+- [x] Add `embeddings` table
 - [x] Integrate CLIP image encoder
-- [ ] Generate embeddings on indexing
-- [ ] Normalise vectors
-- [ ] Load into memory on startup
-- [ ] `get_similar(image_id, limit)`
+- [x] Generate embeddings on indexing
+- [x] Normalise vectors
+- [x] Load into memory on startup
+- [x] `get_similar(image_id, limit)`
 
 ### Frontend
 
-- [ ] "View Similar" button on image click
-- [ ] Masonry layout for similarity results
-- [ ] Slideshow support
+- [x] "View Similar" button on image click
+- [x] Masonry layout for similarity results
+- [x] Slideshow support
 
 **Deliverable:** Instant visual similarity search across the entire library
 
@@ -209,7 +209,6 @@ File explorers struggle with large, nested image collections. This app improves 
 
 ### Frontend
 
-- [ ] Search bar stays the same
 - [ ] Switch result rendering to semantic mode
 - [ ] Tag search and semantic search coexist naturally
 
