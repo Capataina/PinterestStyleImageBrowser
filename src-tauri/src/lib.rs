@@ -169,8 +169,9 @@ fn semantic_search(
     }
 
     // Find similar images using cosine similarity
+    // Use get_similar_images_sorted for semantic search to get results in proper order
     let query_array = Array1::from_vec(text_embedding);
-    let raw_results = index.get_similar_images(&query_array, top_n, None);
+    let raw_results = index.get_similar_images_sorted(&query_array, top_n, None);
     println!(
         "[Backend] Found {} similar images for query '{}'",
         raw_results.len(),

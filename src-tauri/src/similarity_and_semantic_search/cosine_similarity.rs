@@ -170,6 +170,81 @@ impl CosineIndex {
         selected
     }
 
+    /// Get the top N most similar images sorted by similarity score (descending).
+    /// Unlike get_similar_images, this does NOT randomly sample - it returns
+    /// results in exact order of similarity. Best for semantic search where
+    /// ranking accuracy matters.
+    pub fn get_similar_images_sorted(
+        &self,
+        embedding: &Array1<f32>,
+        top_n: usize,
+        exclude_path: Option<&PathBuf>,
+    ) -> Vec<(PathBuf, f32)> {
+        println!(
+            "[CosineIndex] get_similar_images_sorted called - cached_images: {}, top_n: {}, exclude_path: {:?}",
+            self.cached_images.len(),
+            top_n,
+            exclude_path
+        );
+
+        let mut similarities: Vec<(PathBuf, f32)> = self
+            .cached_images
+            .iter()
+            .filter_map(|(path, emb)| {
+                // Exclude the query image itself
+                if let Some(exclude) = exclude_path {
+                    if path == exclude {
+                        return None;
+                    }
+                }
+                let sim = Self::cosine_similarity(embedding, emb);
+                Some((path.clone(), sim))
+            })
+            .collect();
+
+        if similarities.is_empty() {
+            println!("[CosineIndex] WARNING: No similarities calculated! Returning empty result.");
+            return Vec::new();
+        }
+
+        // Sort by similarity descending (highest first)
+        similarities.sort_by(|a, b| match (b.1.is_nan(), a.1.is_nan()) {
+            (true, true) => std::cmp::Ordering::Equal,
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            (false, false) => b.1.partial_cmp(&a.1).unwrap(),
+        });
+
+        // Take exactly the top N results in order
+        let result: Vec<(PathBuf, f32)> = similarities.into_iter().take(top_n).collect();
+
+        println!(
+            "[CosineIndex] Returning {} results sorted by similarity",
+            result.len()
+        );
+
+        if !result.is_empty() {
+            println!("[CosineIndex] Top 5 results:");
+            for (i, (path, sim)) in result.iter().take(5).enumerate() {
+                println!(
+                    "  {}. {:?} - score: {:.4}",
+                    i + 1,
+                    path.file_name().unwrap_or_default(),
+                    sim
+                );
+            }
+            if result.len() > 1 {
+                println!(
+                    "[CosineIndex] Score range: {:.4} (best) to {:.4} (worst in top N)",
+                    result.first().map(|(_, s)| *s).unwrap_or(0.0),
+                    result.last().map(|(_, s)| *s).unwrap_or(0.0)
+                );
+            }
+        }
+
+        result
+    }
+
     /// Get tiered similar images - Pinterest style
     /// Samples images from progressively less similar tiers:
     /// - 5 random from top 5%
