@@ -323,7 +323,7 @@ mod tests {
         // Check if CUDA libraries are available at runtime
         println!("Attempting to create a session...");
 
-        let model_path = std::path::Path::new("models/model.onnx");
+        let model_path = std::path::Path::new("models/model_image.onnx");
         if !model_path.exists() {
             println!("Model file not found, skipping test");
             return;
@@ -367,7 +367,7 @@ mod tests {
     fn test_inference_speed() {
         use std::time::Instant;
 
-        let mut encoder = Encoder::new(std::path::Path::new("models/model.onnx")).unwrap();
+        let mut encoder = Encoder::new(std::path::Path::new("models/model_image.onnx")).unwrap();
 
         // Use one of your actual test images
         let test_image = std::path::Path::new(
@@ -430,7 +430,7 @@ mod tests {
 
     #[test]
     fn test_preprocess_image() {
-        let encoder = Encoder::new(Path::new("models/model.onnx")).unwrap();
+        let encoder = Encoder::new(Path::new("models/model_image.onnx")).unwrap();
 
         let result = encoder
             .preprocess_image(Path::new(
@@ -457,7 +457,7 @@ mod tests {
     fn test_preprocess_image_speed_single_vs_batch() {
         use std::time::{Duration, Instant};
 
-        let mut encoder = Encoder::new(Path::new("models/model.onnx")).unwrap();
+        let mut encoder = Encoder::new(Path::new("models/model_image.onnx")).unwrap();
         let image_paths = vec![
             Path::new("C:\\image-browser\\src-tauri\\test_images\\66bb951dcab9c27a144292c8_WestStudio-LOL-Splash-Vol2-021.jpg"),
             Path::new("C:\\image-browser\\src-tauri\\test_images\\613syV-a1sL._AC_UF894,1000_QL80_.jpg"),
@@ -535,7 +535,7 @@ mod tests {
     // write a test to test the batch preprocess image function
     #[test]
     fn test_batch_preprocess_image() {
-        let mut encoder = Encoder::new(Path::new("models/model.onnx")).unwrap();
+        let mut encoder = Encoder::new(Path::new("models/model_image.onnx")).unwrap();
         let image_paths = vec![
             Path::new("C:\\image-browser\\src-tauri\\test_images\\66bb951dcab9c27a144292c8_WestStudio-LOL-Splash-Vol2-021.jpg"),
             Path::new("C:\\image-browser\\src-tauri\\test_images\\613syV-a1sL._AC_UF894,1000_QL80_.jpg"),
@@ -552,13 +552,13 @@ mod tests {
 
     #[test]
     fn test_inspect_model() {
-        let encoder = Encoder::new(Path::new("models/model.onnx")).unwrap();
+        let encoder = Encoder::new(Path::new("models/model_image.onnx")).unwrap();
         encoder.inspect_model();
     }
 
     #[test]
     fn test_encode_basic() {
-        let mut encoder = Encoder::new(Path::new("models/model.onnx")).unwrap();
+        let mut encoder = Encoder::new(Path::new("models/model_image.onnx")).unwrap();
 
         let embedding = encoder
             .encode(Path::new("C:\\image-browser\\src-tauri\\test_images\\66bb951dcab9c27a144292c8_WestStudio-LOL-Splash-Vol2-021.jpg"))
@@ -589,7 +589,7 @@ mod tests {
 
     #[test]
     fn test_encode_consistency() {
-        let mut encoder = Encoder::new(Path::new("models/model.onnx")).unwrap();
+        let mut encoder = Encoder::new(Path::new("models/model_image.onnx")).unwrap();
 
         let image_path = Path::new("C:\\image-browser\\src-tauri\\test_images\\66bb951dcab9c27a144292c8_WestStudio-LOL-Splash-Vol2-021.jpg");
 
@@ -611,7 +611,7 @@ mod tests {
 
     #[test]
     fn test_encode_multiple_images() {
-        let mut encoder = Encoder::new(Path::new("models/model.onnx")).unwrap();
+        let mut encoder = Encoder::new(Path::new("models/model_image.onnx")).unwrap();
 
         // You'll need at least 2-3 test images for this
         let image_paths = vec![
@@ -650,7 +650,7 @@ mod tests {
 
     #[test]
     fn test_similarity_same_vs_different() {
-        let mut encoder = Encoder::new(Path::new("models/model.onnx")).unwrap();
+        let mut encoder = Encoder::new(Path::new("models/model_image.onnx")).unwrap();
 
         // You need at least 2 different images for this test
         let image1_path = Path::new("C:\\image-browser\\src-tauri\\test_images\\66bb951dcab9c27a144292c8_WestStudio-LOL-Splash-Vol2-021.jpg");
@@ -681,7 +681,7 @@ mod tests {
 
     #[test]
     fn test_encode_invalid_path() {
-        let mut encoder = Encoder::new(Path::new("models/model.onnx")).unwrap();
+        let mut encoder = Encoder::new(Path::new("models/model_image.onnx")).unwrap();
 
         let result = encoder.encode(Path::new("nonexistent_image.jpg"));
 
@@ -691,7 +691,7 @@ mod tests {
 
     #[test]
     fn test_embedding_value_ranges() {
-        let mut encoder = Encoder::new(Path::new("models/model.onnx")).unwrap();
+        let mut encoder = Encoder::new(Path::new("models/model_image.onnx")).unwrap();
 
         let embedding = encoder
             .encode(Path::new("C:\\image-browser\\src-tauri\\test_images\\66bb951dcab9c27a144292c8_WestStudio-LOL-Splash-Vol2-021.jpg"))
@@ -714,7 +714,7 @@ mod tests {
 
     #[test]
     fn test_encode_batch() {
-        let mut encoder = Encoder::new(Path::new("models/model.onnx")).unwrap();
+        let mut encoder = Encoder::new(Path::new("models/model_image.onnx")).unwrap();
 
         let paths = vec![
             Path::new("C:\\image-browser\\src-tauri\\test_images\\66bb951dcab9c27a144292c8_WestStudio-LOL-Splash-Vol2-021.jpg"),

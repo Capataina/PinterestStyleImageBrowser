@@ -44,7 +44,7 @@ fn main() {
         .expect("failed to generate thumbnails");
 
     // Encode images for similarity search
-    let mut encoder = encoder::Encoder::new(Path::new("models/model.onnx")).unwrap();
+    let mut encoder = encoder::Encoder::new(Path::new("models/model_image.onnx")).unwrap();
     encoder
         .encode_all_images_in_database(32, &database)
         .unwrap();
