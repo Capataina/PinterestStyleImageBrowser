@@ -1,4 +1,4 @@
-import { memo } from "react";
+import { memo, useState, useCallback, useRef } from "react";
 import { ImageItem } from "../types";
 import { motion } from "framer-motion";
 import { ZoomIn } from "lucide-react";
@@ -13,6 +13,7 @@ interface MasonryItemProps {
 /**
  * MasonryItem displays an image in the grid.
  * Uses thumbnailUrl for faster loading, but full resolution for selected items.
+ * Features 3D tilt effect on hover based on mouse position.
  */
 export const MasonryItem = memo(function MasonryItem(props: MasonryItemProps) {
   // Use full resolution for selected image (it's bigger, needs clarity)
@@ -21,25 +22,80 @@ export const MasonryItem = memo(function MasonryItem(props: MasonryItemProps) {
     ? props.item.url
     : (props.item.thumbnailUrl || props.item.url);
 
+  const [tilt, setTilt] = useState({ rotateX: 0, rotateY: 0 });
+  const [isHovered, setIsHovered] = useState(false);
+  const cardRef = useRef<HTMLDivElement>(null);
+
+  const handleMouseMove = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+    if (!cardRef.current) return;
+
+    const rect = cardRef.current.getBoundingClientRect();
+    const centerX = rect.left + rect.width / 2;
+    const centerY = rect.top + rect.height / 2;
+
+    // Calculate distance from center as percentage (-1 to 1)
+    const percentX = (e.clientX - centerX) / (rect.width / 2);
+    const percentY = (e.clientY - centerY) / (rect.height / 2);
+
+    // Max tilt angle in degrees (subtle effect)
+    const maxTilt = 6;
+
+    setTilt({
+      rotateX: -percentY * maxTilt, // Tilt up when mouse is at top
+      rotateY: percentX * maxTilt,  // Tilt right when mouse is at right
+    });
+  }, []);
+
+  const handleMouseEnter = useCallback(() => {
+    setIsHovered(true);
+  }, []);
+
+  const handleMouseLeave = useCallback(() => {
+    setIsHovered(false);
+    setTilt({ rotateX: 0, rotateY: 0 });
+  }, []);
+
   return (
     <motion.div
+      ref={cardRef}
       layout
       transition={{
-        duration: 0.25, // Slightly faster animation
+        duration: 0.25,
         ease: [0.25, 0.1, 0.25, 1],
         delay: props.animationDelay,
       }}
       initial={{ opacity: 0, scale: 0.97 }}
       animate={{ opacity: 1, scale: 1 }}
       exit={{ opacity: 0, scale: 0.97 }}
-      whileHover={{ scale: props.isSelected ? 1.01 : 1.02 }}
       onClick={() => props.onClick(props.item)}
+      onMouseMove={handleMouseMove}
+      onMouseEnter={handleMouseEnter}
+      onMouseLeave={handleMouseLeave}
       className="cursor-pointer group"
+      style={{
+        perspective: "1000px",
+      }}
     >
-      <div
-        className={`relative overflow-hidden rounded-2xl bg-gray-100 transition-all duration-200 ${props.isSelected
+      <motion.div
+        animate={{
+          rotateX: isHovered ? tilt.rotateX : 0,
+          rotateY: isHovered ? tilt.rotateY : 0,
+          scale: isHovered ? (props.isSelected ? 1.02 : 1.03) : 1,
+        }}
+        transition={{
+          type: "spring",
+          stiffness: 300,
+          damping: 20,
+          mass: 0.5,
+        }}
+        style={{
+          transformStyle: "preserve-3d",
+        }}
+        className={`relative overflow-hidden rounded-2xl bg-gray-100 transition-shadow duration-200 ${props.isSelected
           ? "shadow-2xl ring-4 ring-black/20"
-          : "shadow-sm group-hover:shadow-xl"
+          : isHovered
+            ? "shadow-xl ring-2 ring-black/10"
+            : "shadow-sm"
           }`}
       >
         <img
@@ -53,7 +109,7 @@ export const MasonryItem = memo(function MasonryItem(props: MasonryItemProps) {
         <div
           className={`absolute inset-0 transition-colors duration-150 ${props.isSelected
             ? "bg-black/0 group-hover:bg-black/20"
-            : "bg-black/0 group-hover:bg-black/10"
+            : "bg-black/0 group-hover:bg-black/5"
             }`}
         />
         {/* Click to inspect hint for selected items */}
@@ -70,7 +126,7 @@ export const MasonryItem = memo(function MasonryItem(props: MasonryItemProps) {
             Click to inspect
           </div>
         )}
-      </div>
+      </motion.div>
     </motion.div>
   );
 });
