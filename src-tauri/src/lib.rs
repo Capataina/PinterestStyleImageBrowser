@@ -1,10 +1,12 @@
 use std::sync::Mutex;
+use std::path::Path;
 use tauri::State;
 
 use crate::{
     db::{ImageDatabase, ID},
     image_struct::ImageData,
     similarity_and_semantic_search::cosine_similarity::CosineIndex,
+    similarity_and_semantic_search::encoder_text::TextEncoder,
     tag_struct::Tag,
 };
 
@@ -13,6 +15,16 @@ struct SimilarImage {
     id: ID,
     path: String,
     score: f32,
+}
+
+#[derive(serde::Serialize)]
+struct SemanticSearchResult {
+    id: ID,
+    path: String,
+    score: f32,
+    thumbnail_path: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
 }
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
@@ -26,6 +38,12 @@ pub mod thumbnail;
 pub struct CosineIndexState {
     pub index: Mutex<CosineIndex>,
     pub db_path: String,
+}
+
+/// State for the text encoder used in semantic search
+/// Lazy-loaded on first semantic search query
+pub struct TextEncoderState {
+    pub encoder: Mutex<Option<TextEncoder>>,
 }
 
 #[tauri::command]
@@ -68,6 +86,180 @@ fn remove_tag_from_image(
 ) -> Result<(), String> {
     db.remove_tag_from_image(image_id, tag_id)
         .map_err(|e| e.to_string())
+}
+
+/// Semantic search: find images matching a text query using CLIP embeddings
+#[tauri::command]
+fn semantic_search(
+    db: State<'_, ImageDatabase>,
+    cosine_state: State<'_, CosineIndexState>,
+    text_encoder_state: State<'_, TextEncoderState>,
+    query: String,
+    top_n: usize,
+) -> Result<Vec<SemanticSearchResult>, String> {
+    use ndarray::Array1;
+
+    println!(
+        "[Backend] semantic_search called - query: '{}', top_n: {}",
+        query, top_n
+    );
+
+    // Validate query
+    let query = query.trim();
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Lazy-load text encoder if not initialized
+    let mut encoder_lock = text_encoder_state
+        .encoder
+        .lock()
+        .map_err(|e| format!("Failed to lock text encoder: {e}"))?;
+
+    if encoder_lock.is_none() {
+        println!("[Backend] Initializing text encoder...");
+        let model_path = Path::new("models/model_text.onnx");
+        let tokenizer_path = Path::new("models/tokenizer.json");
+
+        if !model_path.exists() {
+            return Err(format!(
+                "Text model not found at: {}",
+                model_path.display()
+            ));
+        }
+        if !tokenizer_path.exists() {
+            return Err(format!(
+                "Tokenizer not found at: {}",
+                tokenizer_path.display()
+            ));
+        }
+
+        let encoder = TextEncoder::new(model_path, tokenizer_path)
+            .map_err(|e| format!("Failed to initialize text encoder: {e}"))?;
+
+        *encoder_lock = Some(encoder);
+        println!("[Backend] Text encoder initialized successfully");
+    }
+
+    let encoder = encoder_lock.as_mut().unwrap();
+
+    // Encode the text query
+    println!("[Backend] Encoding query: '{}'", query);
+    let text_embedding = encoder
+        .encode(query)
+        .map_err(|e| format!("Failed to encode query: {e}"))?;
+    println!(
+        "[Backend] Text embedding generated - length: {}",
+        text_embedding.len()
+    );
+
+    // Ensure cosine index is populated
+    let mut index = cosine_state
+        .index
+        .lock()
+        .map_err(|e| format!("Failed to lock cosine index: {e}"))?;
+
+    if index.cached_images.is_empty() {
+        println!("[Backend] Populating cosine index from database...");
+        index.populate_from_db(&cosine_state.db_path);
+        println!(
+            "[Backend] Cosine index populated with {} images",
+            index.cached_images.len()
+        );
+    }
+
+    // Find similar images using cosine similarity
+    let query_array = Array1::from_vec(text_embedding);
+    let raw_results = index.get_similar_images(&query_array, top_n, None);
+    println!(
+        "[Backend] Found {} similar images for query '{}'",
+        raw_results.len(),
+        query
+    );
+
+    // Helper function to normalize Windows paths
+    let normalize_path = |path_str: &str| -> String {
+        if path_str.starts_with("\\\\?\\") {
+            path_str[4..].to_string()
+        } else {
+            path_str.to_string()
+        }
+    };
+
+    // Get all images for flexible path matching and thumbnail info
+    let all_images = db.get_all_images().ok();
+
+    // Convert results to SemanticSearchResult with thumbnail info
+    let results: Vec<SemanticSearchResult> = raw_results
+        .into_iter()
+        .filter_map(|(path, score)| {
+            let path_str = path.to_string_lossy().to_string();
+            let normalized_path = normalize_path(&path_str);
+
+            // Try to find the image in the database
+            let image_info = db
+                .get_image_id_by_path(&normalized_path)
+                .ok()
+                .map(|id| (id, normalized_path.clone()))
+                .or_else(|| {
+                    db.get_image_id_by_path(&path_str)
+                        .ok()
+                        .map(|id| (id, path_str.clone()))
+                })
+                .or_else(|| {
+                    // Flexible matching
+                    all_images.as_ref().and_then(|images| {
+                        images.iter().find(|img| {
+                            let img_normalized = normalize_path(&img.path);
+                            img_normalized == normalized_path
+                                || img_normalized == path_str
+                                || img.path == normalized_path
+                                || img.path == path_str
+                        }).map(|img| (img.id, img.path.clone()))
+                    })
+                });
+
+            image_info.map(|(id, final_path)| {
+                // Get thumbnail info if available
+                let thumbnail_info = db.get_image_thumbnail_info(id).ok().flatten();
+                let (thumbnail_path, width, height) = thumbnail_info
+                    .map(|(tp, w, h)| (Some(tp), Some(w), Some(h)))
+                    .unwrap_or((None, None, None));
+
+                SemanticSearchResult {
+                    id,
+                    path: final_path,
+                    score,
+                    thumbnail_path,
+                    width,
+                    height,
+                }
+            })
+        })
+        .collect();
+
+    println!(
+        "[Backend] semantic_search returning {} results",
+        results.len()
+    );
+
+    if !results.is_empty() {
+        println!("[Backend] Top 5 results:");
+        for (i, r) in results.iter().take(5).enumerate() {
+            println!(
+                "  {}. id: {}, score: {:.4}, path: {}",
+                i + 1,
+                r.id,
+                r.score,
+                std::path::Path::new(&r.path)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+            );
+        }
+    }
+
+    Ok(results)
 }
 
 #[tauri::command]
@@ -406,10 +598,16 @@ pub fn run(db: ImageDatabase, db_path: String) {
         db_path: db_path.clone(),
     };
 
+    // Text encoder state (lazy-loaded on first semantic search)
+    let text_encoder_state = TextEncoderState {
+        encoder: Mutex::new(None),
+    };
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(db)
         .manage(cosine_state)
+        .manage(text_encoder_state)
         .invoke_handler(tauri::generate_handler![
             get_images,
             get_tags,
@@ -417,7 +615,8 @@ pub fn run(db: ImageDatabase, db_path: String) {
             add_tag_to_image,
             remove_tag_from_image,
             get_similar_images,
-            get_tiered_similar_images
+            get_tiered_similar_images,
+            semantic_search
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
