@@ -6,6 +6,8 @@ import {
   useRemoveTagFromImage,
 } from "../queries/useImages";
 import { useTieredSimilarImages } from "../queries/useSimilarImages";
+import { useSemanticSearch } from "../queries/useSemanticSearch";
+import { useDebouncedValue } from "../hooks/useDebouncedValue";
 import { ImageItem, Tag } from "../types";
 import { AnimatePresence, motion } from "framer-motion";
 import { useLocation, useNavigate } from "react-router";
@@ -19,10 +21,28 @@ export default function Home() {
   const [isInspecting, setIsInspecting] = useState(false);
   const [searchTags, setSearchTags] = useState<Tag[]>([]);
   const [searchText, setSearchText] = useState("");
+
+  // Debounce search text for semantic search (300ms delay)
+  const debouncedSearchText = useDebouncedValue(searchText, 300);
+
+  // Determine if we should use semantic search:
+  // - Has search text that doesn't start with # (tag selector)
+  // - No selected item (not viewing similar images)
+  const semanticQuery = debouncedSearchText.trim();
+  const shouldUseSemanticSearch =
+    semanticQuery.length > 0 && !semanticQuery.startsWith("#") && !selectedItem;
+
   const images = useImages({
     tagIds: searchTags.map((t) => t.id),
     searchText: searchText,
   });
+
+  // Semantic search query (only runs when shouldUseSemanticSearch is true)
+  const semanticSearchResults = useSemanticSearch(
+    shouldUseSemanticSearch ? semanticQuery : "",
+    50
+  );
+
   const tags = useTags();
   const createTagMutation = useCreateTag();
   const assignTagMutation = useAssignTagToImage();
@@ -46,23 +66,47 @@ export default function Home() {
     }
   }, [location, images.data]);
 
-  // When an image is selected, show tiered similar images in the grid
-  // Otherwise show all images
+  // Determine which images to display:
+  // Priority: 1) Similar images (when image selected) > 2) Semantic search > 3) All images
   const displayImages = useMemo(() => {
+    // 1. If an image is selected, show tiered similar images
     if (selectedItem && tieredSimilarImages.data) {
-      // Convert SimilarImageItem to ImageItem format (including thumbnailUrl)
       return tieredSimilarImages.data.map((sim) => ({
         id: sim.id,
         url: sim.url,
-        thumbnailUrl: sim.thumbnailUrl, // Use thumbnail for grid display
+        thumbnailUrl: sim.thumbnailUrl,
         width: sim.width,
         height: sim.height,
         name: sim.name || "",
         tags: [] as Tag[],
       }));
     }
+
+    // 2. If semantic search is active and has results, show those
+    if (shouldUseSemanticSearch && semanticSearchResults.data) {
+      return semanticSearchResults.data.map((sim) => ({
+        id: sim.id,
+        url: sim.url,
+        thumbnailUrl: sim.thumbnailUrl,
+        width: sim.width,
+        height: sim.height,
+        name: sim.name || "",
+        tags: [] as Tag[],
+      }));
+    }
+
+    // 3. Default: show all images (with optional tag filter)
     return images.data;
-  }, [selectedItem, tieredSimilarImages.data, images.data]);
+  }, [
+    selectedItem,
+    tieredSimilarImages.data,
+    shouldUseSemanticSearch,
+    semanticSearchResults.data,
+    images.data,
+  ]);
+
+  // Determine if we're in a loading state
+  const isSearchLoading = shouldUseSemanticSearch && semanticSearchResults.isFetching;
 
   const handleClose = () => {
     setIsInspecting(false);
@@ -171,6 +215,41 @@ export default function Home() {
               >
                 ← Back to all
               </button>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Semantic search status */}
+        <AnimatePresence>
+          {shouldUseSemanticSearch && !selectedItem && (
+            <motion.div
+              initial={{ opacity: 0, y: -10 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -10 }}
+              className="mb-6"
+            >
+              <div className="flex items-center gap-2">
+                <h2 className="text-xl font-semibold text-gray-800">
+                  {isSearchLoading ? (
+                    <span className="flex items-center gap-2">
+                      <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-gray-300 border-t-gray-600" />
+                      Searching for "{semanticQuery}"...
+                    </span>
+                  ) : (
+                    `Results for "${semanticQuery}"`
+                  )}
+                </h2>
+              </div>
+              {!isSearchLoading && semanticSearchResults.data && (
+                <p className="text-sm text-gray-500 mt-1">
+                  Found {semanticSearchResults.data.length} matching images
+                </p>
+              )}
+              {semanticSearchResults.isError && (
+                <p className="text-sm text-red-500 mt-1">
+                  Search failed. Make sure the text model is available.
+                </p>
+              )}
             </motion.div>
           )}
         </AnimatePresence>

@@ -64,6 +64,7 @@ impl Encoder {
         image_path: &Path,
     ) -> Result<ndarray::Array4<f32>, Box<dyn std::error::Error>> {
         let img = ImageReader::open(image_path)?
+            .with_guessed_format()?
             .decode()?
             .resize_exact(224, 224, image::imageops::FilterType::Nearest)
             .to_rgb8();

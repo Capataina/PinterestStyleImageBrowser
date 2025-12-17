@@ -1,6 +1,6 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { getImageSize } from "../utils";
-import { ImageData, ImageItem } from "../types";
+import { ImageData, ImageItem, SimilarImageItem } from "../types";
 
 // Default dimensions if backend doesn't provide them (fallback)
 const DEFAULT_WIDTH = 800;
@@ -185,5 +185,45 @@ export async function fetchTieredSimilarImages(imageId: number) {
   } catch (error) {
     console.error("[Frontend] Error in fetchTieredSimilarImages:", error);
     throw new Error(`Failed to fetch tiered similar images: ${error}`);
+  }
+}
+
+/**
+ * Semantic search: find images matching a text query using CLIP embeddings.
+ * Supports 50+ languages thanks to the multilingual CLIP model.
+ *
+ * @param query - The search text (e.g., "blue ocean", "dog playing", "夕焼け")
+ * @param topN - Maximum number of results to return (default: 50)
+ */
+export async function semanticSearch(
+  query: string,
+  topN: number = 50
+): Promise<SimilarImageItem[]> {
+  try {
+    const results: {
+      id: number;
+      path: string;
+      score: number;
+      thumbnail_path?: string;
+      width?: number;
+      height?: number;
+    }[] = await invoke("semantic_search", { query, topN });
+
+    // Convert backend results to frontend format
+    return results.map((res) => ({
+      id: res.id,
+      path: res.path,
+      url: convertFileSrc(res.path),
+      thumbnailUrl: res.thumbnail_path
+        ? convertFileSrc(res.thumbnail_path)
+        : convertFileSrc(getThumbnailPath(res.id)),
+      width: res.width ?? DEFAULT_WIDTH,
+      height: res.height ?? DEFAULT_HEIGHT,
+      score: res.score,
+      name: res.path.split(/[\\/]/).pop() ?? res.path,
+    }));
+  } catch (error) {
+    console.error("[Frontend] Error in semanticSearch:", error);
+    throw new Error(`Semantic search failed: ${error}`);
   }
 }
