@@ -12,6 +12,7 @@ import { useLocation, useNavigate } from "react-router";
 import { useTags, useCreateTag } from "@/queries/useTags";
 import { SearchBar } from "@/components/SearchBar";
 import { PinterestModal } from "@/components/PinterestModal";
+import { useQueryClient } from "@tanstack/react-query";
 
 export default function Home() {
   const [selectedItem, setSelectedItem] = useState<ImageItem | null>(null);
@@ -30,6 +31,7 @@ export default function Home() {
 
   const location = useLocation();
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
 
   // Find selected item from URL
   useEffect(() => {
@@ -64,6 +66,8 @@ export default function Home() {
 
   const handleClose = () => {
     setIsInspecting(false);
+    // Invalidate images query to force refetch with new random order
+    queryClient.invalidateQueries({ queryKey: ["images"] });
     navigate("/");
   };
 
