@@ -74,6 +74,9 @@ impl SimpleTokenizer {
     }
 
     /// Tokenize text into token IDs
+    /// Note: The multilingual CLIP tokenizer uses lowercase: false per tokenizer.json,
+    /// but for WordPiece lookup we need to try both original case and lowercase
+    /// since the vocab may contain either form.
     pub fn encode(&self, text: &str, add_special_tokens: bool) -> (Vec<i64>, Vec<i64>) {
         let mut input_ids = Vec::new();
         let mut attention_mask = Vec::new();
@@ -85,8 +88,8 @@ impl SimpleTokenizer {
         }
 
         // Simple whitespace + subword tokenization
-        let text_lower = text.to_lowercase();
-        let words: Vec<&str> = text_lower.split_whitespace().collect();
+        // Keep original case as the model uses lowercase: false
+        let words: Vec<&str> = text.split_whitespace().collect();
 
         for word in words {
             let word_tokens = self.tokenize_word(word);
@@ -106,6 +109,7 @@ impl SimpleTokenizer {
     }
 
     /// Tokenize a single word using WordPiece-style tokenization
+    /// Tries original case first, then lowercase as fallback for vocab lookup
     fn tokenize_word(&self, word: &str) -> Vec<i64> {
         let mut tokens = Vec::new();
         let chars: Vec<char> = word.chars().collect();
@@ -116,18 +120,38 @@ impl SimpleTokenizer {
             let mut found = false;
 
             while start < end {
+                // Build substring for this position
+                let substr_base: String = chars[start..end].iter().collect();
                 let substr: String = if start == 0 {
-                    chars[start..end].iter().collect()
+                    substr_base.clone()
                 } else {
-                    format!("##{}", chars[start..end].iter().collect::<String>())
+                    format!("##{}", substr_base)
                 };
 
+                // Try original case first
                 if let Some(&token_id) = self.vocab.get(&substr) {
                     tokens.push(token_id);
                     found = true;
                     start = end;
                     break;
                 }
+
+                // Try lowercase as fallback (some multilingual vocabs have mixed case)
+                let substr_lower: String = if start == 0 {
+                    substr_base.to_lowercase()
+                } else {
+                    format!("##{}", substr_base.to_lowercase())
+                };
+
+                if substr_lower != substr {
+                    if let Some(&token_id) = self.vocab.get(&substr_lower) {
+                        tokens.push(token_id);
+                        found = true;
+                        start = end;
+                        break;
+                    }
+                }
+
                 end -= 1;
             }
 
