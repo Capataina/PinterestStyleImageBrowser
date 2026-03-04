@@ -1,5 +1,5 @@
-import { useState, useRef, useEffect } from "react";
-import { SearchIcon, XCircleIcon } from "lucide-react";
+import { useState, useRef, useEffect, useMemo } from "react";
+import { SearchIcon, XCircleIcon, PlusCircleIcon } from "lucide-react";
 import { Badge } from "./ui/badge";
 import { RxCrossCircled } from "react-icons/rx";
 import {
@@ -8,6 +8,7 @@ import {
   CommandGroup,
   CommandItem,
   CommandList,
+  CommandSeparator,
 } from "./ui/command";
 import { Popover, PopoverContent, PopoverAnchor } from "./ui/popover";
 import { Tag } from "@/types";
@@ -48,11 +49,23 @@ export function SearchBar(props: SearchBarProps) {
 
   const filteredTags = props.tags
     ? props.tags.filter(
-        (tag) =>
-          tag.name.toLowerCase().includes(suggestionsFilter.toLowerCase()) &&
-          !selectedTagIds.includes(tag.id)
-      )
+      (tag) =>
+        tag.name.toLowerCase().includes(suggestionsFilter.toLowerCase()) &&
+        !selectedTagIds.includes(tag.id)
+    )
     : [];
+
+  // Check if the filter text exactly matches an existing tag
+  const exactMatch = useMemo(() => {
+    if (!props.tags || !suggestionsFilter.trim()) return null;
+    return props.tags.find(
+      (t) => t.name.toLowerCase() === suggestionsFilter.trim().toLowerCase()
+    );
+  }, [props.tags, suggestionsFilter]);
+
+  // Show create option when there's input after # and no exact match
+  const showCreateOption =
+    suggestionsFilter.trim() && !exactMatch && props.onCreateTag;
 
   // Extract state for parent
   useEffect(() => {
@@ -79,11 +92,24 @@ export function SearchBar(props: SearchBarProps) {
     setTimeout(() => inputRef.current?.focus(), 0);
   };
 
+  const handleCreateTag = async () => {
+    if (!props.onCreateTag || !suggestionsFilter.trim()) return;
+
+    const newTag = await props.onCreateTag(suggestionsFilter.trim(), "#3B82F6");
+    if (newTag) {
+      handleTagSelect(newTag);
+    }
+  };
+
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     // Handle Enter when suggestions are showing
-    if (e.key === "Enter" && showSuggestions && filteredTags.length > 0) {
+    if (e.key === "Enter" && showSuggestions) {
       e.preventDefault();
-      handleTagSelect(filteredTags[0]);
+      if (filteredTags.length > 0) {
+        handleTagSelect(filteredTags[0]);
+      } else if (showCreateOption) {
+        handleCreateTag();
+      }
       return;
     }
 
@@ -167,9 +193,35 @@ export function SearchBar(props: SearchBarProps) {
         >
           <Command>
             <CommandList>
-              <CommandGroup>
-                {filteredTags.length > 0 ? (
-                  filteredTags.map((tag) => (
+              {/* Create new tag option */}
+              {showCreateOption && (
+                <>
+                  <CommandGroup>
+                    <CommandItem
+                      value={`create-${suggestionsFilter}`}
+                      onSelect={handleCreateTag}
+                      className="cursor-pointer"
+                    >
+                      <PlusCircleIcon className="mr-2 h-4 w-4 text-blue-500" />
+                      <span>
+                        Create "
+                        <span className="font-medium">
+                          {suggestionsFilter.trim()}
+                        </span>
+                        "
+                      </span>
+                    </CommandItem>
+                  </CommandGroup>
+                  {filteredTags.length > 0 && <CommandSeparator />}
+                </>
+              )}
+
+              {/* Existing tags */}
+              {filteredTags.length > 0 ? (
+                <CommandGroup
+                  heading={showCreateOption ? "Existing tags" : undefined}
+                >
+                  {filteredTags.map((tag) => (
                     <CommandItem
                       key={tag.id}
                       value={tag.id.toString()}
@@ -180,11 +232,17 @@ export function SearchBar(props: SearchBarProps) {
                         {tag.name}
                       </Badge>
                     </CommandItem>
-                  ))
-                ) : (
-                  <CommandEmpty>No tags found</CommandEmpty>
-                )}
-              </CommandGroup>
+                  ))}
+                </CommandGroup>
+              ) : (
+                !showCreateOption && (
+                  <CommandEmpty>
+                    {props.tags && props.tags.length > 0
+                      ? "No tags found"
+                      : "Type to create a new tag"}
+                  </CommandEmpty>
+                )
+              )}
             </CommandList>
           </Command>
         </PopoverContent>

@@ -52,7 +52,9 @@ impl ThumbnailGenerator {
         let thumbnail_path = self.thumbnail_dir.join(&thumbnail_filename);
 
         // Load the original image to get dimensions
-        let img = ImageReader::open(image_path)?.decode()?;
+        let img = ImageReader::open(image_path)?
+            .with_guessed_format()?
+            .decode()?;
         let (original_width, original_height) = (img.width(), img.height());
 
         // Check if thumbnail already exists

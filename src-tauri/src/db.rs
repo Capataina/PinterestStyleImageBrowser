@@ -492,7 +492,11 @@ impl ImageDatabase {
                 img
             })
             .collect();
-        images.sort_by_key(|img| img.id);
+
+        // Shuffle images randomly instead of sorting by ID
+        use rand::seq::SliceRandom;
+        let mut rng = rand::rng();
+        images.shuffle(&mut rng);
 
         Ok(images)
     }
