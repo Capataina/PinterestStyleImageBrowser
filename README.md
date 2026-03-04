@@ -1,255 +1,216 @@
-# Local-First Pinterest-Style Image Browser
+# Image Browser
 
-A lightweight, high-performance desktop application for browsing large local image collections using a modern Pinterest-style masonry layout, manual tagging, a built-in search bar, visual similarity search, semantic search, and an optional timed slideshow mode.
-
-Built with Rust, Tauri, and React. Designed to handle thousands of images smoothly with complete offline privacy.
-
-**Use it for:**
-
-- Organising personal photos
-- Browsing inspiration packs or mood boards
-- Managing art and design reference libraries
-- Searching images by tags or meaning
-- Finding visually similar images
-- Running slideshows for study or review
+> A local-first desktop application for browsing and searching large image collections — Pinterest-style masonry layout, manual tagging, CLIP-powered visual similarity search, and natural language semantic search, all running entirely on your machine with no cloud, no accounts, and no external services.
 
 ---
 
-## Overview
+## Why Image Browser exists
 
-File explorers struggle with large, nested image collections. This app improves the experience with:
+File explorers are built for files, not images. When you have thousands of images across nested folders — reference collections, inspiration boards, photography libraries, art assets — navigating them with a file explorer means clicking through directories one by one with no way to search by meaning, find visually similar images, or organise by anything other than filename or date.
 
-- **Pinterest-style masonry grid**
-- **Manual tagging system**
-- **Universal search bar** (tags initially, semantic search later)
-- **Semantic search** via CLIP (e.g. "forest", "portrait", "cat", "architecture")
-- **Similarity search** ("show similar images")
-- **Slideshow viewer**
-- **Fully local thumbnail and embedding database**
-- **No cloud, no accounts, no external services**
+Image Browser solves this by treating your local image library as a first-class collection: thumbnailed, indexed, tagged, and searchable — both by text labels and by semantic meaning. You can type "dark cinematic lighting" or "forest path at dusk" and find matching images without having manually tagged them. You can click any image and instantly surface the visually similar ones from across your entire library.
+
+Everything runs locally. Embeddings are generated on your machine using ONNX Runtime. Nothing leaves your computer.
 
 ---
 
-## Architecture Overview
+## What Image Browser does
 
-### Frontend
-
-- React SPA inside Tauri
-- Masonry grid feed
-- Tag chips and tag editor
-- Search bar (tag search initially, semantic later)
-- "View Similar" page
-- Slideshow viewer
-
-### Backend (Rust)
-
-- Tauri IPC commands
-- Recursive folder scanning
-- Thumbnail generation
-- SQLite database:
-  - Image metadata
-  - Tags
-  - Embeddings
-- ONNX Runtime for CLIP image and text encoders
-- Cosine similarity engine
-
-### Data
-
-- SQLite stored locally
-- Thumbnails cached in `/thumbs/`
-- Embeddings stored as BLOB
-- Original images untouched
+- **Pinterest-style masonry grid** — infinite scroll layout that handles thousands of images without performance degradation
+- **Manual tagging** — add and remove tags per image, filter the entire library by tag
+- **Visual similarity search** — click any image to find the most visually similar ones across the full library using CLIP image embeddings
+- **Semantic search** — type natural language queries ("skull", "neon cityscape", "dynamic pose") and retrieve matching images using CLIP text embeddings compared against stored image embeddings
+- **Slideshow mode** — fullscreen slideshow across any view: main feed, tag-filtered results, or search results
+- **Fully offline** — all computation, indexing, and inference runs locally with no network requirements
 
 ---
 
-## Roadmap and Milestones
+## Architecture
 
-- [x] **Milestone 1** – Basic Folder Viewer  
-       Minimal grid, recursive scanning
+Image Browser runs as a local Tauri desktop application:
 
-- [ ] **Milestone 2** – Database and Thumbnails  
-       SQLite and thumbnail caching
-
-- [ ] **Milestone 3** – Masonry UI, Slideshow, Search Bar, and Manual Tagging  
-       Pinterest-style feed, search bar UI (tag search), tagging, slideshow
-
-- [ ] **Milestone 4** – Similarity Search  
-       CLIP image embeddings → "View Similar Images"
-
-- [ ] **Milestone 5** – Semantic Search  
-       Enhance the existing search bar with CLIP text embeddings
-
-- [ ] **Milestone 6** – Reserved for Future Features  
-       (Boards, auto-tagging, video/GIF support, etc.)
-
----
-
-## Milestone 1: Basic Folder Viewer
-
-**Goal:** Display images from disk in a basic grid
-
-### Backend
-
-- [x] Set up Tauri project
-- [x] `scan_folder(path)` (recursive image lookup)
-
-### Frontend
-
-- [x] Simple grid showing full-resolution images
-- [x] Folder picker or fixed path
-
-**Deliverable:** Basic viewer
+```
+┌─────────────────────────────────────────┐
+│            React Frontend               │
+│  Masonry grid, search bar, tag UI       │
+│  Slideshow, similarity results view     │
+└──────────────────┬──────────────────────┘
+                   │ Tauri IPC
+┌──────────────────▼──────────────────────┐
+│            Rust Backend                 │
+│  Folder scanning, thumbnail generation  │
+│  Tag management, search logic           │
+│  CLIP embedding generation              │
+│  Cosine similarity engine               │
+└──────────────────┬──────────────────────┘
+                   │
+┌──────────────────▼──────────────────────┐
+│           Local Storage                 │
+│  SQLite: image metadata, tags,          │
+│  embeddings                             │
+│  Thumbnail cache on disk                │
+└──────────────────┬──────────────────────┘
+                   │
+┌──────────────────▼──────────────────────┐
+│           ONNX Runtime                  │
+│  CLIP image encoder (local inference)   │
+│  CLIP text encoder (local inference)    │
+└─────────────────────────────────────────┘
+```
 
 ---
 
-## Milestone 2: Database and Thumbnails
+## Design Principles
 
-**Goal:** Persistent local library with fast thumbnail browsing
-
-### Backend
-
-- [x] SQLite integration
-- [x] `images` table with metadata
-- [x] Thumbnail generation stored in `/thumbs/`
-- [x] `list_images(offset, limit)`
-
-### Frontend
-
-- [x] Render thumbnails
-- [x] Pagination → infinite scroll preparation
-
-**Deliverable:** Thumbnail-based image library
+- **Local-first**: all computation, storage, and inference runs on your machine — no cloud dependencies, no API keys, no network required
+- **Privacy by construction**: original images are never modified or uploaded; thumbnails and embeddings are derived locally and stored in a local SQLite database
+- **Performance at scale**: thumbnail caching and embedding precomputation mean the UI stays fast regardless of library size
+- **Offline ML inference**: CLIP embeddings are generated and compared entirely via ONNX Runtime — no Python, no external ML service, no GPU required
+- **Separation of concerns**: React frontend, Tauri IPC layer, Rust backend logic, and SQLite persistence are cleanly separated and independently testable
 
 ---
 
-## Milestone 3: Masonry UI, Slideshow, Search Bar, and Manual Tagging
+## Roadmap
 
-**Goal:** Deliver the core UX (browsing, searching, tagging, and viewing)
-
-### Masonry Grid (Frontend)
-
-- [x] Infinite scroll masonry layout
-- [x] Hover interactions
-- [x] Click to inspect image
-
-### Manual Tagging
-
-#### Backend
-
-- [x] `tags` table
-- [x] `image_tags` table
-- [ ] Commands:
-  - `add_tag(image_id, name)`
-  - `remove_tag(image_id, name)`
-  - `list_tags(image_id)`
-  - `filter_by_tag(name)`
-
-#### Frontend
-
-- [ ] Add/remove tag UI
-- [ ] Tag chips under images
-- [x] Tag filtering via search bar
-
-### Search Bar (Phase 1: Tag/Filename Search)
-
-- [x] Global search input
-- [ ] Filter image results:
-  - Tags
-  - Filenames (optional)
-  - Pack roots (optional)
-
-### Slideshow Mode
-
-- [x] Fullscreen slideshow
-- [ ] Timer (N seconds per image)
-- [ ] Next/Previous
-- [ ] Works on:
-  - Main feed
-  - Tag-filtered feed
-  - Search-filtered feed
-
-**Deliverable:** Fully functional browsing UX with search, tags, and slideshow
+- [x] Milestone 1: Basic Folder Viewer
+- [x] Milestone 2: Database & Thumbnail System
+- [x] Milestone 3: Masonry UI, Tagging & Slideshow
+- [x] Milestone 4: Visual Similarity Search
+- [ ] Milestone 5: Semantic Search
+- [ ] Milestone 6: Future Extensions
 
 ---
 
-## Milestone 4: Similarity Search
-
-**Goal:** "View Similar Images" using CLIP image embeddings
-
-### Backend
-
-- [x] Add `embeddings` table
-- [x] Integrate CLIP image encoder
-- [x] Generate embeddings on indexing
-- [x] Normalise vectors
-- [x] Load into memory on startup
-- [x] `get_similar(image_id, limit)`
-
-### Frontend
-
-- [x] "View Similar" button on image click
-- [x] Masonry layout for similarity results
-- [x] Slideshow support
-
-**Deliverable:** Instant visual similarity search across the entire library
+## 📍 Milestones
 
 ---
 
-## Milestone 5: Semantic Search
+### Milestone 1 — Basic Folder Viewer ✅
 
-**Goal:** Upgrade the existing search bar to support natural language search
+> **Goal**: Display images from a local folder in a basic grid — the minimal foundation proving the Tauri + Rust + React stack works end to end
 
-### Backend
-
-- [ ] Integrate CLIP text encoder
-- [ ] Replace/extend search logic:
-  - `search_images(query_text, limit)`
-  - Compare text embedding with every image embedding
-- [ ] Cosine similarity ranking
-
-### Frontend
-
-- [ ] Switch result rendering to semantic mode
-- [ ] Tag search and semantic search coexist naturally
-
-**Example Queries:**
-
-- "skull"
-- "female portrait"
-- "forest path"
-- "dark cinematic lighting"
-- "neon cityscape"
-- "dynamic gesture pose"
-
-**Deliverable:** A fully intelligent search system without relying on manual tags
+#### Core Concept
+Before any intelligence is added, the application needs to do one thing: open a folder and display its images. This milestone establishes the full stack — Tauri desktop shell, Rust backend command handling, React frontend rendering — so every subsequent milestone builds on proven infrastructure.
 
 ---
 
-## Milestone 6: Reserved for Future Extensions
+- [x] Tauri project set up and running locally
+- [x] Recursive folder scan finding all image files in a selected directory
+- [x] Basic grid displaying full-resolution images
+- [x] Folder picker allowing the user to select any directory
 
-**Possible expansions:**
+**Exit criteria**: Application launches, user selects a folder, images display in a grid
 
-- Auto-tagging with CLIP
-- GIF/video embedding (frame sampling)
+---
+
+### Milestone 2 — Database & Thumbnail System ✅
+
+> **Goal**: Replace full-resolution grid with a fast thumbnail-based library backed by persistent local storage
+
+#### Core Concept
+Loading full-resolution images for every item in a large library is unusable at scale. This milestone introduces SQLite for persistent image metadata and a thumbnail generation pipeline that creates small cached previews on first scan. Subsequent launches are fast because thumbnails already exist — only new images need processing.
+
+---
+
+- [x] SQLite database integrated with image metadata table
+- [x] Thumbnail generation on first index, cached to disk
+- [x] Paginated image loading preparing for infinite scroll
+- [x] Thumbnails rendered in frontend instead of full-resolution images
+
+**Exit criteria**: Library of thousands of images opens quickly using cached thumbnails; rescan only processes new additions
+
+---
+
+### Milestone 3 — Masonry UI, Tagging & Slideshow ✅
+
+> **Goal**: Deliver the full core browsing experience — Pinterest-style layout, manual organisation via tags, and fullscreen slideshow
+
+#### Core Concept
+A grid of equal-sized thumbnails wastes space and loses the visual character of images with different aspect ratios. Masonry layout preserves each image's proportions while packing them efficiently. On top of this, manual tagging gives users a way to organise their library, and slideshow mode provides a distraction-free viewing experience across any filtered view.
+
+---
+
+- [x] Infinite scroll masonry layout preserving image aspect ratios
+- [x] Click to inspect individual image
+- [x] Tag management — add and remove tags per image
+- [x] Tag filtering — search bar filters library to images matching selected tags
+- [x] Fullscreen slideshow mode working across main feed and filtered views
+- [x] Hover interactions and smooth scroll behaviour
+
+**Exit criteria**: User can browse a large library in masonry layout, tag images, filter by tag, and launch a slideshow
+
+---
+
+### Milestone 4 — Visual Similarity Search ✅
+
+> **Goal**: Click any image and instantly surface the most visually similar images from across the entire library using CLIP embeddings
+
+#### Core Concept
+Visual similarity search is the technically interesting core of the project. Every image in the library is passed through a CLIP image encoder to produce a 512-dimensional embedding vector that captures its visual and semantic content. These embeddings are stored in SQLite and loaded into memory at startup. When the user clicks "View Similar", the clicked image's embedding is compared against all others using cosine similarity, and the closest matches are returned ranked by similarity score. All of this runs locally via ONNX Runtime — no GPU required, no external service.
+
+---
+
+- [x] CLIP image encoder integrated via ONNX Runtime
+- [x] Embeddings generated for all images on indexing and stored in SQLite
+- [x] Embedding vectors normalised and loaded into memory on startup
+- [x] Cosine similarity engine comparing a query embedding against the full library
+- [x] "View Similar" button on image inspect view
+- [x] Similarity results displayed in masonry layout with slideshow support
+
+**Exit criteria**: Clicking "View Similar" on any image returns visually and semantically similar images ranked by similarity score
+
+---
+
+### Milestone 5 — Semantic Search
+
+> **Goal**: Upgrade the search bar to support natural language queries using CLIP text embeddings matched against stored image embeddings
+
+#### Core Concept
+CLIP was trained on image-text pairs, meaning its image and text encoders share the same embedding space. A text query like "dark cinematic lighting" produces an embedding that sits close in the vector space to images depicting dark, cinematic scenes — even if those images have never been manually tagged. This milestone adds a CLIP text encoder to the pipeline, so the search bar compares a text embedding against all stored image embeddings and returns semantically matching results ranked by cosine similarity.
+
+---
+
+- [x] CLIP text encoder integrated via ONNX Runtime
+- [x] Search bar switches to semantic mode when no exact tag match is found
+- [x] Text query encoded to embedding and compared against all stored image embeddings
+- [x] Results ranked by cosine similarity and displayed in masonry layout
+- [x] Tag search and semantic search coexist naturally — exact tag matches take priority
+
+**Exit criteria**: Typing "forest path", "skull", or "neon cityscape" into the search bar returns semantically matching images from an untagged library
+
+---
+
+### Milestone 6 — Future Extensions
+
+> Possible directions once the core feature set is complete
+
+- Auto-tagging via CLIP zero-shot classification
 - Saved collections and boards
-- Drag-and-drop import
-- Cluster-based discovery
-- NSFW filters
-- Offline embeddings update
+- Drag-and-drop folder import
+- GIF and video support via frame sampling
+- Cluster-based discovery — group visually similar images automatically
+- Embedding update for newly added images without full rescan
+
+---
+
+## Running Locally
+
+```bash
+# Clone the repository
+git clone https://github.com/Capataina/PinterestStyleImageBrowser
+cd PinterestStyleImageBrowser
+
+# Install frontend dependencies
+npm install
+
+# Run in development mode
+npm run tauri dev
+```
+
+No API keys required. No internet connection required. CLIP models are bundled and run locally via ONNX Runtime.
 
 ---
 
 ## Summary
 
-This app provides a refined, private, and highly capable way to browse large local image libraries:
-
-- Modern Pinterest-style grid
-- Manual tagging and tag-based filtering
-- Early search bar (tag and name search)
-- CLIP-powered similarity search
-- CLIP-powered semantic search
-- Slideshow mode
-- Efficient Rust backend
-- No cloud, fully local
-
-A flexible, scalable foundation for any image-heavy workflow.
+Image Browser is a local-first desktop application that brings intelligent image search to personal libraries without any cloud dependency. It demonstrates end-to-end product delivery across a Rust backend, Tauri desktop shell, React frontend, SQLite persistence layer, and ONNX Runtime inference pipeline — with CLIP-powered visual similarity and semantic search running entirely offline on consumer hardware.
