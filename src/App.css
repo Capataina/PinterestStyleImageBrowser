@@ -11,6 +11,27 @@
 
 @custom-variant dark (&:is(.dark *));
 
+/*
+ * Theme tokens.
+ *
+ * The :root values are the LIGHT palette (kept tuned-up for users who
+ * pick "Light" in the settings drawer). The .dark overrides are the
+ * default — we apply `class="dark"` to <html> in main.tsx unless the
+ * user explicitly set a theme preference.
+ *
+ * Design notes:
+ * - Dark mode targets a "premium photo viewer" feel: deep neutral
+ *   greys, no warm tint to the chrome, warm amber accent reserved
+ *   for active/focused state and progress fills only. The chrome
+ *   should fade and let the images stay the visual focus.
+ * - All accents and borders are sized in oklch so the gradient feels
+ *   perceptually linear rather than RGB-blocky.
+ * - Light mode keeps the original Pinterest-inspired palette
+ *   (off-white background + Pinterest red accent) for contrast — if
+ *   the user wants their accent to differ between light and dark we
+ *   can split this later but uniform-by-mode is the simpler default.
+ */
+
 @theme inline {
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);
@@ -51,6 +72,8 @@
 
 :root {
   --radius: 1rem;
+
+  /* LIGHT — kept Pinterest-inspired (red accent) */
   --background: #fafafa;
   --foreground: #111111;
   --card: #ffffff;
@@ -85,37 +108,52 @@
 }
 
 .dark {
-  --background: oklch(0.145 0 0);
-  --foreground: oklch(0.985 0 0);
-  --card: oklch(0.205 0 0);
-  --card-foreground: oklch(0.985 0 0);
-  --popover: oklch(0.205 0 0);
-  --popover-foreground: oklch(0.985 0 0);
-  --primary: oklch(0.922 0 0);
-  --primary-foreground: oklch(0.205 0 0);
-  --secondary: oklch(0.269 0 0);
-  --secondary-foreground: oklch(0.985 0 0);
-  --muted: oklch(0.269 0 0);
-  --muted-foreground: oklch(0.708 0 0);
-  --accent: oklch(0.269 0 0);
-  --accent-foreground: oklch(0.985 0 0);
-  --destructive: oklch(0.704 0.191 22.216);
-  --border: oklch(1 0 0 / 10%);
-  --input: oklch(1 0 0 / 15%);
-  --ring: oklch(0.556 0 0);
+  /*
+   * DARK — deep neutral greys with a warm amber accent.
+   *
+   * Backgrounds: #0c0c0e (page) -> #16161a (surface) -> #1f1f23 (raised).
+   * Borders:     #26262b (subtle definition without halos).
+   * Text:        warm white #e5e5e7 (primary), #a1a1aa (secondary), #71717a (muted).
+   * Accent:      warm amber #fbbf24 used for active/focused state, progress
+   *              bar fills, the create-tag plus icon — sparingly.
+   */
+  --background: oklch(0.13 0.005 285);   /* near-black, slight cool tint */
+  --foreground: oklch(0.92 0.005 285);   /* warm-leaning white */
+  --card: oklch(0.17 0.006 285);
+  --card-foreground: oklch(0.92 0.005 285);
+  --popover: oklch(0.18 0.006 285);
+  --popover-foreground: oklch(0.92 0.005 285);
+
+  /* Primary = warm amber accent. Used for buttons, active-state rings,
+   * progress fills, and the create-tag plus icon. Reserve for clear
+   * intent — over-using turns the UI loud. */
+  --primary: oklch(0.82 0.15 80);
+  --primary-foreground: oklch(0.16 0.01 285);
+
+  --secondary: oklch(0.22 0.006 285);
+  --secondary-foreground: oklch(0.92 0.005 285);
+  --muted: oklch(0.18 0.006 285);
+  --muted-foreground: oklch(0.65 0.01 285);
+  --accent: oklch(0.22 0.006 285);
+  --accent-foreground: oklch(0.92 0.005 285);
+  --destructive: oklch(0.65 0.2 25);
+  --border: oklch(0.25 0.006 285);
+  --input: oklch(0.22 0.006 285);
+  --ring: oklch(0.82 0.15 80);
+
   --chart-1: oklch(0.488 0.243 264.376);
   --chart-2: oklch(0.696 0.17 162.48);
   --chart-3: oklch(0.769 0.188 70.08);
   --chart-4: oklch(0.627 0.265 303.9);
   --chart-5: oklch(0.645 0.246 16.439);
-  --sidebar: oklch(0.205 0 0);
-  --sidebar-foreground: oklch(0.985 0 0);
-  --sidebar-primary: oklch(0.488 0.243 264.376);
-  --sidebar-primary-foreground: oklch(0.985 0 0);
-  --sidebar-accent: oklch(0.269 0 0);
-  --sidebar-accent-foreground: oklch(0.985 0 0);
-  --sidebar-border: oklch(1 0 0 / 10%);
-  --sidebar-ring: oklch(0.556 0 0);
+  --sidebar: oklch(0.16 0.006 285);
+  --sidebar-foreground: oklch(0.92 0.005 285);
+  --sidebar-primary: oklch(0.82 0.15 80);
+  --sidebar-primary-foreground: oklch(0.16 0.01 285);
+  --sidebar-accent: oklch(0.22 0.006 285);
+  --sidebar-accent-foreground: oklch(0.92 0.005 285);
+  --sidebar-border: oklch(0.25 0.006 285);
+  --sidebar-ring: oklch(0.82 0.15 80);
 }
 
 @layer base {
@@ -128,11 +166,18 @@
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
   }
+
+  /* Image rendering: keep crisp at all zoom levels; the OS WebView
+   * sometimes applies aggressive smoothing that softens splash arts. */
+  img {
+    image-rendering: -webkit-optimize-contrast;
+  }
 }
 
-/* Custom scrollbar for Pinterest feel */
+/* Scrollbar styling — subtle in dark mode, almost invisible until hover */
 ::-webkit-scrollbar {
-  width: 8px;
+  width: 10px;
+  height: 10px;
 }
 
 ::-webkit-scrollbar-track {
@@ -140,10 +185,65 @@
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #d1d1d1;
-  border-radius: 4px;
+  background: oklch(0.30 0.005 285);
+  border-radius: 5px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
 }
 
 ::-webkit-scrollbar-thumb:hover {
+  background: oklch(0.40 0.005 285);
+  background-clip: padding-box;
+  border: 2px solid transparent;
+}
+
+:root ::-webkit-scrollbar-thumb {
+  background: #d1d1d1;
+}
+:root ::-webkit-scrollbar-thumb:hover {
   background: #b0b0b0;
+}
+
+/*
+ * Skeleton-tile pulse animation. Used while thumbnails are still being
+ * generated — gives the grid a sense of "incoming" rather than "blank
+ * forever".
+ */
+@keyframes skeleton-pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}
+
+.skeleton-tile {
+  background: linear-gradient(
+    90deg,
+    oklch(0.22 0.006 285) 0%,
+    oklch(0.26 0.006 285) 50%,
+    oklch(0.22 0.006 285) 100%
+  );
+  background-size: 200% 100%;
+  animation: skeleton-shimmer 1.6s ease-in-out infinite;
+}
+
+@keyframes skeleton-shimmer {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: -200% 0;
+  }
+}
+
+/*
+ * Performance hint for offscreen tiles. Lets the WebView skip layout
+ * and paint for tiles outside the current viewport. Free perf win at
+ * large grid sizes.
+ */
+.masonry-tile {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 300px;
 }

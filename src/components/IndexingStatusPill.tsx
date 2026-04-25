@@ -7,7 +7,7 @@ import {
 } from "../hooks/useIndexingProgress";
 
 const PHASE_LABELS: Record<IndexingPhase, string> = {
-  scan: "Scanning folder",
+  scan: "Scanning",
   "model-download": "Downloading models",
   thumbnail: "Generating thumbnails",
   encode: "Encoding embeddings",
@@ -16,28 +16,24 @@ const PHASE_LABELS: Record<IndexingPhase, string> = {
 };
 
 /**
- * Floating status pill that lives in the top-right corner of the page
- * and reports indexing pipeline progress.
+ * Floating status pill in the top-right corner.
  *
  * Visibility:
- * - Hidden until the first event arrives (so a fresh launch with no
- *   scan_root doesn't flash a pill).
- * - Shown while phase is anything except "ready" / "error".
- * - "ready" stays visible for 4s as a "X images indexed" confirmation,
- *   then auto-dismisses.
- * - "error" stays visible until the user dismisses (via the × button)
- *   or until a new pipeline run starts.
+ * - Hidden until the first event arrives (no flash on cold launch).
+ * - Shown for any active phase.
+ * - "ready" lingers 4s as a "X images indexed" confirmation, fades.
+ * - "error" sticks until the user dismisses (×) or a new run starts.
+ *
+ * Visual: minimal — icon + label + counter + thin progress bar. We
+ * deliberately dropped the redundant "message" detail line that the
+ * previous design had; the phase label tells you what the counter
+ * counts. The full message is available on hover via `title=`.
  */
 export function IndexingStatusPill() {
-  // We deliberately don't bind isIndexing here — visibility logic uses
-  // progress.phase directly because we want different rules for ready
-  // (auto-dismiss after 4s) vs error (stay until manually dismissed).
   const { progress } = useIndexingProgress();
   const [dismissed, setDismissed] = useState(false);
   const [showFinal, setShowFinal] = useState(false);
 
-  // When the pipeline goes ready, briefly show "X images indexed" then
-  // fade out. Resets dismissed state when a new run begins.
   useEffect(() => {
     if (!progress) return;
     if (progress.phase === "ready") {
@@ -51,13 +47,10 @@ export function IndexingStatusPill() {
       setDismissed(false);
       return;
     }
-    // Any non-terminal phase resets dismissal — the user dismissed an
-    // earlier error, but we're in flight again now.
     setDismissed(false);
     setShowFinal(false);
-  }, [progress?.phase]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [progress?.phase]);
 
-  // Visibility decision:
   if (!progress) return null;
   if (dismissed) return null;
   if (progress.phase === "ready" && !showFinal) return null;
@@ -66,8 +59,6 @@ export function IndexingStatusPill() {
   const isReady = progress.phase === "ready";
   const label = PHASE_LABELS[progress.phase];
 
-  // Determinate progress bar fill (0..1). Indeterminate phases (no
-  // total) leave the bar empty and show only the spinner.
   const fill =
     progress.total > 0 ? Math.min(1, progress.processed / progress.total) : 0;
   const showBar = progress.total > 0 && !isError && !isReady;
@@ -76,70 +67,61 @@ export function IndexingStatusPill() {
     <AnimatePresence>
       <motion.div
         key="indexing-pill"
-        initial={{ opacity: 0, y: -10 }}
-        animate={{ opacity: 1, y: 0 }}
-        exit={{ opacity: 0, y: -10 }}
-        transition={{ duration: 0.2 }}
+        initial={{ opacity: 0, y: -8, scale: 0.95 }}
+        animate={{ opacity: 1, y: 0, scale: 1 }}
+        exit={{ opacity: 0, y: -8, scale: 0.95 }}
+        transition={{ type: "spring", stiffness: 400, damping: 30 }}
         className={[
           "fixed top-4 right-4 z-50 flex items-center gap-3",
-          "rounded-full border bg-white/95 backdrop-blur-sm",
-          "px-4 py-2 shadow-lg",
-          "min-w-[260px] max-w-[400px]",
-          isError ? "border-red-200" : "border-gray-200",
+          "rounded-full border bg-card/95 backdrop-blur-md",
+          "px-4 py-2 shadow-lg shadow-black/30",
+          "min-w-[240px] max-w-[380px]",
+          isError ? "border-destructive/40" : "border-border",
         ].join(" ")}
+        title={progress.message ?? undefined}
       >
         <div className="shrink-0">
           {isError ? (
-            <AlertCircle className="h-5 w-5 text-red-500" />
+            <AlertCircle className="h-4 w-4 text-destructive" />
           ) : isReady ? (
-            <CheckCircle2 className="h-5 w-5 text-green-500" />
+            <CheckCircle2 className="h-4 w-4 text-primary" />
           ) : (
-            <Loader2 className="h-5 w-5 animate-spin text-gray-600" />
+            <Loader2 className="h-4 w-4 animate-spin text-primary" />
           )}
         </div>
 
-        <div className="flex flex-1 flex-col gap-1 overflow-hidden">
+        <div className="flex flex-1 flex-col gap-1.5 overflow-hidden">
           <div className="flex items-center justify-between gap-2">
             <span
               className={[
-                "text-sm font-medium",
-                isError ? "text-red-700" : "text-gray-800",
+                "text-xs font-medium",
+                isError ? "text-destructive" : "text-foreground",
               ].join(" ")}
             >
               {label}
             </span>
             {progress.total > 0 && !isError && !isReady && (
-              <span className="text-xs tabular-nums text-gray-500">
-                {progress.processed} / {progress.total}
+              <span className="text-[10px] tabular-nums text-muted-foreground">
+                {humanize(progress.processed, progress.total, progress.phase)}
               </span>
             )}
           </div>
 
           {showBar && (
-            <div className="h-1 w-full overflow-hidden rounded-full bg-gray-100">
+            <div className="h-1 w-full overflow-hidden rounded-full bg-muted">
               <motion.div
-                className="h-full bg-gray-700"
+                className="h-full bg-primary"
                 initial={false}
                 animate={{ width: `${fill * 100}%` }}
-                transition={{ duration: 0.25 }}
+                transition={{ type: "spring", stiffness: 200, damping: 30 }}
               />
             </div>
           )}
 
-          {progress.message && !isReady && (
-            <span
-              className={[
-                "truncate text-xs",
-                isError ? "text-red-600" : "text-gray-500",
-              ].join(" ")}
-              title={progress.message}
-            >
+          {isReady && progress.message && (
+            <span className="text-[10px] text-muted-foreground">
               {progress.message}
             </span>
-          )}
-
-          {isReady && progress.message && (
-            <span className="text-xs text-gray-500">{progress.message}</span>
           )}
         </div>
 
@@ -148,7 +130,7 @@ export function IndexingStatusPill() {
             type="button"
             onClick={() => setDismissed(true)}
             aria-label="Dismiss"
-            className="shrink-0 rounded p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-700"
+            className="shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-foreground transition"
           >
             ×
           </button>
@@ -156,4 +138,19 @@ export function IndexingStatusPill() {
       </motion.div>
     </AnimatePresence>
   );
+}
+
+/**
+ * Format the counter line. For model-download events the totals are
+ * in bytes (we want MB), for everything else they're item counts.
+ */
+function humanize(
+  processed: number,
+  total: number,
+  phase: IndexingPhase,
+): string {
+  if (phase === "model-download") {
+    return `${(processed / 1_048_576).toFixed(0)} / ${(total / 1_048_576).toFixed(0)} MB`;
+  }
+  return `${processed} / ${total}`;
 }

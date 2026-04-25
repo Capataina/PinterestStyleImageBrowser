@@ -149,7 +149,7 @@ export default function Home() {
   };
 
   return (
-    <main className="w-screen h-screen overflow-hidden bg-[#fafafa]">
+    <main className="w-screen h-screen overflow-hidden bg-background text-foreground">
       {/* Live indexing-progress pill (top-right corner) */}
       <IndexingStatusPill />
 
@@ -201,7 +201,7 @@ export default function Home() {
               type="button"
               title="Choose image folder"
               aria-label="Choose image folder"
-              className="flex shrink-0 items-center gap-2 rounded-full bg-gray-100 px-4 py-3 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-200"
+              className="flex shrink-0 items-center gap-2 rounded-full bg-secondary text-secondary-foreground px-4 py-3 text-sm font-medium transition-colors hover:bg-accent"
               onClick={async () => {
                 try {
                   const folder = await pickScanFolder();
@@ -229,11 +229,11 @@ export default function Home() {
           !shouldUseSemanticSearch &&
           images.data &&
           images.data.length === 0 && (
-            <div className="mb-8 rounded-xl bg-white p-6 text-center shadow-sm border border-gray-100">
-              <h2 className="mb-2 text-lg font-semibold text-gray-800">
+            <div className="mb-8 rounded-xl bg-card p-6 text-center shadow-md border border-border">
+              <h2 className="mb-2 text-lg font-semibold text-foreground">
                 No images yet
               </h2>
-              <p className="mb-4 text-sm text-gray-500">
+              <p className="mb-4 text-sm text-muted-foreground">
                 Pick a folder above to start indexing your library. The app
                 searches recursively, so you can point it at a parent folder
                 and let it sweep through every subfolder.
@@ -251,10 +251,10 @@ export default function Home() {
               className="mb-6 flex items-center justify-between"
             >
               <div>
-                <h2 className="text-xl font-semibold text-gray-800">
+                <h2 className="text-xl font-semibold text-foreground">
                   More like this
                 </h2>
-                <p className="text-sm text-gray-500">
+                <p className="text-sm text-muted-foreground">
                   {tieredSimilarImages.isFetching
                     ? "Finding similar images..."
                     : `${tieredSimilarImages.data?.length || 0} similar images`}
@@ -262,7 +262,7 @@ export default function Home() {
               </div>
               <button
                 onClick={handleClose}
-                className="rounded-full bg-gray-100 px-4 py-2 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-200"
+                className="rounded-full bg-secondary text-secondary-foreground px-4 py-2 text-sm font-medium transition-colors hover:bg-accent"
               >
                 ← Back to all
               </button>
@@ -280,10 +280,10 @@ export default function Home() {
               className="mb-6"
             >
               <div className="flex items-center gap-2">
-                <h2 className="text-xl font-semibold text-gray-800">
+                <h2 className="text-xl font-semibold text-foreground">
                   {isSearchLoading ? (
                     <span className="flex items-center gap-2">
-                      <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-gray-300 border-t-gray-600" />
+                      <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-muted border-t-primary" />
                       Searching for "{semanticQuery}"...
                     </span>
                   ) : (
@@ -292,13 +292,13 @@ export default function Home() {
                 </h2>
               </div>
               {!isSearchLoading && semanticSearchResults.data && (
-                <p className="text-sm text-gray-500 mt-1">
+                <p className="text-sm text-muted-foreground mt-1">
                   Found {semanticSearchResults.data.length} matching images
                 </p>
               )}
               {semanticSearchResults.isError && (
                 <p
-                  className="text-sm text-red-500 mt-1"
+                  className="text-sm text-destructive mt-1"
                   title={String(semanticSearchResults.error)}
                 >
                   Search failed:{" "}
