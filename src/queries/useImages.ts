@@ -9,6 +9,9 @@ import {
 export function useImages(filters?: {
   tagIds?: number[];
   searchText?: string;
+  /** When true, match images that have ALL selected tags (AND).
+   *  When false (default), match images with ANY selected tag (OR). */
+  matchAllTags?: boolean;
 }) {
   const tagIds = filters?.tagIds ?? [];
   // searchText is intentionally NOT in the queryKey: the backend ignores
@@ -16,10 +19,11 @@ export function useImages(filters?: {
   // so keying on it would produce a cache miss per keystroke for identical
   // data. We still pass it through to fetchImages for future-proofing.
   const searchText = filters?.searchText ?? "";
+  const matchAllTags = filters?.matchAllTags ?? false;
 
   return useQuery<ImageItem[]>({
-    queryKey: ["images", tagIds],
-    queryFn: () => fetchImages(tagIds, searchText),
+    queryKey: ["images", tagIds, matchAllTags],
+    queryFn: () => fetchImages(tagIds, searchText, matchAllTags),
     enabled: true,
   });
 }

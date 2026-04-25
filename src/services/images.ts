@@ -9,12 +9,14 @@ const DEFAULT_HEIGHT = 600;
 
 export async function fetchImages(
   filterTagIds: number[] = [],
-  filterString: string = ""
+  filterString: string = "",
+  matchAllTags: boolean = false,
 ): Promise<ImageItem[]> {
   try {
     const imagesDB: ImageData[] = await invoke("get_images", {
       filterTagIds,
       filterString,
+      matchAllTags,
     });
 
     // Convert backend data to frontend ImageItem format

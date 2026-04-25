@@ -637,6 +637,34 @@ impl ImageDatabase {
         Ok(out)
     }
 
+    /// Read the free-text annotation for an image. Returns Ok(None)
+    /// when the row exists but the column is NULL (default).
+    pub fn get_image_notes(&self, image_id: ID) -> rusqlite::Result<Option<String>> {
+        let conn = self.connection.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT notes FROM images WHERE id = ?1")?;
+        let mut rows = stmt.query([image_id])?;
+        match rows.next()? {
+            Some(row) => row.get::<_, Option<String>>(0),
+            None => Err(rusqlite::Error::QueryReturnedNoRows),
+        }
+    }
+
+    /// Set / clear the free-text annotation. Pass an empty string or
+    /// "" to clear; we don't bother distinguishing "" from NULL because
+    /// the user-facing semantic is the same ("no annotation").
+    pub fn set_image_notes(&self, image_id: ID, notes: &str) -> rusqlite::Result<()> {
+        let cleaned = notes.trim();
+        let val: Option<&str> = if cleaned.is_empty() { None } else { Some(cleaned) };
+        self.connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE images SET notes = ?1 WHERE id = ?2",
+                params![val, image_id],
+            )?;
+        Ok(())
+    }
+
     /// Look up the root_id for an image given its path. Returns None
     /// when the path isn't in the DB or when the row's root_id is NULL
     /// (legacy un-migrated rows). Used by the thumbnail generator to
@@ -758,10 +786,16 @@ impl ImageDatabase {
     ///
     /// Rows with NULL root_id are kept — those are legacy un-migrated
     /// rows from before multi-folder support and should still display.
+    ///
+    /// `match_all_tags` controls multi-tag semantics: false (default)
+    /// matches images with ANY of the selected tags (OR), true requires
+    /// ALL of them (AND). Threaded through from the user's tagFilterMode
+    /// preference via the get_images Tauri command.
     pub fn get_images_with_thumbnails(
         &self,
         filter_tag_ids: Vec<ID>,
         _filter_string: String,
+        match_all_tags: bool,
     ) -> rusqlite::Result<Vec<ImageData>> {
         let conn = self.connection.lock().unwrap();
 
@@ -777,21 +811,48 @@ impl ImageDatabase {
 
         let sql = if !filter_tag_ids.is_empty() {
             let placeholders = vec!["?"; filter_tag_ids.len()].join(", ");
-            format!(
-                "SELECT images.id AS img_id, images.path AS img_path,
-                images.thumbnail_path, images.width, images.height,
-                tags.id AS tag_id, tags.name AS tag_name, tags.color AS tag_color
-                FROM images
-                LEFT JOIN images_tags ON images.id = images_tags.image_id
-                LEFT JOIN tags ON tags.id = images_tags.tag_id
-                WHERE {root_filter}
-                AND EXISTS (
-                    SELECT 1
-                    FROM images_tags it2
-                    WHERE it2.image_id = images.id
-                    AND it2.tag_id IN ({placeholders})
-                );"
-            )
+            if match_all_tags {
+                // AND semantic: image must have EVERY selected tag.
+                // GROUP BY image_id with HAVING COUNT = number of distinct
+                // selected tags. Note we COUNT(DISTINCT tag_id) so a tag
+                // appearing twice for the same image (impossible given
+                // the PK but defensive) doesn't satisfy the constraint
+                // for two different selected tags.
+                let n = filter_tag_ids.len();
+                format!(
+                    "SELECT images.id AS img_id, images.path AS img_path,
+                    images.thumbnail_path, images.width, images.height,
+                    tags.id AS tag_id, tags.name AS tag_name, tags.color AS tag_color
+                    FROM images
+                    LEFT JOIN images_tags ON images.id = images_tags.image_id
+                    LEFT JOIN tags ON tags.id = images_tags.tag_id
+                    WHERE {root_filter}
+                    AND images.id IN (
+                        SELECT it2.image_id
+                        FROM images_tags it2
+                        WHERE it2.tag_id IN ({placeholders})
+                        GROUP BY it2.image_id
+                        HAVING COUNT(DISTINCT it2.tag_id) = {n}
+                    );"
+                )
+            } else {
+                // OR semantic: image must have ANY selected tag.
+                format!(
+                    "SELECT images.id AS img_id, images.path AS img_path,
+                    images.thumbnail_path, images.width, images.height,
+                    tags.id AS tag_id, tags.name AS tag_name, tags.color AS tag_color
+                    FROM images
+                    LEFT JOIN images_tags ON images.id = images_tags.image_id
+                    LEFT JOIN tags ON tags.id = images_tags.tag_id
+                    WHERE {root_filter}
+                    AND EXISTS (
+                        SELECT 1
+                        FROM images_tags it2
+                        WHERE it2.image_id = images.id
+                        AND it2.tag_id IN ({placeholders})
+                    );"
+                )
+            }
         } else {
             format!(
                 "SELECT images.id AS img_id, images.path AS img_path,

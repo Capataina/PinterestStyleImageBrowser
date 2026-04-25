@@ -20,6 +20,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { FolderOpen, Settings as SettingsIcon } from "lucide-react";
 import { pickScanFolder, setScanRoot } from "@/services/images";
 import { useUserPreferences } from "@/hooks/useUserPreferences";
+import { getImageNotes, setImageNotes } from "@/services/notes";
 
 export default function Home() {
   const [selectedItem, setSelectedItem] = useState<ImageItem | null>(null);
@@ -55,7 +56,30 @@ export default function Home() {
   const images = useImages({
     tagIds: searchTags.map((t) => t.id),
     searchText: searchText,
+    // Tag filter mode comes from user prefs — settings drawer toggle
+    matchAllTags: prefs.tagFilterMode === "all",
   });
+
+  // Per-image notes (Phase 11). Lazy-loaded when the inspector opens.
+  const [activeNotes, setActiveNotes] = useState<string>("");
+  useEffect(() => {
+    if (!selectedItem) {
+      setActiveNotes("");
+      return;
+    }
+    let cancelled = false;
+    getImageNotes(selectedItem.id)
+      .then((n) => {
+        if (!cancelled) setActiveNotes(n);
+      })
+      .catch(() => {
+        // Non-fatal — notes are optional. Treat as empty.
+        if (!cancelled) setActiveNotes("");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedItem?.id]);
 
   // Semantic search query (only runs when shouldUseSemanticSearch is true)
   const semanticSearchResults = useSemanticSearch(
@@ -195,6 +219,15 @@ export default function Home() {
             onRemoveTag={(imageId, tagId) =>
               removeTagMutation.mutate({ imageId, tagId })
             }
+            notes={activeNotes}
+            onSaveNotes={(imageId, notes) => {
+              setActiveNotes(notes);
+              // Fire-and-forget — non-fatal failure logs but doesn't
+              // block the user. The textarea stays in sync via local state.
+              setImageNotes(imageId, notes).catch((err) =>
+                console.warn("Failed to save notes:", err),
+              );
+            }}
           />
         )}
       </AnimatePresence>

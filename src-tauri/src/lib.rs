@@ -63,11 +63,13 @@ fn get_images(
     db: State<'_, ImageDatabase>,
     filter_tag_ids: Vec<ID>,
     filter_string: String,
+    match_all_tags: Option<bool>,
 ) -> Result<Vec<ImageData>, String> {
-    // Use the new method that includes thumbnail info
-    return db
-        .get_images_with_thumbnails(filter_tag_ids, filter_string)
-        .map_err(|e| e.to_string());
+    // match_all_tags is Option so older frontend builds (or tests)
+    // can call without specifying — defaults to false (OR semantic).
+    let match_all = match_all_tags.unwrap_or(false);
+    db.get_images_with_thumbnails(filter_tag_ids, filter_string, match_all)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -83,6 +85,28 @@ fn create_tag(db: State<'_, ImageDatabase>, name: String, color: String) -> Resu
 #[tauri::command]
 fn delete_tag(db: State<'_, ImageDatabase>, tag_id: i64) -> Result<(), String> {
     db.delete_tag(tag_id).map_err(|e| e.to_string())
+}
+
+/// Read the free-text annotation for an image. Returns "" if there
+/// is no annotation set (the column is either NULL or "" — we treat
+/// both as "no annotation" at the user-facing level).
+#[tauri::command]
+fn get_image_notes(db: State<'_, ImageDatabase>, image_id: i64) -> Result<String, String> {
+    db.get_image_notes(image_id)
+        .map(|opt| opt.unwrap_or_default())
+        .map_err(|e| e.to_string())
+}
+
+/// Write an annotation for an image. Empty / whitespace-only string
+/// clears the field.
+#[tauri::command]
+fn set_image_notes(
+    db: State<'_, ImageDatabase>,
+    image_id: i64,
+    notes: String,
+) -> Result<(), String> {
+    db.set_image_notes(image_id, &notes)
+        .map_err(|e| e.to_string())
 }
 
 /// Read the currently-configured scan root from settings.json, if any.
@@ -886,6 +910,8 @@ pub fn run(db: ImageDatabase, db_path: String) {
             add_root,
             remove_root,
             set_root_enabled,
+            get_image_notes,
+            set_image_notes,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
