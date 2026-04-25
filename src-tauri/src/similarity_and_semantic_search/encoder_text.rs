@@ -2,8 +2,15 @@ use ort::{session::Session, value::Tensor};
 use std::{collections::HashMap, error::Error, fs, path::Path};
 use tracing::{debug, info, warn};
 
-#[cfg(target_os = "macos")]
-use ort::execution_providers::CoreMLExecutionProvider;
+// CoreML is intentionally NOT used for the text encoder on macOS.
+// The multilingual CLIP text model is a transformer (DistilBERT-based,
+// 383 nodes); CoreML can only execute ~17 of those nodes natively and
+// falls back to CPU for the rest. We measured 6-15s of upfront CoreML
+// graph-analysis cost per session-create, plus partition management
+// overhead at run time — all for a worse runtime than plain CPU.
+//
+// Image encoder (encoder.rs) keeps CoreML because CLIP's CNN-heavy
+// graph is what CoreML is good at — there it's a 5-10x win.
 
 #[cfg(not(target_os = "macos"))]
 use ort::execution_providers::CUDAExecutionProvider;
@@ -205,10 +212,11 @@ impl TextEncoder {
     /// * `tokenizer_path` - Path to the tokenizer.json file (e.g., "models/tokenizer.json")
     #[cfg(target_os = "macos")]
     fn build_session_with_accel(model_path: &Path) -> Result<Session, Box<dyn Error>> {
-        info!("trying CoreML execution provider for text encoder");
-        let session = Session::builder()?
-            .with_execution_providers([CoreMLExecutionProvider::default().build()])?
-            .commit_from_file(model_path)?;
+        // macOS: text encoder runs CPU-only because CoreML coverage is
+        // poor for transformers (see top-of-file comment). Plain CPU
+        // session creates in ~1-2s vs CoreML's 6-15s for the same model.
+        info!("text encoder using CPU (CoreML skipped — poor transformer coverage)");
+        let session = Session::builder()?.commit_from_file(model_path)?;
         Ok(session)
     }
 
