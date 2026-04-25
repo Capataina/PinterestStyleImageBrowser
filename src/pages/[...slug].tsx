@@ -14,6 +14,7 @@ import { useLocation, useNavigate } from "react-router";
 import { useTags, useCreateTag, useDeleteTag } from "@/queries/useTags";
 import { SearchBar } from "@/components/SearchBar";
 import { PinterestModal } from "@/components/PinterestModal";
+import { IndexingStatusPill } from "@/components/IndexingStatusPill";
 import { useQueryClient } from "@tanstack/react-query";
 import { FolderOpen } from "lucide-react";
 import { pickScanFolder, setScanRoot } from "@/services/images";
@@ -149,6 +150,9 @@ export default function Home() {
 
   return (
     <main className="w-screen h-screen overflow-hidden bg-[#fafafa]">
+      {/* Live indexing-progress pill (top-right corner) */}
+      <IndexingStatusPill />
+
       {/* Pinterest Modal (inspect mode) - only shows when inspecting a selected image */}
       <AnimatePresence>
         {selectedItem && isInspecting && (
@@ -203,11 +207,9 @@ export default function Home() {
                   const folder = await pickScanFolder();
                   if (!folder) return; // user cancelled
                   await setScanRoot(folder);
-                  // Pass 4a: re-indexing requires a restart. Pass 5 will
-                  // replace this alert with live progress.
-                  window.alert(
-                    `Folder set:\n\n${folder}\n\nRestart the app to index this folder.`
-                  );
+                  // Pass 5: indexing now runs live in the background.
+                  // The IndexingStatusPill at the top-right surfaces
+                  // progress; no restart needed.
                 } catch (err) {
                   console.error("Folder picker failed:", err);
                   window.alert(

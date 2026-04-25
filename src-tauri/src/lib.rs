@@ -1,10 +1,11 @@
 use std::path::PathBuf;
-use std::sync::Mutex;
-use tauri::State;
+use std::sync::{Arc, Mutex};
+use tauri::{AppHandle, State};
 
 use crate::{
     db::{ImageDatabase, ID},
     image_struct::ImageData,
+    indexing::IndexingState,
     similarity_and_semantic_search::cosine_similarity::CosineIndex,
     similarity_and_semantic_search::encoder_text::TextEncoder,
     tag_struct::Tag,
@@ -31,6 +32,7 @@ struct SemanticSearchResult {
 pub mod db;
 pub mod filesystem;
 pub mod image_struct;
+pub mod indexing;
 pub mod model_download;
 pub mod paths;
 pub mod settings;
@@ -39,7 +41,10 @@ pub mod tag_struct;
 pub mod thumbnail;
 
 pub struct CosineIndexState {
-    pub index: Mutex<CosineIndex>,
+    /// Wrapped in Arc<Mutex<...>> rather than plain Mutex<...> so the
+    /// indexing thread (Pass 5) can hold a clone alongside the Tauri-
+    /// managed state. Both point at the same in-memory cache.
+    pub index: Arc<Mutex<CosineIndex>>,
     pub db_path: String,
 }
 
@@ -85,20 +90,30 @@ fn get_scan_root() -> Result<Option<String>, String> {
         .map(|p| p.to_string_lossy().into_owned()))
 }
 
-/// Set the scan root the next launch will index. Validates the path,
-/// persists it to settings.json, and wipes the existing image rows from
-/// the database so the new root indexes clean (the single-root
-/// replaceable model — Pass 4a doesn't yet trigger re-indexing live;
-/// the user must restart for now. Pass 5 will replace this with an async
-/// re-index + progress events).
+/// Set the scan root and trigger a live re-index without restart.
+///
+/// Steps:
+/// 1. Validate the path exists and is a directory.
+/// 2. Persist to settings.json. If this fails we don't proceed — the
+///    user shouldn't end up in a half-state with a wiped DB and no
+///    saved scan root.
+/// 3. Wipe image rows (the tag catalogue is preserved — tag names are
+///    user knowledge that should survive moving libraries).
+/// 4. Clear the in-memory cosine cache so previous-root embeddings
+///    don't leak into similarity queries.
+/// 5. Spawn the background indexing pipeline. If a previous indexing
+///    run is still in flight, return Err so the user can wait or
+///    cancel; the frontend surfaces this cleanly.
 ///
 /// The tag catalogue is intentionally preserved across root switches,
 /// because tag names are user knowledge (e.g. "favourite") that should
 /// survive moving libraries.
 #[tauri::command]
 fn set_scan_root(
+    app: AppHandle,
     db: State<'_, ImageDatabase>,
     cosine_state: State<'_, CosineIndexState>,
+    indexing_state: State<'_, Arc<IndexingState>>,
     path: String,
 ) -> Result<(), String> {
     let scan_root = PathBuf::from(&path);
@@ -106,25 +121,28 @@ fn set_scan_root(
         return Err(format!("Not a directory: {path}"));
     }
 
-    // Persist first; if this fails we don't want to wipe the DB and end
-    // up in a half-state with no scan root and no images.
     let mut user_settings = settings::Settings::load();
     user_settings.scan_root = Some(scan_root);
     user_settings
         .save()
         .map_err(|e| format!("Failed to save settings.json: {e}"))?;
 
-    // Wipe image rows (tags catalog stays).
     db.wipe_images_for_new_root()
         .map_err(|e| format!("Failed to wipe images table: {e}"))?;
 
-    // Clear the in-memory cosine cache so similarity queries don't return
-    // results based on the previous root's embeddings.
     if let Ok(mut idx) = cosine_state.index.lock() {
         idx.cached_images.clear();
     }
 
-    println!("[Backend] set_scan_root saved + wiped — restart required to re-index.");
+    indexing::try_spawn_pipeline(
+        app.clone(),
+        indexing_state.inner().clone(),
+        cosine_state.db_path.clone(),
+        cosine_state.index.clone(),
+    )
+    .map_err(|e| e.to_string())?;
+
+    println!("[Backend] set_scan_root saved + wiped + indexing thread spawned.");
     Ok(())
 }
 
@@ -655,15 +673,21 @@ fn get_similar_images(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run(db: ImageDatabase, db_path: String) {
+    let cosine_index = Arc::new(Mutex::new(CosineIndex::new()));
     let cosine_state = CosineIndexState {
-        index: Mutex::new(CosineIndex::new()),
+        index: cosine_index.clone(),
         db_path: db_path.clone(),
     };
 
-    // Text encoder state (lazy-loaded on first semantic search)
+    // Text encoder state (lazy-loaded on first semantic search).
     let text_encoder_state = TextEncoderState {
         encoder: Mutex::new(None),
     };
+
+    // Single-flight guard for the indexing pipeline. Wrapped in Arc so
+    // the .setup() callback (and later set_scan_root commands) can both
+    // hand a clone to the indexing thread.
+    let indexing_state = Arc::new(IndexingState::new());
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -671,6 +695,33 @@ pub fn run(db: ImageDatabase, db_path: String) {
         .manage(db)
         .manage(cosine_state)
         .manage(text_encoder_state)
+        .manage(indexing_state.clone())
+        .setup({
+            let db_path = db_path.clone();
+            let cosine_index = cosine_index.clone();
+            let indexing_state = indexing_state.clone();
+            move |app| {
+                // Auto-spawn the indexing pipeline at app startup. This
+                // refreshes the catalog whenever the user reopens the
+                // app — picks up any new images they added since last
+                // launch, regenerates missing thumbnails, encodes any
+                // new images.
+                //
+                // No-op when no scan_root is configured (Phase::Ready
+                // fires immediately with zero counts so the UI knows
+                // the pipeline ran).
+                let app_handle = app.handle().clone();
+                if let Err(e) = indexing::try_spawn_pipeline(
+                    app_handle,
+                    indexing_state,
+                    db_path,
+                    cosine_index,
+                ) {
+                    eprintln!("[setup] could not spawn indexing pipeline: {e}");
+                }
+                Ok(())
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             get_images,
             get_tags,
