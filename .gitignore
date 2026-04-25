@@ -24,4 +24,6 @@ dist-ssr
 *.sw?
 
 images.db
-images.db
+
+# Local Claude Code personality — not shared
+CLAUDE.md
