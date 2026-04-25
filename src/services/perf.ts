@@ -49,6 +49,28 @@ export async function getPerfSnapshot(): Promise<PerfSnapshot> {
   return await invoke<PerfSnapshot>("get_perf_snapshot");
 }
 
+/**
+ * Append a user action to the profiling timeline.
+ *
+ * No-op when the app isn't in profiling mode — call sites can sprinkle
+ * `recordAction(...)` freely without worrying about overhead. The
+ * cached `profilingCache` is consulted synchronously after the first
+ * `isProfilingEnabled()` resolves; if a call fires before the cache
+ * resolves, it just gets dropped (which is fine — early-mount actions
+ * are noise).
+ *
+ * Payload is whatever's useful at the call site: search query, image
+ * id, tag id. The on-exit report renderer pairs each user action with
+ * span events that fired in the next ~500ms.
+ */
+export function recordAction(action: string, payload: Record<string, unknown> = {}): void {
+  if (!profilingCache) return;
+  // Fire-and-forget — don't block the UI thread. If the IPC fails
+  // (host crashed mid-session, etc.), we'd rather lose the action
+  // than throw an unhandled rejection.
+  invoke("record_user_action", { action, payload }).catch(() => {});
+}
+
 export async function resetPerfStats(): Promise<void> {
   await invoke("reset_perf_stats");
 }

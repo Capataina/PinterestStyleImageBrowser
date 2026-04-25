@@ -19,10 +19,15 @@
 //! microseconds or more, which is what we care about.
 
 use std::collections::HashMap;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
-use std::time::Instant;
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tracing::span::{Attributes, Id};
 use tracing::{Event, Subscriber};
 use tracing_subscriber::layer::Context;
@@ -101,6 +106,210 @@ pub fn is_profiling_enabled() -> bool {
     *PROFILING_ENABLED.get().unwrap_or(&false)
 }
 
+// =====================================================================
+// Session + raw event log
+// =====================================================================
+//
+// In addition to the per-span aggregates, profiling mode also records
+// every span close and every user action as an individual `RawEvent`
+// in a process-global ringbuffer. The buffer is drained to disk every
+// `FLUSH_INTERVAL` by a background thread spawned at session start.
+//
+// This catches what aggregates can't: a single 5-second outlier among
+// 99 fast calls barely moves the mean and only barely shows in p99,
+// but the raw event is right there in the timeline — and crucially,
+// correlated with whatever user action fired just before it.
+//
+// Design choices:
+// - Ringbuffer cap of 50_000 events at ~80 bytes each = ~4 MB max in
+//   memory. With a 5s flush interval that's ~10k events/sec headroom,
+//   well above what we'd ever hit.
+// - JSONL output (one event per line) so the file is append-only —
+//   safe under SIGTERM, parseable line-by-line for streaming, easy to
+//   diff between runs.
+// - Timestamps are milliseconds since session start, not unix epoch:
+//   small numbers, easy to read in the report, no risk of leaking
+//   the user's wall clock if a report ever gets shared.
+
+/// Maximum events buffered in memory before they MUST be flushed to
+/// disk. If the flush thread falls behind, oldest events are dropped
+/// (logged as a warning) — losing the trailing edge of a session is
+/// preferable to OOMing.
+const RAW_EVENT_CAP: usize = 50_000;
+
+/// How often the background thread drains the raw event buffer to
+/// `timeline.jsonl`. 5s balances "lose at most 5s on crash" against
+/// "don't beat up the disk during heavy span traffic."
+const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// One row in the timeline. Either a span close (with its measured
+/// duration) or a user action (with arbitrary JSON payload).
+///
+/// `Deserialize` is implemented because the on-exit report renderer
+/// reads the JSONL back line-by-line to build the markdown report,
+/// and tests round-trip through it as a sanity check.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum RawEvent {
+    /// Emitted by `PerfLayer::on_close` for every instrumented span.
+    Span {
+        /// Milliseconds since session start. Same clock as User events
+        /// so they sort into one timeline.
+        ts_ms: u64,
+        /// The span's metadata name (e.g. `clip.encode_image`).
+        name: String,
+        /// Wall-clock duration of the span in microseconds.
+        duration_us: u64,
+    },
+    /// Emitted by the `record_user_action` Tauri command.
+    User {
+        ts_ms: u64,
+        /// e.g. `search_submit`, `image_click`, `tag_toggle`.
+        action: String,
+        /// Whatever the call site decided to attach. Free-form JSON
+        /// so we don't need a schema migration every time we add an
+        /// instrumentation point.
+        payload: Value,
+    },
+}
+
+/// Process-global session start. Set once when profiling mode begins.
+/// All RawEvent ts_ms values are computed relative to this instant.
+static SESSION_START: OnceLock<Instant> = OnceLock::new();
+
+/// Process-global session directory. Holds `timeline.jsonl` during
+/// the session, plus `report.md` and `raw.json` written at exit.
+static SESSION_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Process-global ringbuffer of pending raw events. Drained by the
+/// background flush thread.
+static RAW_EVENTS: OnceLock<Mutex<Vec<RawEvent>>> = OnceLock::new();
+
+fn raw_events_buf() -> &'static Mutex<Vec<RawEvent>> {
+    RAW_EVENTS.get_or_init(|| Mutex::new(Vec::with_capacity(1024)))
+}
+
+/// Initialise the profiling session. Creates the session directory
+/// (`Library/exports/perf-{unix_ts}/`) and stores the start instant
+/// so all subsequent events get relative timestamps. Returns the
+/// session directory path so the caller can log it.
+///
+/// Safe to call only once per process. Subsequent calls are ignored
+/// (the existing session continues).
+pub fn init_session(exports_dir: PathBuf) -> io::Result<PathBuf> {
+    let unix_ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let dir = exports_dir.join(format!("perf-{unix_ts}"));
+    fs::create_dir_all(&dir)?;
+    let _ = SESSION_START.set(Instant::now());
+    let _ = SESSION_DIR.set(dir.clone());
+    Ok(dir)
+}
+
+/// Path of the active session directory if profiling is enabled.
+pub fn session_dir() -> Option<PathBuf> {
+    SESSION_DIR.get().cloned()
+}
+
+/// Milliseconds since `init_session` was called. Returns 0 if the
+/// session was never initialised (so events still get a timestamp,
+/// they just all collapse to t=0).
+fn session_ms() -> u64 {
+    SESSION_START
+        .get()
+        .map(|s| s.elapsed().as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Record a user action into the timeline. No-op if profiling is off,
+/// so call sites don't need to gate themselves.
+pub fn record_user_action(action: String, payload: Value) {
+    if !is_profiling_enabled() {
+        return;
+    }
+    push_event(RawEvent::User {
+        ts_ms: session_ms(),
+        action,
+        payload,
+    });
+}
+
+/// Append an event to the ringbuffer. If the buffer is at capacity
+/// (flush thread fell behind), drop the oldest event and log a single
+/// warning the first time it happens — we'd rather lose the trailing
+/// tail than block the calling thread on disk I/O.
+fn push_event(event: RawEvent) {
+    let Ok(mut buf) = raw_events_buf().lock() else {
+        return;
+    };
+    if buf.len() >= RAW_EVENT_CAP {
+        // Drop oldest. Vec::remove(0) is O(n) but n is bounded at
+        // RAW_EVENT_CAP and this only happens under saturation —
+        // fine for diagnostics.
+        buf.remove(0);
+    }
+    buf.push(event);
+}
+
+/// Spawn the background thread that drains the raw event buffer to
+/// `timeline.jsonl` every `FLUSH_INTERVAL`. No-op if profiling is
+/// off or the session directory wasn't initialised.
+///
+/// The thread runs until the process exits. Tauri kills it on app
+/// shutdown along with everything else; we don't try to join it.
+pub fn spawn_flush_thread() {
+    if !is_profiling_enabled() {
+        return;
+    }
+    let Some(dir) = session_dir() else {
+        return;
+    };
+    let path = dir.join("timeline.jsonl");
+
+    thread::spawn(move || loop {
+        thread::sleep(FLUSH_INTERVAL);
+        if let Err(e) = flush_to_file(&path) {
+            // Don't crash the diagnostics on I/O hiccups — log and
+            // try again on the next interval. If the disk is wedged,
+            // the buffer will fill up and start dropping oldest
+            // events; that's the right failure mode for telemetry.
+            tracing::warn!("perf flush failed: {e}");
+        }
+    });
+}
+
+/// Drain the buffer and append every event as JSONL to `path`. Called
+/// by the background thread; also called explicitly from the on-exit
+/// report renderer to capture whatever's still in memory at shutdown.
+pub fn flush_to_file(path: &std::path::Path) -> io::Result<()> {
+    // Drain under the lock so we don't hold it during disk I/O.
+    let drained: Vec<RawEvent> = {
+        let mut buf = raw_events_buf().lock().map_err(|_| {
+            io::Error::new(io::ErrorKind::Other, "perf buffer mutex poisoned")
+        })?;
+        std::mem::take(&mut *buf)
+    };
+    if drained.is_empty() {
+        return Ok(());
+    }
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    for event in drained {
+        // serde_json::to_string can only fail if the value contains
+        // non-serialisable types — RawEvent is constructed from owned
+        // Strings + serde_json::Value, both always serialisable.
+        let line = serde_json::to_string(&event)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        writeln!(file, "{line}")?;
+    }
+    Ok(())
+}
+
 /// `tracing` Layer that records every span's enter/exit and writes a
 /// duration sample on span close.
 pub struct PerfLayer;
@@ -163,8 +372,18 @@ where
         let name = span.metadata().name().to_string();
 
         if let Ok(mut map) = stats_map().lock() {
-            map.entry(name).or_default().record(elapsed_ns);
+            map.entry(name.clone()).or_default().record(elapsed_ns);
         }
+
+        // Also append to the raw event log so the timeline view can
+        // show this exact event (with its precise timestamp), not
+        // just the aggregate. This is what catches single-event
+        // spikes that aggregates would smooth over.
+        push_event(RawEvent::Span {
+            ts_ms: session_ms(),
+            name,
+            duration_us: elapsed_ns / 1000,
+        });
     }
 
     fn on_event(&self, _event: &Event<'_>, _ctx: Context<'_, S>) {
@@ -320,5 +539,115 @@ mod tests {
         let snap = snapshot();
         assert!(snap.spans.is_empty());
         assert!(snap.timestamp >= 0);
+    }
+
+    #[test]
+    fn raw_event_span_serialises_with_kind_tag() {
+        let e = RawEvent::Span {
+            ts_ms: 1234,
+            name: "clip.encode_image".into(),
+            duration_us: 75_000,
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        // The internal #[serde(tag = "kind")] discriminator means the
+        // JSON output has a "kind":"span" field — this is the contract
+        // the report renderer relies on.
+        assert!(json.contains("\"kind\":\"span\""));
+        assert!(json.contains("\"ts_ms\":1234"));
+        assert!(json.contains("\"name\":\"clip.encode_image\""));
+        assert!(json.contains("\"duration_us\":75000"));
+    }
+
+    #[test]
+    fn raw_event_user_serialises_with_payload_object() {
+        let e = RawEvent::User {
+            ts_ms: 5678,
+            action: "image_click".into(),
+            payload: serde_json::json!({ "id": 42 }),
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains("\"kind\":\"user\""));
+        assert!(json.contains("\"action\":\"image_click\""));
+        assert!(json.contains("\"id\":42"));
+    }
+
+    #[test]
+    fn flush_to_file_writes_jsonl_and_drains_buffer() {
+        // Use a unique temp path so this test doesn't interact with
+        // a real session directory left from another run.
+        let dir = std::env::temp_dir().join(format!(
+            "perf_flush_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("timeline.jsonl");
+
+        // Push two events directly into the buffer (bypassing the
+        // is_profiling_enabled check, which is process-global).
+        push_event(RawEvent::Span {
+            ts_ms: 100,
+            name: "test.span".into(),
+            duration_us: 50,
+        });
+        push_event(RawEvent::User {
+            ts_ms: 200,
+            action: "test_action".into(),
+            payload: serde_json::json!({}),
+        });
+
+        flush_to_file(&path).unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = written.lines().collect();
+        assert!(
+            lines.len() >= 2,
+            "expected at least 2 lines (other tests may have pushed events), got {}: {written}",
+            lines.len()
+        );
+        // Each line must be valid JSON on its own — that's the JSONL
+        // contract the on-exit renderer reads.
+        for line in &lines {
+            let _: RawEvent = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("line is not valid RawEvent JSON: {line} ({e})"));
+        }
+
+        // Buffer should now be drained.
+        let remaining = raw_events_buf().lock().unwrap().len();
+        assert_eq!(
+            remaining, 0,
+            "flush should leave the buffer empty, found {remaining} events"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn flush_to_file_is_noop_when_buffer_empty() {
+        // Drain anything pending from prior tests.
+        let _ = raw_events_buf().lock().map(|mut b| b.clear());
+
+        let dir = std::env::temp_dir().join(format!(
+            "perf_flush_empty_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("timeline.jsonl");
+
+        flush_to_file(&path).unwrap();
+        // Empty buffer + empty flush ⇒ file is never created. That's
+        // the contract: don't spam the disk with empty files every 5s
+        // when the user is just sitting on the app idle.
+        assert!(
+            !path.exists(),
+            "flush_to_file should not create the file when buffer is empty"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

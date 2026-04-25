@@ -201,6 +201,20 @@ fn reset_perf_stats() -> Result<(), String> {
     Ok(())
 }
 
+/// Append a user action to the profiling timeline. No-op when the
+/// app isn't in profiling mode (the frontend checks this before
+/// calling, but we double-check on the backend so a stale
+/// profilingCache can't poison the timeline).
+///
+/// Payload is free-form JSON — call sites attach whatever's relevant
+/// (query text, image id, tag id, sort mode...). The on-exit
+/// markdown renderer correlates these with span events that fired
+/// in the next ~500ms.
+#[tauri::command]
+fn record_user_action(action: String, payload: serde_json::Value) {
+    perf::record_user_action(action, payload);
+}
+
 /// Write the current perf snapshot to Library/exports/perf-<unix-ts>.json
 /// as pretty-printed JSON. Returns the absolute path so the frontend
 /// can show it in a confirmation message.
@@ -967,6 +981,7 @@ pub fn run(db: ImageDatabase, db_path: String) {
             get_perf_snapshot,
             reset_perf_stats,
             export_perf_snapshot,
+            record_user_action,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

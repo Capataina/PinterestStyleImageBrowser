@@ -17,7 +17,7 @@ import { PinterestModal } from "@/components/PinterestModal";
 import { IndexingStatusPill } from "@/components/IndexingStatusPill";
 import { SettingsDrawer } from "@/components/SettingsDrawer";
 import { PerfOverlay } from "@/components/PerfOverlay";
-import { isProfilingEnabled } from "@/services/perf";
+import { isProfilingEnabled, recordAction } from "@/services/perf";
 import { useQueryClient } from "@tanstack/react-query";
 import { FolderOpen, Settings as SettingsIcon } from "lucide-react";
 import { pickScanFolder, setScanRoot } from "@/services/images";
@@ -59,7 +59,10 @@ export default function Home() {
       const cmdOrCtrl = e.metaKey || e.ctrlKey;
       if (cmdOrCtrl && e.key === ",") {
         e.preventDefault();
-        setSettingsOpen((s) => !s);
+        setSettingsOpen((s) => {
+          recordAction(s ? "settings_close" : "settings_open", { via: "shortcut" });
+          return !s;
+        });
         return;
       }
       if (
@@ -199,6 +202,7 @@ export default function Home() {
   const isSearchLoading = shouldUseSemanticSearch && semanticSearchResults.isFetching;
 
   const handleClose = () => {
+    recordAction("image_close", { id: selectedItem?.id });
     setIsInspecting(false);
     // Bump the shuffle seed so the next render produces a fresh order
     // when sortMode is "shuffle". For other sort modes this is a
@@ -211,6 +215,7 @@ export default function Home() {
   };
 
   const handleCloseInspect = () => {
+    recordAction("inspect_close", { id: selectedItem?.id });
     setIsInspecting(false);
   };
 
@@ -225,16 +230,20 @@ export default function Home() {
     } else {
       newIndex = currentIndex < images.data.length - 1 ? currentIndex + 1 : 0;
     }
-    navigate(`/${images.data[newIndex].id}/`);
+    const target = images.data[newIndex];
+    recordAction("image_navigate", { direction, from: selectedItem.id, to: target.id });
+    navigate(`/${target.id}/`);
   };
 
   // Handle clicking on an image in the grid
   const handleImageClick = (item: ImageItem) => {
     if (selectedItem && selectedItem.id === item.id) {
       // Clicking on the already-selected image → open inspect modal
+      recordAction("image_inspect", { id: item.id });
       setIsInspecting(true);
     } else {
       // Clicking on a different image → select it
+      recordAction("image_click", { id: item.id });
       navigate(`/${item.id}/`);
     }
   };
@@ -295,6 +304,10 @@ export default function Home() {
               <SearchBar
                 tags={tags.data}
                 onSearchChange={(selectedTags, text) => {
+                  recordAction("search_change", {
+                    text,
+                    tagIds: selectedTags.map((t) => t.id),
+                  });
                   setSearchTags(selectedTags);
                   setSearchText(text);
                 }}
@@ -335,7 +348,10 @@ export default function Home() {
               title="Settings (⌘,)"
               aria-label="Settings"
               className="flex shrink-0 items-center justify-center rounded-full bg-secondary text-secondary-foreground p-3 transition-colors hover:bg-accent"
-              onClick={() => setSettingsOpen(true)}
+              onClick={() => {
+                recordAction("settings_open", { via: "button" });
+                setSettingsOpen(true);
+              }}
             >
               <SettingsIcon className="h-4 w-4" />
             </button>

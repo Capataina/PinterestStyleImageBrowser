@@ -1,7 +1,7 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use image_browser_lib::{db, perf};
+use image_browser_lib::{db, paths, perf};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 fn main() {
@@ -51,7 +51,29 @@ fn main() {
 
     if profiling {
         let _ = registry.with(perf::PerfLayer::new()).try_init();
-        tracing::info!("profiling mode enabled (--profile)");
+        // Open the session directory under Library/exports/ and start
+        // the background flush thread. From this point on, every span
+        // close + every record_user_action call lands in
+        // Library/exports/perf-{unix_ts}/timeline.jsonl, drained every
+        // 5 seconds. The on-exit renderer reads the same file.
+        match perf::init_session(paths::exports_dir()) {
+            Ok(dir) => {
+                tracing::info!(
+                    "profiling mode enabled (--profile); session dir: {}",
+                    dir.display()
+                );
+                perf::spawn_flush_thread();
+            }
+            Err(e) => {
+                // Don't crash the app if we can't write diagnostics —
+                // the user might still want to use it. Aggregates
+                // still work via the in-memory PerfLayer.
+                tracing::warn!(
+                    "could not init profiling session dir: {e}; \
+                     timeline.jsonl + exit report will not be written"
+                );
+            }
+        }
     } else {
         let _ = registry.try_init();
     }

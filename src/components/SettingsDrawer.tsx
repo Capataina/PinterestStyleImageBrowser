@@ -22,6 +22,7 @@ import {
   useSetRootEnabled,
 } from "../queries/useRoots";
 import { pickScanFolder } from "../services/images";
+import { recordAction } from "../services/perf";
 
 interface SettingsDrawerProps {
   open: boolean;
@@ -225,7 +226,13 @@ export function SettingsDrawer({ open, onClose }: SettingsDrawerProps) {
               <Section title="Sort order">
                 <SegmentedButtons
                   value={prefs.sortMode}
-                  onChange={(v) => update("sortMode", v)}
+                  onChange={(v) => {
+                    recordAction("sort_change", {
+                      from: prefs.sortMode,
+                      to: v,
+                    });
+                    update("sortMode", v);
+                  }}
                   options={[
                     { value: "shuffle", label: "Shuffle" },
                     { value: "name", label: "Name" },
@@ -252,9 +259,13 @@ export function SettingsDrawer({ open, onClose }: SettingsDrawerProps) {
                     >
                       <Toggle
                         checked={root.enabled}
-                        onChange={(enabled) =>
-                          toggleRootMutation.mutate({ id: root.id, enabled })
-                        }
+                        onChange={(enabled) => {
+                          recordAction("folder_toggle", {
+                            id: root.id,
+                            enabled,
+                          });
+                          toggleRootMutation.mutate({ id: root.id, enabled });
+                        }}
                       />
                       <div className="flex-1 min-w-0">
                         <p
@@ -276,6 +287,10 @@ export function SettingsDrawer({ open, onClose }: SettingsDrawerProps) {
                               `Remove ${root.path}?\n\nThe images from this folder will be removed from the index. The actual files on disk are not touched.`,
                             )
                           ) {
+                            recordAction("folder_remove", {
+                              id: root.id,
+                              path: root.path,
+                            });
                             removeRootMutation.mutate(root.id);
                           }
                         }}
@@ -300,6 +315,7 @@ export function SettingsDrawer({ open, onClose }: SettingsDrawerProps) {
                     try {
                       const folder = await pickScanFolder();
                       if (!folder) return;
+                      recordAction("folder_add", { path: folder });
                       await addRootMutation.mutateAsync(folder);
                     } catch (err) {
                       window.alert(
