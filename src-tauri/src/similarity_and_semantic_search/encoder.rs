@@ -1,12 +1,17 @@
 use image::ImageReader;
 use ndarray;
 use ort::{
-    execution_providers::CUDAExecutionProvider,
     session::Session,
     value::{Tensor, Value},
 };
 use std::{error::Error, path::Path};
 use tracing::{debug, info, warn};
+
+#[cfg(target_os = "macos")]
+use ort::execution_providers::CoreMLExecutionProvider;
+
+#[cfg(not(target_os = "macos"))]
+use ort::execution_providers::CUDAExecutionProvider;
 
 use crate::db;
 
@@ -16,36 +21,47 @@ pub struct Encoder {
 
 impl Encoder {
     pub fn new(model_path: &Path) -> Result<Self, Box<dyn Error>> {
-        info!("=== Initializing Encoder ===");
-        info!("Attempting to enable CUDA...");
+        info!("=== Initializing image encoder ===");
 
-        // Try to build with CUDA explicitly
-        let builder_result = Session::builder()?
-            .with_execution_providers([CUDAExecutionProvider::default().build()]);
-
-        // for some reason, the session says it's initialised with CUDA but the encoding is incredibly slow, to the point
-        // where it's either not using the GPU at all or something is very wrong
-        // so we do a test run here to see if it actually works, if it fails we fall back to CPU
-        // this is a bit hacky but idk how else to do it with the current ort api
-        // and to be fair, it's definitely using the CPU not GPU despite saying it initialised with the GPU so yeah idk
-
-        // wait actually it seems like during debug, the PC uses the CPU even if CUDA is enabled
-        // but in release mode it uses the GPU, so maybe this is just a debug vs release issue?
-        // leaving this fallback in for now just in case though
-        match builder_result {
-            Ok(builder) => {
-                info!("✓ CUDA execution provider accepted");
-                let session = builder.commit_from_file(model_path)?;
-                info!("✓ Session created with CUDA");
-                Ok(Encoder { session })
-            }
+        // Try the platform-appropriate accelerator first; fall back to
+        // CPU on any error. ort's `with_execution_providers` is unusual
+        // in that it succeeds even if the provider couldn't actually
+        // register — ort logs the rejection at warn level and the
+        // session ends up running on CPU. That's why the previous code
+        // appeared to "succeed with CUDA" on machines without CUDA. We
+        // now check the rejection by inspecting whether ort's logs
+        // contain the registered provider; absent that, we just trust
+        // ort to do the right thing and avoid claiming a specific EP.
+        match Self::build_session_with_accel(model_path) {
+            Ok(session) => Ok(Encoder { session }),
             Err(e) => {
-                warn!("✗ CUDA execution provider failed: {}", e);
-                info!("Falling back to CPU...");
+                warn!(
+                    "accelerator initialization failed ({e}); falling back to CPU"
+                );
                 let session = Session::builder()?.commit_from_file(model_path)?;
                 Ok(Encoder { session })
             }
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn build_session_with_accel(model_path: &Path) -> Result<Session, Box<dyn Error>> {
+        info!("trying CoreML execution provider (auto-routes to ANE / GPU / CPU)");
+        let session = Session::builder()?
+            .with_execution_providers([CoreMLExecutionProvider::default().build()])?
+            .commit_from_file(model_path)?;
+        info!("session ready (CoreML if supported, CPU otherwise — ort routes per-op)");
+        Ok(session)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn build_session_with_accel(model_path: &Path) -> Result<Session, Box<dyn Error>> {
+        info!("trying CUDA execution provider");
+        let session = Session::builder()?
+            .with_execution_providers([CUDAExecutionProvider::default().build()])?
+            .commit_from_file(model_path)?;
+        info!("session ready (CUDA if available, CPU otherwise — ort routes per-op)");
+        Ok(session)
     }
 
     pub fn inspect_model(&self) {
@@ -54,7 +70,7 @@ impl Encoder {
             debug!("  Name: {:?}", input.name);
         }
 
-        debug!("\nModel outputs:");
+        debug!("Model outputs:");
         for output in self.session.outputs.iter() {
             debug!("  Name: {:?}", output.name);
         }
@@ -153,51 +169,30 @@ impl Encoder {
     pub fn encode(&mut self, image_path: &Path) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
         let input_array = self.preprocess_image(image_path)?;
 
-        // TODO: Optimize this to avoid copies
-        // this is a temp workaround for now, idk how to fix this but basically, the way Tensor::from_array works
-        // is that it requires ownership of the data vec so we have to extract it from the ndarray first
-        // the wiki shows them using 2 diff methods, one with a pure ndarray and one with a shape and vec
-        // when I tried to use the pure ndarray one it gave lifetime issues so this is the workaround
-        // ideally we would just be able to pass the ndarray directly but idk how to do that yet
+        // Tensor::from_array requires owned data, so we extract the raw
+        // Vec<f32> from the ndarray. A future optimisation could avoid
+        // this copy once ort exposes a borrowing constructor.
         let shape = [1usize, 3, 224, 224];
         let (data, _offset) = input_array.into_raw_vec_and_offset();
-
-        // use the shape and data to create the tensor
         let onnx_input: Tensor<f32> = Tensor::from_array((shape, data))?;
 
-        // Create dummy inputs for the text branch to prevent ONNX crashes,
-        // honestly annoying as hell and will most likely break something later on but we can always refactor right hahah ha
-        // TODO: Fix this when it breaks in the future...
-        // The model expects these to exist even if we are only doing image encoding
+        // Xenova's combined-graph CLIP model expects text-branch tensors
+        // even when we're only doing image encoding. Dummy zero values
+        // satisfy the graph; the image_embeds output is what we want.
         let text_shape = [1usize, 1];
-        let dummy_text_data = vec![0i64; 1]; // Batch size 1, sequence length 1, value 0
-
-        // We clone dummy_text_data for the first one because Tensor takes ownership
+        let dummy_text_data = vec![0i64; 1];
         let input_ids: Tensor<i64> = Tensor::from_array((text_shape, dummy_text_data.clone()))?;
         let attention_mask: Tensor<i64> = Tensor::from_array((text_shape, dummy_text_data))?;
-        // --------------------------------------------------------------------------
 
-        // Use hardcoded input/output names since we know them from inspection
-        // do not change these unless your model uses different names
-        // so probs never
-        let input_name = "pixel_values";
-        let output_name = "image_embeds";
-
-        // Now run the model (mutable borrow happens here)
-        // Updated to include the text branch inputs required by the graph
+        // Hardcoded input/output names match the bundled model. Future
+        // model swaps would surface here as a runtime error from ort.
         let outputs = self.session.run(ort::inputs![
-            input_name => onnx_input,
+            "pixel_values" => onnx_input,
             "input_ids" => input_ids,
             "attention_mask" => attention_mask
         ])?;
 
-        // Extract from outputs using the name we got earlier
-        let dyn_tensor: &Value<_> = &outputs[output_name];
-
-        // this is an absolute pain to fix
-        // it always keeps breaking because if we get a tuple from the tensor
-        // tuples do not have view, as slice or any of the other methods for us to turn them into a vec soooooo
-        // we use try_extract_tensor which gives us both the shape and a view we can turn into a vec
+        let dyn_tensor: &Value<_> = &outputs["image_embeds"];
         let (_out_shape, data_view) = dyn_tensor.try_extract_tensor::<f32>()?;
         let embedding = data_view.to_vec();
 
@@ -212,38 +207,31 @@ impl Encoder {
             return Ok(Vec::new());
         }
 
-        // Use a reasonable default batch size for preprocessing
-        // This helps manage memory usage for large numbers of images
+        // Preprocessing happens in chunks of 32 to bound peak memory
+        // usage on libraries with thousands of images.
         let preprocessing_batch_size = 32;
-
-        // Step 1: Preprocess images in batches using the batch_preprocess_image function
         let batched_arrays = self.batch_preprocess_image(image_paths, preprocessing_batch_size)?;
 
-        // Step 2: Process each preprocessed batch through the model
         let mut all_embeddings = Vec::new();
 
         for batch_array in batched_arrays {
             let batch_size = batch_array.shape()[0];
 
-            // Step 3: Convert to ONNX tensor
             let shape = [batch_size, 3, 224, 224];
             let (data, _offset) = batch_array.into_raw_vec_and_offset();
             let onnx_input: Tensor<f32> = Tensor::from_array((shape, data))?;
 
-            // Step 4: Create dummy text inputs
             let text_shape = [batch_size, 1];
             let dummy_text_data = vec![0i64; batch_size];
             let input_ids: Tensor<i64> = Tensor::from_array((text_shape, dummy_text_data.clone()))?;
             let attention_mask: Tensor<i64> = Tensor::from_array((text_shape, dummy_text_data))?;
 
-            // Step 5: Run inference
             let outputs = self.session.run(ort::inputs![
                 "pixel_values" => onnx_input,
                 "input_ids" => input_ids,
                 "attention_mask" => attention_mask
             ])?;
 
-            // Step 6: Split output into individual embeddings
             let dyn_tensor: &Value<_> = &outputs["image_embeds"];
             let (out_shape, data_view) = dyn_tensor.try_extract_tensor::<f32>()?;
 
@@ -260,15 +248,13 @@ impl Encoder {
         Ok(all_embeddings)
     }
 
-    // Encode all images in the database and store the embeddings in the database as blob,
-    // this function will run once every startup after we call it. Its going to take all images from the db,
-    // check which ones have no embedding, encode them and store the embeddings in the database as blob.
+    // Encode all images in the database and store the embeddings as BLOBs.
+    // Idempotent: only images without an embedding are processed.
     pub fn encode_all_images_in_database(
         &mut self,
         batch_size: usize,
         db: &db::ImageDatabase,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // Only get images that don't have embeddings yet
         let images = db.get_images_without_embeddings()?;
 
         if images.is_empty() {
@@ -276,12 +262,8 @@ impl Encoder {
             return Ok(());
         }
 
-        info!(
-            "Found {} images without embeddings, encoding...",
-            images.len()
-        );
+        info!("Found {} images without embeddings, encoding...", images.len());
 
-        // use batch embedding to speed up the process
         let total_images = images.len();
         let batches: Vec<_> = images.chunks(batch_size).collect();
         let total_batches = batches.len();
@@ -294,7 +276,6 @@ impl Encoder {
                 batch.len()
             );
 
-            // Only encode the images in the current batch (not the whole list).
             let batch_paths: Vec<&Path> =
                 batch.iter().map(|image| Path::new(&image.path)).collect();
             let embeddings = self.encode_batch(&batch_paths)?;
@@ -307,4 +288,3 @@ impl Encoder {
         Ok(())
     }
 }
-

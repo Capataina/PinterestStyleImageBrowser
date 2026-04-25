@@ -1,40 +1,33 @@
-//! First-launch ONNX model + tokenizer download.
+//! First-launch ONNX model + tokenizer download with live progress.
 //!
-//! Pass 4b scope: synchronous, foreground download to stdout — runs once
-//! during app startup if the relevant files are missing from
-//! `paths::models_dir()`. Pass 5 will move this to a background task with
-//! progress events surfaced to the UI.
+//! Files land in `paths::models_dir()` and are skipped if already present.
+//! A caller-supplied `Progress` callback receives running totals after a
+//! HEAD-request preflight establishes the aggregate target size; the
+//! indexing thread wires this through to the `indexing-progress` Tauri
+//! event channel so the frontend pill can render a smooth bar across all
+//! three files.
 //!
 //! ## Sources (verified 2026-04-25)
 //!
 //! - **Image encoder** — Xenova's HuggingFace Optimum ONNX export of
-//!   OpenAI CLIP ViT-B/32. Combined-graph variant (both image and text
-//!   branches in one model) so the existing `encoder.rs` pipeline that
-//!   feeds dummy text inputs alongside the real image tensor works
-//!   without modification. The signature matches:
+//!   OpenAI CLIP ViT-B/32. Combined-graph variant with the signature:
 //!     - inputs: `pixel_values` [1,3,224,224], `input_ids` [1,1], `attention_mask` [1,1]
 //!     - output: `image_embeds` [1,512]
 //!
-//! - **Text encoder** — sentence-transformers' multilingual CLIP. This
-//!   model is specifically trained to map 50+ languages into the same
-//!   512-d embedding space as OpenAI's English CLIP, which is what makes
-//!   typing `犬` find dogs. The Xenova text-only model is English-only
-//!   and would NOT be a substitute here.
+//! - **Text encoder** — sentence-transformers' multilingual CLIP
+//!   (clip-ViT-B-32-multilingual-v1). 50+ languages mapped into the
+//!   shared 512-d CLIP embedding space.
 //!
-//! - **Tokenizer** — the multilingual model's `tokenizer.json`. The
-//!   pure-Rust WordPiece tokenizer in `encoder_text.rs` parses this file
-//!   directly.
+//! - **Tokenizer** — the multilingual model's `tokenizer.json`.
 //!
-//! Total first-launch download: ~1.15 GB. Subsequent launches no-op
-//! because the files exist locally.
+//! Total first-launch download: ~1.15 GB.
 
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::{BufWriter, Read, Write};
-
 use std::path::Path;
 
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::paths;
 
@@ -50,24 +43,29 @@ const TEXT_MODEL_URL: &str =
 const TOKENIZER_URL: &str =
     "https://huggingface.co/sentence-transformers/clip-ViT-B-32-multilingual-v1/resolve/main/tokenizer.json";
 
-/// Local filenames inside `paths::models_dir()`. These are the names the
-/// rest of the codebase already expects (see `lib.rs::semantic_search`
-/// and `main.rs`).
 const IMAGE_MODEL_FILENAME: &str = "model_image.onnx";
 const TEXT_MODEL_FILENAME: &str = "model_text.onnx";
 const TOKENIZER_FILENAME: &str = "tokenizer.json";
 
-/// Download every model file that is missing from `paths::models_dir()`.
-/// Files that already exist are left alone — no version check, no hash
-/// verification (yet — see TODO at the bottom of this file).
+/// Callback signature for download progress.
 ///
-/// Returns Ok(()) when every required file is present after the call.
-/// Returns Err on the first download that fails — partial state on disk
-/// (a half-written .onnx file) is not cleaned up automatically; on the
-/// next launch, the partial file's existence will skip the redownload
-/// and the app will fail to load the model. Worth catching in Pass 5
-/// when we move to async downloads with proper temp-file + rename.
-pub fn download_models_if_missing() -> Result<(), Box<dyn Error>> {
+/// `processed` and `total` are aggregate byte counts across all
+/// downloads in the current call; `current_file` is the filename
+/// being fetched right now (or `None` if no file-specific work is
+/// happening, e.g. during the HEAD-request preflight).
+pub type ProgressFn = dyn Fn(u64, u64, Option<&str>) + Send + Sync;
+
+/// Download every model file that is missing from `paths::models_dir()`.
+/// Already-present files are left alone.
+///
+/// `progress` is invoked with running aggregate byte totals as bytes
+/// land. The callback is also invoked once at the start with
+/// `(0, total_bytes_to_download, None)` after the HEAD preflight, so
+/// the UI can show the eventual size before any actual download begins.
+pub fn download_models_if_missing<F>(progress: F) -> Result<(), Box<dyn Error>>
+where
+    F: Fn(u64, u64, Option<&str>) + Send + Sync + 'static,
+{
     let models_dir = paths::models_dir();
 
     let targets = [
@@ -76,47 +74,81 @@ pub fn download_models_if_missing() -> Result<(), Box<dyn Error>> {
         (TOKENIZER_URL, TOKENIZER_FILENAME),
     ];
 
-    let mut anything_downloaded = false;
-
+    // Phase 1: figure out which files are missing and how big they are
+    // in total. This lets the caller's progress bar be determinate
+    // across the whole 1+GB download rather than per-file.
+    let mut to_download: Vec<(&str, &str, u64)> = Vec::new();
     for (url, filename) in targets {
         let dest = models_dir.join(filename);
         if dest.exists() {
             continue;
         }
-        if !anything_downloaded {
-            info!(
-                "First-launch model setup begun — files will land in {}",
-                models_dir.display()
-            );
-            anything_downloaded = true;
-        }
-        download_to_file(url, &dest)?;
+        let size = head_content_length(url).unwrap_or(0);
+        to_download.push((url, filename, size));
     }
 
-    if anything_downloaded {
-        info!("All model files present.");
+    if to_download.is_empty() {
+        return Ok(());
     }
+
+    info!(
+        "First-launch model setup begun — {} files to fetch into {}",
+        to_download.len(),
+        models_dir.display()
+    );
+
+    let total_bytes: u64 = to_download.iter().map(|(_, _, s)| s).sum();
+    progress(0, total_bytes, None);
+
+    // Phase 2: actually download. The aggregate counter accumulates
+    // across files so the UI sees one smooth 0..total progression.
+    let mut bytes_so_far: u64 = 0;
+    for (url, filename, _) in &to_download {
+        let dest = models_dir.join(filename);
+        download_to_file(url, &dest, &mut bytes_so_far, total_bytes, &progress)?;
+    }
+
+    info!("All model files present.");
+    progress(total_bytes, total_bytes, None);
     Ok(())
 }
 
-/// Synchronous chunked download with stdout progress. Writes to
-/// `dest.with_extension("part")` first then renames on success — that
-/// way an interrupted download leaves a `.part` file behind that the
-/// next run will see-and-delete-and-retry rather than treating as
-/// complete (see partial-file note below).
-fn download_to_file(url: &str, dest: &Path) -> Result<(), Box<dyn Error>> {
+/// HEAD a URL to read its Content-Length. Falls through to None on any
+/// error; the caller treats unknown sizes as zero in the aggregate
+/// total (so the bar is slightly less accurate but still progresses).
+fn head_content_length(url: &str) -> Option<u64> {
+    let resp = ureq::head(url).call().ok()?;
+    resp.headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+}
+
+/// Synchronous chunked download with progress callback.
+///
+/// `bytes_so_far` is the running aggregate counter — we mutate it in
+/// place so the caller's tally stays accurate across files. Writes to
+/// `dest.with_extension("part")` first then renames atomically on
+/// success; an interrupted download leaves a stale `.part` that the
+/// next run cleans up before retrying.
+fn download_to_file(
+    url: &str,
+    dest: &Path,
+    bytes_so_far: &mut u64,
+    total_bytes: u64,
+    progress: &ProgressFn,
+) -> Result<(), Box<dyn Error>> {
+    let filename = dest
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("model");
     info!("GET {url}");
 
     let resp = ureq::get(url).call()?;
-    let total_bytes: Option<u64> = resp
-        .headers()
-        .get("content-length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok());
-
     let part_path = dest.with_extension("part");
-    // If a previous run left a stale .part behind, remove it — its bytes
-    // can't be reused without HTTP Range semantics, which we don't do yet.
+
+    // If a previous run left a stale .part behind, remove it — its
+    // bytes can't be reused without HTTP Range semantics.
     if part_path.exists() {
         let _ = fs::remove_file(&part_path);
     }
@@ -125,12 +157,12 @@ fn download_to_file(url: &str, dest: &Path) -> Result<(), Box<dyn Error>> {
     let file = File::create(&part_path)?;
     let mut writer = BufWriter::new(file);
 
-    // 256 KB chunks. Big enough that progress reporting isn't a fire hose
-    // (a 600 MB file is ~2400 chunks); small enough that we surface
-    // progress within a few seconds even on slow connections.
+    // 256 KB read chunks. Progress callback invoked at most every
+    // ~512 KB written (one byte-counter update per loop) — that's
+    // ~2000 callbacks for a 1 GB download, comfortably below
+    // overhead concerns even with the Tauri event hop.
     let mut buf = vec![0u8; 256 * 1024];
-    let mut downloaded: u64 = 0;
-    let mut last_logged_percent: i32 = -1;
+    let mut last_emitted_bucket: i32 = -1;
 
     loop {
         let n = reader.read(&mut buf)?;
@@ -138,25 +170,37 @@ fn download_to_file(url: &str, dest: &Path) -> Result<(), Box<dyn Error>> {
             break;
         }
         writer.write_all(&buf[..n])?;
-        downloaded += n as u64;
+        *bytes_so_far += n as u64;
 
-        // Progress: log every full 10% step (or on every megabyte if
-        // we don't know the total length).
-        if let Some(total) = total_bytes {
-            let percent = ((downloaded as f64 / total as f64) * 100.0) as i32;
-            // Round down to nearest 10 so we get 0%, 10%, 20%, ..., 100%
-            let bucket = (percent / 10) * 10;
-            if bucket > last_logged_percent {
-                last_logged_percent = bucket;
+        // Coalesce the progress callback to once per ~1% of the total
+        // (so the UI gets ~100 events for a full download, smooth
+        // enough for a determinate bar without thrashing).
+        if total_bytes > 0 {
+            let bucket = ((*bytes_so_far as f64 / total_bytes as f64) * 100.0) as i32;
+            if bucket > last_emitted_bucket {
+                last_emitted_bucket = bucket;
+                progress(*bytes_so_far, total_bytes, Some(filename));
+            }
+        } else {
+            // No total known — emit on every chunk write so the UI
+            // sees the byte counter advance, even if it can't draw a
+            // determinate bar.
+            progress(*bytes_so_far, 0, Some(filename));
+        }
+
+        // Per-10% trace logging is independent of the UI callback.
+        // Keeps the terminal log human-friendly without firehose-y
+        // per-chunk lines.
+        if let Some(total) = Some(total_bytes).filter(|t| *t > 0) {
+            let pct = ((*bytes_so_far as f64 / total as f64) * 100.0) as i32;
+            if pct % 10 == 0 && (pct / 10) * 10 != last_emitted_bucket / 10 * 10 {
                 debug!(
-                    "  {bucket}% — {} / {} MB",
-                    downloaded / 1_048_576,
-                    total / 1_048_576
+                    "  {pct}% — {} / {} MB ({})",
+                    *bytes_so_far / 1_048_576,
+                    total / 1_048_576,
+                    filename
                 );
             }
-        } else if downloaded.is_multiple_of(10 * 1_048_576) {
-            // No content-length — log every 10 MB.
-            debug!("  {} MB so far", downloaded / 1_048_576);
         }
     }
 
@@ -164,13 +208,15 @@ fn download_to_file(url: &str, dest: &Path) -> Result<(), Box<dyn Error>> {
     drop(writer);
 
     fs::rename(&part_path, dest)?;
-    info!(
-        "saved {} ({} MB)",
-        dest.display(),
-        downloaded / 1_048_576
-    );
-
+    info!("saved {} ({} bytes)", dest.display(), file_size(dest));
     Ok(())
+}
+
+fn file_size(path: &Path) -> u64 {
+    fs::metadata(path).map(|m| m.len()).unwrap_or_else(|_| {
+        warn!("could not stat {}", path.display());
+        0
+    })
 }
 
 #[cfg(test)]
@@ -200,14 +246,15 @@ mod tests {
         assert_eq!(TEXT_MODEL_FILENAME, "model_text.onnx");
         assert_eq!(TOKENIZER_FILENAME, "tokenizer.json");
     }
-}
 
-// TODO(future hardening): Once Pass 5 lands the async download path:
-// - Verify a SHA256 of each file against a hash bundled in this module.
-//   HuggingFace exposes `X-Linked-Etag` headers that often contain the
-//   blob's git-LFS SHA256, which we could pin and check.
-// - Add HTTP Range resumption so an interrupted 600 MB download can
-//   pick up where it left off. The current `.part` file is created
-//   afresh on every retry.
-// - Surface progress as a Tauri event so the UI can render a real
-//   progress bar instead of relying on stdout.
+    #[test]
+    fn test_progress_signature_compiles() {
+        // Compile-time only: ensures the closure shape we pass from
+        // indexing.rs matches what download_models_if_missing expects.
+        // Doesn't actually fetch anything.
+        let _f = |_processed: u64, _total: u64, _file: Option<&str>| {};
+        // Confirms F's bounds: Fn(u64, u64, Option<&str>) + Send + Sync
+        fn assert_fn<F: Fn(u64, u64, Option<&str>) + Send + Sync>(_: F) {}
+        assert_fn(|_a, _b, _c| {});
+    }
+}

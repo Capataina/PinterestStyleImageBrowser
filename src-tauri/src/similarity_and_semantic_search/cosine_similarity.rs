@@ -1,7 +1,10 @@
 use crate::db;
+use crate::paths;
 use ndarray::Array1;
 use rand::prelude::*;
+use std::fs;
 use std::path::PathBuf;
+use std::time::Instant;
 use tracing::{debug, info, warn};
 
 pub struct CosineIndex {
@@ -19,48 +22,127 @@ impl CosineIndex {
         self.cached_images.push((path, embedding));
     }
 
-    // add a function thats going to connect to our sql database, query all images and their embeddings, and populate the cached_images vector
-    pub fn populate_from_db(&mut self, _db_path: &str) {
-        info!(
-            "populate_from_db called with db_path: {}",
-            _db_path
-        );
-        let db = db::ImageDatabase::new(_db_path).expect("failed to init db");
-        let images = db.get_all_images().expect("failed to get all images");
-        debug!(
-            "Found {} total images in database",
-            images.len()
-        );
-
-        let mut added_count = 0;
-        let mut skipped_no_embedding = 0;
-        let mut skipped_empty = 0;
-
-        for image in images {
-            // Skip images without embeddings instead of panicking
-            match db.get_image_embedding(image.id) {
-                Ok(embedding) => {
-                    // Also skip empty embeddings
-                    if embedding.is_empty() {
-                        skipped_empty += 1;
-                    } else {
-                        self.add_image(
-                            PathBuf::from(image.path.clone()),
-                            Array1::from_vec(embedding),
-                        );
-                        added_count += 1;
-                    }
-                }
-                Err(_) => {
-                    skipped_no_embedding += 1;
-                }
+    /// Populate the in-memory index by SELECTing every embedding in one
+    /// query.
+    ///
+    /// Replaces the previous N+1 implementation (one SELECT per image)
+    /// which was ~30x slower for libraries of 1000+ images. Also takes
+    /// `&ImageDatabase` rather than a `db_path: &str` so the cosine
+    /// module no longer opens its own second SQLite connection.
+    pub fn populate_from_db(&mut self, db: &db::ImageDatabase) {
+        let start = Instant::now();
+        info!("populate_from_db called");
+        let rows = match db.get_all_embeddings() {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("populate_from_db: get_all_embeddings failed: {e}");
+                return;
             }
+        };
+        let total = rows.len();
+        self.cached_images.clear();
+        self.cached_images.reserve(total);
+        for (_id, path, embedding) in rows {
+            if embedding.is_empty() {
+                continue;
+            }
+            self.cached_images
+                .push((PathBuf::from(path), Array1::from_vec(embedding)));
+        }
+        info!(
+            "Population complete: {} embeddings loaded in {:?}",
+            self.cached_images.len(),
+            start.elapsed()
+        );
+    }
+
+    /// Persist the in-memory index to disk for fast next-launch load.
+    /// The cache is keyed by file mtime — a future startup will only
+    /// trust it if the SQLite DB hasn't been modified since.
+    ///
+    /// Failure is non-fatal — we just log; the next launch will
+    /// repopulate from the DB.
+    pub fn save_to_disk(&self) {
+        let path = paths::cosine_cache_path();
+        // Convert to a (String, Vec<f32>) shape so bincode can serialise
+        // without needing PathBuf serde support.
+        let serialisable: Vec<(String, Vec<f32>)> = self
+            .cached_images
+            .iter()
+            .map(|(p, e)| (p.to_string_lossy().into_owned(), e.to_vec()))
+            .collect();
+        match bincode::serialize(&serialisable) {
+            Ok(bytes) => match fs::write(&path, bytes) {
+                Ok(_) => info!(
+                    "cosine cache saved to {} ({} entries)",
+                    path.display(),
+                    self.cached_images.len()
+                ),
+                Err(e) => warn!("cosine cache write failed: {e}"),
+            },
+            Err(e) => warn!("cosine cache serialise failed: {e}"),
+        }
+    }
+
+    /// Try to load the cache from disk. Returns true if the cache was
+    /// loaded successfully and is fresher than the SQLite DB; false
+    /// otherwise (caller should fall back to populate_from_db).
+    ///
+    /// Freshness check: the cache file's mtime must be >= the DB
+    /// file's mtime. If the user ran the encoder since the last save,
+    /// the DB will be newer and we re-populate.
+    pub fn load_from_disk_if_fresh(&mut self, db_path: &std::path::Path) -> bool {
+        let cache_path = paths::cosine_cache_path();
+        if !cache_path.exists() {
+            return false;
         }
 
+        let cache_mtime = match fs::metadata(&cache_path).and_then(|m| m.modified()) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("could not stat cosine cache: {e}");
+                return false;
+            }
+        };
+        let db_mtime = match fs::metadata(db_path).and_then(|m| m.modified()) {
+            Ok(t) => t,
+            Err(_) => {
+                // If we can't stat the DB, we can't trust the cache
+                // either. Fall through to repopulate.
+                return false;
+            }
+        };
+        if cache_mtime < db_mtime {
+            debug!("cosine cache stale (DB modified since save); refusing");
+            return false;
+        }
+
+        let bytes = match fs::read(&cache_path) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("cosine cache read failed: {e}");
+                return false;
+            }
+        };
+        let parsed: Vec<(String, Vec<f32>)> = match bincode::deserialize(&bytes) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("cosine cache deserialise failed: {e}; will repopulate");
+                return false;
+            }
+        };
+
+        self.cached_images.clear();
+        self.cached_images.reserve(parsed.len());
+        for (p, e) in parsed {
+            self.cached_images
+                .push((PathBuf::from(p), Array1::from_vec(e)));
+        }
         info!(
-            "Population complete - Added: {}, Skipped (no embedding): {}, Skipped (empty): {}",
-            added_count, skipped_no_embedding, skipped_empty
+            "cosine cache loaded from disk ({} entries)",
+            self.cached_images.len()
         );
+        true
     }
 
     // Function to compute cosine similarity between two embeddings

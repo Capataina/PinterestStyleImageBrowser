@@ -241,7 +241,7 @@ fn semantic_search(
 
     if index.cached_images.is_empty() {
         debug!("Populating cosine index from database...");
-        index.populate_from_db(&cosine_state.db_path);
+        index.populate_from_db(&db);
         debug!(
             "Cosine index populated with {} images",
             index.cached_images.len()
@@ -364,7 +364,7 @@ fn get_tiered_similar_images(
 
     if index.cached_images.is_empty() {
         debug!("Cache is empty, populating from database...");
-        index.populate_from_db(&cosine_state.db_path);
+        index.populate_from_db(&db);
     }
 
     // Get the path of the clicked image to exclude it from results
@@ -487,7 +487,7 @@ fn get_similar_images(
 
     if index.cached_images.is_empty() {
         debug!("Cache is empty, populating from database...");
-        index.populate_from_db(&cosine_state.db_path);
+        index.populate_from_db(&db);
         debug!(
             "Cache populated - cached_images count: {}",
             index.cached_images.len()

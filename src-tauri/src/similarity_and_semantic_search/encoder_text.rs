@@ -1,6 +1,12 @@
-use ort::{execution_providers::CUDAExecutionProvider, session::Session, value::Tensor};
+use ort::{session::Session, value::Tensor};
 use std::{collections::HashMap, error::Error, fs, path::Path};
 use tracing::{debug, info, warn};
+
+#[cfg(target_os = "macos")]
+use ort::execution_providers::CoreMLExecutionProvider;
+
+#[cfg(not(target_os = "macos"))]
+use ort::execution_providers::CUDAExecutionProvider;
 
 /// Simple tokenizer that loads from HuggingFace tokenizer.json format.
 /// This is a pure Rust implementation to avoid C library dependencies.
@@ -197,34 +203,45 @@ impl TextEncoder {
     /// # Arguments
     /// * `model_path` - Path to the ONNX text model (e.g., "models/model_text.onnx")
     /// * `tokenizer_path` - Path to the tokenizer.json file (e.g., "models/tokenizer.json")
+    #[cfg(target_os = "macos")]
+    fn build_session_with_accel(model_path: &Path) -> Result<Session, Box<dyn Error>> {
+        info!("trying CoreML execution provider for text encoder");
+        let session = Session::builder()?
+            .with_execution_providers([CoreMLExecutionProvider::default().build()])?
+            .commit_from_file(model_path)?;
+        Ok(session)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn build_session_with_accel(model_path: &Path) -> Result<Session, Box<dyn Error>> {
+        info!("trying CUDA execution provider for text encoder");
+        let session = Session::builder()?
+            .with_execution_providers([CUDAExecutionProvider::default().build()])?
+            .commit_from_file(model_path)?;
+        Ok(session)
+    }
+
     pub fn new(model_path: &Path, tokenizer_path: &Path) -> Result<Self, Box<dyn Error>> {
-        info!("=== Initializing Text Encoder ===");
-        info!("Model path: {:?}", model_path);
-        info!("Tokenizer path: {:?}", tokenizer_path);
+        info!("=== Initializing text encoder ===");
+        debug!("Model path: {:?}", model_path);
+        debug!("Tokenizer path: {:?}", tokenizer_path);
 
         // Load the tokenizer
         info!("Loading tokenizer...");
         let tokenizer = SimpleTokenizer::from_file(tokenizer_path)?;
-        info!("✓ Tokenizer loaded successfully");
+        info!("Tokenizer loaded ({} tokens)", tokenizer.vocab.len());
 
-        // Try to build with CUDA, fall back to CPU
-        info!("Attempting to enable CUDA...");
-        let builder_result = Session::builder()?
-            .with_execution_providers([CUDAExecutionProvider::default().build()]);
-
-        let session = match builder_result {
-            Ok(builder) => {
-                info!("✓ CUDA execution provider accepted");
-                let session = builder.commit_from_file(model_path)?;
-                info!("✓ Text encoder session created with CUDA");
-                session
-            }
+        // Build the ONNX session with the platform-appropriate
+        // execution provider, falling back to CPU on any error. Same
+        // story as the image encoder: ort lets the provider registration
+        // succeed even when the EP isn't actually available, so we
+        // can't claim "running on CoreML" or "running on CUDA" with
+        // confidence. We just log what we tried.
+        let session = match Self::build_session_with_accel(model_path) {
+            Ok(s) => s,
             Err(e) => {
-                warn!("✗ CUDA execution provider failed: {}", e);
-                info!("Falling back to CPU...");
-                let session = Session::builder()?.commit_from_file(model_path)?;
-                info!("✓ Text encoder session created with CPU");
-                session
+                warn!("text encoder accelerator init failed ({e}); falling back to CPU");
+                Session::builder()?.commit_from_file(model_path)?
             }
         };
 

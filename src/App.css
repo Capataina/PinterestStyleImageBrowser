@@ -1,10 +1,15 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 
-@custom-variant dark (&:is(.dark *));
+/*
+ * Note: the DM Sans @import was previously here as a CSS @import; that
+ * triggered a postcss warning ("@import must precede all other statements")
+ * because the inlined Tailwind output puts it after non-import rules. The
+ * font is now loaded via <link> tags in index.html, which is also better
+ * for performance (parallel fetch + preconnect).
+ */
 
-/* Pinterest-inspired font */
-@import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,100..1000;1,9..40,100..1000&display=swap');
+@custom-variant dark (&:is(.dark *));
 
 @theme inline {
   --radius-sm: calc(var(--radius) - 4px);

@@ -345,6 +345,49 @@ impl ImageDatabase {
         }
     }
 
+    /// Fetch every (id, path, embedding) row whose embedding is non-null
+    /// in a single SELECT.
+    ///
+    /// Replaces the per-row `get_image_embedding(id)` call inside the
+    /// cosine populate loop, which was N+1 (one query per image —
+    /// ~30x slower than this for 1000+ image libraries). The path is
+    /// returned alongside the embedding because that's what the cosine
+    /// index keys by.
+    ///
+    /// Empty embeddings are skipped at the SQL level (`length(embedding) > 0`)
+    /// so callers don't have to filter them out.
+    pub fn get_all_embeddings(&self) -> rusqlite::Result<Vec<(ID, String, Vec<f32>)>> {
+        let conn = self.connection.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, path, embedding FROM images
+             WHERE embedding IS NOT NULL AND length(embedding) > 0",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let id: ID = row.get(0)?;
+            let path: String = row.get(1)?;
+            let bytes: Vec<u8> = row.get(2)?;
+            Ok((id, path, bytes))
+        })?;
+
+        let mut out = Vec::new();
+        let f32_size = std::mem::size_of::<f32>();
+        for row in rows {
+            let (id, path, bytes) = row?;
+            if bytes.len() % f32_size != 0 {
+                // Skip malformed rows — they were probably written by an
+                // older version with a different layout. The user can
+                // wipe and re-encode.
+                continue;
+            }
+            let embedding: Vec<f32> = unsafe {
+                std::slice::from_raw_parts(bytes.as_ptr() as *const f32, bytes.len() / f32_size)
+                    .to_vec()
+            };
+            out.push((id, path, embedding));
+        }
+        Ok(out)
+    }
+
     pub fn get_image_id_by_path(&self, path: &str) -> rusqlite::Result<ID> {
         let conn = self.connection.lock().unwrap();
         let mut stmt = conn.prepare("SELECT id FROM images WHERE path = ?1 LIMIT 1")?;

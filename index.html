@@ -4,7 +4,23 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Tauri + React + Typescript</title>
+
+    <!--
+      DM Sans loaded via <link> rather than CSS @import:
+      - parallel fetch (no render block via the CSS dependency chain)
+      - preconnect lets DNS+TLS happen before the stylesheet GET
+      - and most importantly: avoids the postcss "@import must precede
+        all other statements" error that was firing when the font
+        @import landed after Tailwind's inlined rules in App.css.
+    -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,100..1000;1,9..40,100..1000&display=swap"
+      rel="stylesheet"
+    />
+
+    <title>Image Browser</title>
   </head>
 
   <body>

@@ -64,6 +64,18 @@ pub fn settings_path() -> PathBuf {
     app_data_dir().join("settings.json")
 }
 
+/// Path to the on-disk cached cosine index (a bincode-encoded
+/// Vec<(PathBuf, Vec<f32>)>). Loaded eagerly at app startup if it
+/// exists and is fresher than the SQLite DB; populated again from
+/// the DB whenever the indexing pipeline finishes encoding.
+///
+/// Lives in app_data_dir rather than in the DB itself because the
+/// embedding BLOB column already holds the canonical data — the cache
+/// just speeds up the load path.
+pub fn cosine_cache_path() -> PathBuf {
+    app_data_dir().join("cosine_cache.bin")
+}
+
 fn ensure_dir(path: &PathBuf) -> io::Result<()> {
     if !path.exists() {
         fs::create_dir_all(path)?;

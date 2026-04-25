@@ -27,13 +27,14 @@
 //! listens and renders a status pill.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 
+use rayon::prelude::*;
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
-use tracing::{error, warn};
+use tauri::{AppHandle, Emitter, Manager};
+use tracing::{error, info, warn};
 
 use crate::db::ImageDatabase;
 use crate::filesystem::ImageScanner;
@@ -41,7 +42,9 @@ use crate::model_download;
 use crate::paths;
 use crate::similarity_and_semantic_search::cosine_similarity::CosineIndex;
 use crate::similarity_and_semantic_search::encoder::Encoder;
+use crate::similarity_and_semantic_search::encoder_text::TextEncoder;
 use crate::thumbnail::ThumbnailGenerator;
+use crate::TextEncoderState;
 
 /// The single-flight guard. Wrap in Arc and stash in a Tauri state
 /// struct so commands and the setup callback can both reach it.
@@ -169,9 +172,48 @@ fn run_pipeline_inner(
     db_path: &str,
     cosine_index: &Arc<std::sync::Mutex<CosineIndex>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Make sure the model files are on disk. No-op on subsequent runs.
+    // 0. Try the on-disk cosine cache before doing anything else. On a
+    //    typical second-launch with no new images, the cache is fresh
+    //    and similarity / semantic search become available essentially
+    //    immediately — the user can act on the catalog while the rest
+    //    of the pipeline (rescan, model verification) finishes in the
+    //    background. The cache is invalidated automatically if the DB
+    //    file is newer than it.
+    {
+        let db_path_buf = std::path::PathBuf::from(db_path);
+        if let Ok(mut idx) = cosine_index.lock() {
+            if idx.cached_images.is_empty() {
+                idx.load_from_disk_if_fresh(&db_path_buf);
+            }
+        }
+    }
+
+    // 1. Make sure the model files are on disk. The download function
+    //    now reports progress via callback so the UI's status pill can
+    //    render a real determinate bar across the ~1 GB of downloads
+    //    instead of the previous "Checking models..." flash followed
+    //    by a multi-minute silent stretch.
     emit(app, Phase::ModelDownload, 0, 0, Some("Checking models...".into()));
-    if let Err(e) = model_download::download_models_if_missing() {
+    let app_for_progress = app.clone();
+    let progress_cb = move |processed: u64, total: u64, current_file: Option<&str>| {
+        let msg = current_file.map(|f| {
+            if total > 0 {
+                format!(
+                    "Downloading {f} — {} / {} MB",
+                    processed / 1_048_576,
+                    total / 1_048_576
+                )
+            } else {
+                format!("Downloading {f} — {} MB", processed / 1_048_576)
+            }
+        });
+        // Tauri events take usize; cast carefully. The download is
+        // capped at ~1.2 GB so usize::MAX is not in play even on 32-bit.
+        let processed = processed.min(usize::MAX as u64) as usize;
+        let total = total.min(usize::MAX as u64) as usize;
+        emit(&app_for_progress, Phase::ModelDownload, processed, total, msg);
+    };
+    if let Err(e) = model_download::download_models_if_missing(progress_cb) {
         // Non-fatal: scan + thumbnail still work without models. Encode
         // gets skipped further down.
         warn!("model download skipped: {e}");
@@ -182,6 +224,37 @@ fn run_pipeline_inner(
             0,
             Some(format!("Model download skipped: {e}")),
         );
+    }
+
+    // 1b. Pre-warm the text encoder so the user's first semantic search
+    //     doesn't pause for ~1-2 seconds while the ONNX session and
+    //     tokenizer load. We're already on a background thread inside
+    //     the pipeline; absorbing the load cost here is invisible to
+    //     the user (the indexing pill is already showing), whereas
+    //     paying it later means the user types a query and stares at
+    //     a spinner.
+    {
+        let models_dir = paths::models_dir();
+        let model_path = models_dir.join("model_text.onnx");
+        let tokenizer_path = models_dir.join("tokenizer.json");
+        if model_path.exists() && tokenizer_path.exists() {
+            // Bind the State separately so its lifetime extends across
+            // the full block. Inlining `app.state::<TextEncoderState>()
+            // .encoder.lock()` produces a temporary that the borrow
+            // checker drops too early.
+            let text_encoder_state: tauri::State<'_, TextEncoderState> =
+                app.state::<TextEncoderState>();
+            let lock_result = text_encoder_state.encoder.lock();
+            if let Ok(mut lock) = lock_result {
+                if lock.is_none() {
+                    info!("pre-warming text encoder");
+                    match TextEncoder::new(&model_path, &tokenizer_path) {
+                        Ok(encoder) => *lock = Some(encoder),
+                        Err(e) => warn!("text encoder pre-warm failed: {e}"),
+                    }
+                }
+            }
+        }
     }
 
     // 2. Resolve the scan root from settings. If none, exit cleanly.
@@ -228,35 +301,54 @@ fn run_pipeline_inner(
     }
     emit(app, Phase::Scan, total_found, total_found, None);
 
-    // 5. Thumbnails.
+    // 5. Thumbnails (parallel via rayon).
+    //
+    //    Per-image cost is dominated by JPEG decode+encode, which is
+    //    embarrassingly parallel. The DB write under the mutex is
+    //    microseconds vs ~100ms decode/encode, so contention there is
+    //    negligible. On an M-series chip with 8-12 cores this gives
+    //    a ~6-10x speedup vs the previous serial loop.
     let thumbnail_generator = ThumbnailGenerator::new(&paths::thumbnails_dir(), 400, 400)?;
     let needs_thumbs = database.get_images_without_thumbnails()?;
     let total_thumbs = needs_thumbs.len();
     if total_thumbs > 0 {
         emit(app, Phase::Thumbnail, 0, total_thumbs, None);
-        for (i, image) in needs_thumbs.iter().enumerate() {
-            // Reuse the existing per-image generation; the bulk method
-            // would also work but doesn't expose granular progress.
+
+        let completed = AtomicUsize::new(0);
+        let last_emit_bucket = AtomicUsize::new(0);
+        // Coalesce progress emits to roughly every 25 thumbnails
+        // (across ALL workers combined) so a 1500-image run fires
+        // ~60 events rather than ~1500.
+        const EMIT_EVERY: usize = 25;
+
+        needs_thumbs.par_iter().for_each(|image| {
             match thumbnail_generator.generate_thumbnail(Path::new(&image.path), image.id) {
                 Ok(result) => {
-                    database.update_image_thumbnail(
+                    if let Err(e) = database.update_image_thumbnail(
                         image.id,
                         &result.thumbnail_path,
                         result.original_width,
                         result.original_height,
-                    )?;
+                    ) {
+                        warn!("DB update for thumbnail of image {} failed: {e}", image.id);
+                    }
                 }
                 Err(e) => {
-                    warn!(
-                        "thumbnail failed for {}: {e}",
-                        image.path
-                    );
+                    warn!("thumbnail generation failed for {}: {e}", image.path);
                 }
             }
-            if (i + 1) % 25 == 0 || i + 1 == total_thumbs {
-                emit(app, Phase::Thumbnail, i + 1, total_thumbs, None);
+
+            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+            let bucket = done / EMIT_EVERY;
+            let prev = last_emit_bucket.load(Ordering::Relaxed);
+            if bucket > prev
+                && last_emit_bucket
+                    .compare_exchange(prev, bucket, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
+                emit(app, Phase::Thumbnail, done, total_thumbs, None);
             }
-        }
+        });
     }
     emit(app, Phase::Thumbnail, total_thumbs, total_thumbs, None);
 
@@ -289,11 +381,11 @@ fn run_pipeline_inner(
         );
     }
 
-    // 7. Repopulate the in-memory cosine cache. The cosine module owns
-    //    the populate logic; we just clear-and-trigger.
+    // 7. Repopulate the in-memory cosine cache from the now-fresh
+    //    embeddings, then persist to disk so next-launch starts hot.
     if let Ok(mut idx) = cosine_index.lock() {
-        idx.cached_images.clear();
-        idx.populate_from_db(db_path);
+        idx.populate_from_db(&database);
+        idx.save_to_disk();
     }
 
     // 8. Done — total image count is what the user sees in the grid.
