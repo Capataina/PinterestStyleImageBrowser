@@ -11,7 +11,7 @@ import { useDebouncedValue } from "../hooks/useDebouncedValue";
 import { ImageItem, Tag } from "../types";
 import { AnimatePresence, motion } from "framer-motion";
 import { useLocation, useNavigate } from "react-router";
-import { useTags, useCreateTag } from "@/queries/useTags";
+import { useTags, useCreateTag, useDeleteTag } from "@/queries/useTags";
 import { SearchBar } from "@/components/SearchBar";
 import { PinterestModal } from "@/components/PinterestModal";
 import { useQueryClient } from "@tanstack/react-query";
@@ -45,6 +45,7 @@ export default function Home() {
 
   const tags = useTags();
   const createTagMutation = useCreateTag();
+  const deleteTagMutation = useDeleteTag();
   const assignTagMutation = useAssignTagToImage();
   const removeTagMutation = useRemoveTagFromImage();
   const tieredSimilarImages = useTieredSimilarImages(selectedItem?.id);
@@ -158,6 +159,7 @@ export default function Home() {
               const tag = await createTagMutation.mutateAsync({ name, color });
               return tag;
             }}
+            onDeleteTag={(tagId) => deleteTagMutation.mutate(tagId)}
             onAssignTag={(imageId, tagId) =>
               assignTagMutation.mutate({ imageId, tagId })
             }

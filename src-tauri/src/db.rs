@@ -119,9 +119,12 @@ impl ImageDatabase {
     }
 
     pub fn add_tag_to_image(&self, image_id: ID, tag_id: ID) -> rusqlite::Result<()> {
-        println!("adding to {image_id}, {tag_id}");
+        // INSERT OR IGNORE so duplicate (image_id, tag_id) assignments are
+        // a no-op rather than a UNIQUE-constraint error. The frontend
+        // pre-checks selection state, but a future caller that doesn't
+        // shouldn't have to.
         self.connection.lock().unwrap().execute(
-            "INSERT INTO images_tags (image_id, tag_id) VALUES (?1, ?2)",
+            "INSERT OR IGNORE INTO images_tags (image_id, tag_id) VALUES (?1, ?2)",
             [image_id, tag_id],
         )?;
         Ok(())

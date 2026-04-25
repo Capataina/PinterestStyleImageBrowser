@@ -46,19 +46,4 @@ impl ImageData {
         }
     }
 
-    /// Create ImageData with thumbnail info
-    pub fn with_thumbnail(
-        id: ID,
-        path: &Path,
-        tags: Vec<Tag>,
-        thumbnail_path: Option<String>,
-        width: Option<u32>,
-        height: Option<u32>,
-    ) -> Self {
-        let mut data = Self::new(id, path, tags);
-        data.thumbnail_path = thumbnail_path;
-        data.width = width;
-        data.height = height;
-        data
-    }
 }

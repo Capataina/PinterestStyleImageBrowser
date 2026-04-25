@@ -69,6 +69,11 @@ fn create_tag(db: State<'_, ImageDatabase>, name: String, color: String) -> Resu
 }
 
 #[tauri::command]
+fn delete_tag(db: State<'_, ImageDatabase>, tag_id: i64) -> Result<(), String> {
+    db.delete_tag(tag_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn add_tag_to_image(
     db: State<'_, ImageDatabase>,
     image_id: i64,
@@ -613,6 +618,7 @@ pub fn run(db: ImageDatabase, db_path: String) {
             get_images,
             get_tags,
             create_tag,
+            delete_tag,
             add_tag_to_image,
             remove_tag_from_image,
             get_similar_images,

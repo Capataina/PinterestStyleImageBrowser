@@ -1,6 +1,11 @@
 "use client";
 
-import { CheckIcon, ChevronsUpDownIcon, PlusCircleIcon } from "lucide-react";
+import {
+  CheckIcon,
+  ChevronsUpDownIcon,
+  PlusCircleIcon,
+  Trash2Icon,
+} from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -30,6 +35,7 @@ interface TagDropdownProps {
   placeholder: string;
   instruction: string;
   onCreateTag: (name: string, color: string) => Promise<Tag>;
+  onDeleteTag?: (tagId: number) => void;
   imageId?: number;
   onAssignTag: (imageId: number, tagId: number) => void;
   onRemoveTag: (imageId: number, tagId: number) => void;
@@ -134,17 +140,39 @@ export function TagDropdown(props: TagDropdownProps) {
                     key={tag.id}
                     value={tag.id.toString()}
                     onSelect={() => handleSelectTag(tag)}
-                    className="cursor-pointer"
+                    className="group cursor-pointer flex items-center"
                   >
                     <CheckIcon
                       className={cn(
-                        "mr-2 h-4 w-4",
+                        "mr-2 h-4 w-4 shrink-0",
                         props.selected.includes(tag.id)
                           ? "opacity-100"
                           : "opacity-0"
                       )}
                     />
-                    {tag.name}
+                    <span className="flex-1 truncate">{tag.name}</span>
+                    {props.onDeleteTag && (
+                      <button
+                        type="button"
+                        title={`Delete tag "${tag.name}" from catalog`}
+                        aria-label={`Delete tag ${tag.name}`}
+                        className="ml-2 shrink-0 rounded p-1 opacity-0 group-hover:opacity-60 hover:opacity-100 hover:bg-destructive/10 hover:text-destructive transition"
+                        onClick={(e) => {
+                          // stopPropagation so the row's onSelect (toggle)
+                          // doesn't fire when the user clicks the trash icon
+                          e.stopPropagation();
+                          if (
+                            window.confirm(
+                              `Delete tag "${tag.name}" from the catalog? It will be removed from every image that has it.`
+                            )
+                          ) {
+                            props.onDeleteTag!(tag.id);
+                          }
+                        }}
+                      >
+                        <Trash2Icon className="h-3.5 w-3.5" />
+                      </button>
+                    )}
                   </CommandItem>
                 ))}
               </CommandGroup>

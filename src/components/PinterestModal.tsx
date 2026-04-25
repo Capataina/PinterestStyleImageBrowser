@@ -12,6 +12,7 @@ interface PinterestModalProps {
   onNavigate?: (direction: "prev" | "next") => void;
   tags?: Tag[];
   onCreateTag: (name: string, color: string) => Promise<Tag>;
+  onDeleteTag?: (tagId: number) => void;
   onAssignTag: (imageId: number, tagId: number) => void;
   onRemoveTag: (imageId: number, tagId: number) => void;
 }
@@ -116,6 +117,7 @@ export function PinterestModal(props: PinterestModalProps) {
                 placeholder="Add Tags"
                 instruction="Select tags to add"
                 onCreateTag={props.onCreateTag}
+                onDeleteTag={props.onDeleteTag}
                 imageId={props.item.id}
                 onAssignTag={props.onAssignTag}
                 onRemoveTag={props.onRemoveTag}

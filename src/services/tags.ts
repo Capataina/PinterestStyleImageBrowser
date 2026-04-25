@@ -12,11 +12,19 @@ export async function fetchTags(): Promise<Tag[]> {
 
 export async function createTag(
   name: string,
-  color: string = "#3489eb"
+  color: string = "#3B82F6"
 ): Promise<Tag> {
   try {
     return await invoke("create_tag", { name, color });
   } catch (error) {
     throw new Error(`Failed to create tag: ${error}`);
+  }
+}
+
+export async function deleteTag(tagId: number): Promise<void> {
+  try {
+    await invoke("delete_tag", { tagId });
+  } catch (error) {
+    throw new Error(`Failed to delete tag: ${error}`);
   }
 }

@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Tag } from "../types";
-import { createTag, fetchTags } from "@/services/tags";
+import { ImageItem, Tag } from "../types";
+import { createTag, deleteTag, fetchTags } from "@/services/tags";
 
 export function useTags() {
   return useQuery<Tag[]>({
@@ -40,6 +40,49 @@ export function useCreateTag() {
       queryClient.setQueryData<Tag[]>(["tags"], (old = []) =>
         old.map((tag) => (tag.id === -1 ? newTag : tag))
       );
+    },
+  });
+}
+
+export function useDeleteTag() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (tagId: number) => deleteTag(tagId),
+
+    onMutate: async (tagId) => {
+      await queryClient.cancelQueries({ queryKey: ["tags"] });
+      await queryClient.cancelQueries({ queryKey: ["images"] });
+
+      const prevTags = queryClient.getQueryData<Tag[]>(["tags"]);
+
+      // Optimistically remove from tags catalog
+      queryClient.setQueryData<Tag[]>(["tags"], (old = []) =>
+        old.filter((t) => t.id !== tagId)
+      );
+
+      // Also strip the tag from any image that has it (the DB does this
+      // via ON DELETE CASCADE on images_tags; we mirror it in the cache so
+      // the UI doesn't show ghost tags until the next refetch).
+      queryClient.setQueriesData<ImageItem[]>(
+        { queryKey: ["images"], exact: false },
+        (old = []) =>
+          old.map((img) => ({
+            ...img,
+            tags: img.tags.filter((t) => t.id !== tagId),
+          }))
+      );
+
+      return { prevTags };
+    },
+
+    onError: (_err, _vars, context) => {
+      if (context?.prevTags) {
+        queryClient.setQueryData(["tags"], context.prevTags);
+      }
+      // Image cache will self-correct on next refetch; we don't snapshot
+      // every image query because there can be many cache keys.
+      queryClient.invalidateQueries({ queryKey: ["images"] });
     },
   });
 }

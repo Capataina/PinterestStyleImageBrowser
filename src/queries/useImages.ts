@@ -11,10 +11,14 @@ export function useImages(filters?: {
   searchText?: string;
 }) {
   const tagIds = filters?.tagIds ?? [];
+  // searchText is intentionally NOT in the queryKey: the backend ignores
+  // it (filtering happens via tagIds + the separate semantic_search command),
+  // so keying on it would produce a cache miss per keystroke for identical
+  // data. We still pass it through to fetchImages for future-proofing.
   const searchText = filters?.searchText ?? "";
 
   return useQuery<ImageItem[]>({
-    queryKey: ["images", tagIds, searchText],
+    queryKey: ["images", tagIds],
     queryFn: () => fetchImages(tagIds, searchText),
     enabled: true,
   });
