@@ -31,6 +31,18 @@ fn main() {
     let mut database = db::ImageDatabase::new(&db_path).expect("failed to init db");
     database.initialize().expect("failed to create tables");
 
+    // Pass 4b: download CLIP models on first launch. No-op on subsequent
+    // launches. Failure is non-fatal — without models the encoder pass is
+    // skipped (the if-exists guard below) and similarity / semantic search
+    // are disabled, but tagging and the image grid still work. Pass 5
+    // will surface this download as a UI progress bar.
+    if let Err(e) = model_download::download_models_if_missing() {
+        eprintln!(
+            "[main] Model download failed: {e}. Similarity and semantic \
+             search will be disabled. Re-launch to retry."
+        );
+    }
+
     // Read scan root from settings.json. None means "no folder picked yet"
     // — Pass 4 will surface a folder-picker UI; for now we just skip the
     // scan/encode pipeline so the app can still launch. The grid will be

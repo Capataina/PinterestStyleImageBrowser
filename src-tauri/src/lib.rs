@@ -31,6 +31,7 @@ struct SemanticSearchResult {
 pub mod db;
 pub mod filesystem;
 pub mod image_struct;
+pub mod model_download;
 pub mod paths;
 pub mod settings;
 pub mod similarity_and_semantic_search;
