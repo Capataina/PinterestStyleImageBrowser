@@ -905,10 +905,15 @@ impl ImageDatabase {
             })
             .collect();
 
-        // Shuffle images randomly instead of sorting by ID
-        use rand::seq::SliceRandom;
-        let mut rng = rand::rng();
-        images.shuffle(&mut rng);
+        // Stable order by id (oldest first). The previous "shuffle on
+        // every read" caused the visible "entire app refreshes"
+        // behaviour during indexing — every refetch (every ~2s while
+        // thumbnails were generating) reordered the grid, making
+        // tiles jump around. Sort modes are now controlled via the
+        // user's `sortMode` preference and applied frontend-side
+        // when needed (the frontend can apply a deterministic
+        // shuffle with a session seed if the user picks "shuffle").
+        images.sort_by_key(|i| i.id);
 
         Ok(images)
     }

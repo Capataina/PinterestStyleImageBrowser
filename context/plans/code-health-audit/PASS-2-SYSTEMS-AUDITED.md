@@ -1,0 +1,43 @@
+# Pass 2 Systems Audited — Code Health Audit (2026-04-25)
+
+Static snapshot of every system the audit touched in Pass 2, alongside the research and diagnostic-test evidence used.
+
+| System | Research evidence | Tests written | Findings count | Confidence |
+|--------|-------------------|---------------|----------------|------------|
+| **`db.rs` (database)** | Mode 2: `bytemuck::cast_slice` as a safe alternative to `slice::from_raw_parts` (https://docs.rs/bytemuck/latest/bytemuck/fn.cast_slice.html). Mode 2: SQLite WAL vs default journal under rusqlite (https://sqlite.org/wal.html, https://cj.rs/blog/sqlite-pragma-cheatsheet-for-performance-and-consistency/). | None — findings rely on grep + structural reading; no behaviour test would resolve uncertainty (see Reasoned omission column). | 5 (Performance, Modularisation, Inconsistent Patterns, Documentation Rot, Configuration Drift) | High |
+| **`lib.rs` (tauri-commands)** | Mode 1 (front-loaded): "code health audit patterns for Rust Tauri desktop application with React frontend" (https://v2.tauri.app/start/, https://github.com/tauri-apps/tauri). Mode 3: Mutex held across expensive work (https://medium.com/@ladroid/advanced-rust-anti-patterns-36ea1bb84a02). | None — duplicated `normalize_path` closure is observably triplicated, no test needed. | 4 (Modularisation, Pattern Extraction, Performance, Inconsistent Patterns) | High |
+| **`cosine_similarity.rs` (cosine + persistent cache)** | Mode 2: partial sort vs full sort for top-k cosine similarity (https://medium.com/wbaa/https-medium-com-ingwbaa-boosting-selection-of-the-most-similar-entities-450b3242e618, https://users.rust-lang.org/t/announcing-hora-0-1-0-an-approximate-nearest-neighbor-search-algorithm-library-in-rust/62993). | `src-tauri/tests/cosine_topk_partial_sort_diagnostic.rs` — 6 tests pinning equivalence of full-sort vs partial-select top-N + a timing observation. Result: **2.53× speedup** measured at n=10000, top_n=50 (debug build). | 3 (Algorithm Optimisation, Performance, Modularisation) | High |
+| **`indexing.rs` (async pipeline)** | Mode 2: "rusqlite N+1 lookups in batch insert / loop, single SELECT alternatives" (https://cj.rs/blog/sqlite-pragma-cheatsheet-for-performance-and-consistency/). | None — finding is grep + structural reasoning. | 1 (Performance — N+1 root_id lookup) | High |
+| **`encoder.rs` (CLIP image encoder)** | Mode 2: ort CoreML EP runtime errors on CLIP graphs (the existing top-of-file comment block already cites the diagnosis; no new external research needed beyond confirmation that the reasoning is sound). | None — code already self-documents the trade-off. | 0 substantive findings (preprocessing already fixed, CoreML disabled with rationale). | High — system is in good shape after recent commits. |
+| **`encoder_text.rs` (CLIP text encoder)** | Mode 2: WordPiece longest-match-from-front pure-Rust correctness (cross-checked the existing case-fallback comment block; no new external research yielded a higher-leverage finding). | None — the system has a strong test suite already; no diagnostic test would resolve uncertainty about the behaviours flagged. | 1 (Modularisation — file is 647 lines, splittable into tokenizer + encoder + pooling submodules). | High |
+| **Frontend `[...slug].tsx` (search routing)** | Mode 3: Selection-lookup-uses-stale-list anti-pattern; the documented bug in `systems/search-routing.md` is still present (verified by reading the current code). No new web search needed — the finding is grounded in code reading. Mode 1 contribution from front-loaded search applies. | None — existing test suite covers the routing layer; the finding is a UX bug confirmed by grep. | 2 (Known Issues — selectedItem lookup, arrow nav) | High |
+| **`SettingsDrawer.tsx`** | None — Mode 1 front-loaded covers React/Tauri patterns. The 466-line file is a single component with several distinct sections; no domain research adds value. Recorded as reasoned omission in the map. | None — no diagnostic uncertainty. | 1 (Modularisation) | Moderate |
+| **`services/images.ts` (frontend service layer)** | Mode 3: N parallel DOM image-load anti-pattern when backend can return dimensions in JSON (cross-referenced against semantic_search's existing per-result enrichment pattern in lib.rs). | None — the finding is mechanical: similar-images services replicate enrichment that semantic-search backend already does. | 2 (Performance, Inconsistent Patterns — similar/tiered services trigger N DOM image loads to size results that semantic_search already returns dimensions for) | High |
+| **Cross-cutting / project-level (documentation rot, dead code, README drift)** | Mode 1 (already covered). | None. | 4 (Documentation Rot — context architecture is 16 commits stale; Documentation Rot — context system files; Dead Code — `ImageData::with_thumbnail`; Triage Needed — `useSimilarImages` hook). | High |
+| **Reasoned omissions** | `paths.rs` — covered structurally; no substantive behaviour worth domain research (`paths.rs` is small + well-tested). `watcher.rs` — small, focused; no findings. `model_download.rs` — out-of-band downloader, not covered in depth this round (would benefit from a dedicated audit when a future change touches it). `filesystem.rs` — 56 lines, trivially clean. `settings.rs` — small. The Python script `scripts/download_lol_splashes.py` is a dev tool, not a runtime path; not audited. | | | |
+
+## Summary
+
+- **5 systems audited deeply** (`db.rs`, `lib.rs`, `cosine_similarity.rs`, `indexing.rs`, frontend routing/services).
+- **3 systems given a structural read with no findings** (encoder.rs, paths.rs, watcher.rs).
+- **2 systems given lighter coverage** (encoder_text.rs, settings drawer) where the modularisation lens was the dominant useful finding.
+- **All findings backed by direct code citation, with confidence-upgrading evidence (research URL or diagnostic test) where the finding sits at moderate confidence absent that evidence.**
+- **Diagnostic test added** at `src-tauri/tests/cosine_topk_partial_sort_diagnostic.rs` proving the algorithm-optimisation finding produces identical sets and is faster — measured 2.53× at n=10k, top_n=50.
+
+## Modularisation evaluation floor — per-file verdict
+
+Verdicts are recorded here (not in `cross-cutting.md`) so the floor obligation is satisfied in one place.
+
+| File | Lines | Verdict | Justification |
+|------|-------|---------|---------------|
+| `src-tauri/src/db.rs` | 1597 | `split-recommended` | Five distinct concerns (schema/migrations, roots, tags, images CRUD, embeddings, thumbnails). See `database.md` finding. |
+| `src-tauri/src/lib.rs` | 918 | `split-recommended` | 17 Tauri command handlers + helper closures + state types. See `tauri-commands.md` finding. |
+| `src-tauri/src/similarity_and_semantic_search/cosine_similarity.rs` | 822 | `split-recommended` | Math + 3 retrieval modes + cache I/O + tests in one file. See `cosine.md` finding. |
+| `src-tauri/src/similarity_and_semantic_search/encoder_text.rs` | 647 | `split-recommended` (low priority) | Tokenizer + encoder + pooling fallback could be 3 modules. The internal structure is already coherent so the win is presentation/navigation rather than testability. |
+| `src-tauri/src/indexing.rs` | 589 | `leave-as-is` | The pipeline is one logical narrative — splitting steps into modules would shred the readability of "scan → thumbnail → encode → cosine repopulate." Internal structure (one function per phase) is already strong. Top-of-file doc comment is excellent. |
+| `src-tauri/tests/similarity_integration_test.rs` | 350 | `not-applicable` | Integration test file; size is dictated by fixture-construction overhead. Not user-facing. |
+| `scripts/download_lol_splashes.py` | 304 | `not-applicable` | Dev-tooling script run once when fetching the test corpus. Not on any runtime path. |
+| `src/components/SettingsDrawer.tsx` | 466 | `split-recommended` | 6 distinct sections (theme, display, search, sort, folders, reset) inside one component. Each section is self-contained — splitting into 6 sub-components yields free testability. See `frontend.md`. |
+| `src/pages/[...slug].tsx` | 392 | `leave-as-is` | This is the application's single page route and lives at the top of the priority chain. Splitting would push state-management seams across files for marginal gain. The component is already organised by concern. |
+| `src/services/images.ts` | 275 | `leave-as-is` | Slightly large but each function is a self-contained `invoke()` wrapper — splitting by command produces tiny files for no testability gain. |
+| `src/components/SearchBar.tsx` | 252 | `leave-as-is` | Single coherent component, internal structure clear. Below the soft TS threshold. |

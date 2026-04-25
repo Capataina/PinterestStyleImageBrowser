@@ -4,6 +4,7 @@ import {
   assignTagToImage,
   fetchImages,
   removeTagFromImage,
+  type SortMode,
 } from "../services/images";
 
 export function useImages(filters?: {
@@ -12,6 +13,13 @@ export function useImages(filters?: {
   /** When true, match images that have ALL selected tags (AND).
    *  When false (default), match images with ANY selected tag (OR). */
   matchAllTags?: boolean;
+  /** User's preferred sort. Defaults to "id" (stable). */
+  sortMode?: SortMode;
+  /** Seed for shuffle mode. Same seed always produces the same order.
+   *  Bumped only on deliberate refresh actions, not on indexing-progress
+   *  invalidations — that way progressive thumbnail loading doesn't
+   *  cause the grid to reshuffle every couple of seconds. */
+  shuffleSeed?: number;
 }) {
   const tagIds = filters?.tagIds ?? [];
   // searchText is intentionally NOT in the queryKey: the backend ignores
@@ -20,10 +28,17 @@ export function useImages(filters?: {
   // data. We still pass it through to fetchImages for future-proofing.
   const searchText = filters?.searchText ?? "";
   const matchAllTags = filters?.matchAllTags ?? false;
+  const sortMode = filters?.sortMode ?? "id";
+  const shuffleSeed = filters?.shuffleSeed ?? 0;
 
   return useQuery<ImageItem[]>({
-    queryKey: ["images", tagIds, matchAllTags],
-    queryFn: () => fetchImages(tagIds, searchText, matchAllTags),
+    // Include sortMode + shuffleSeed in the key so a sort change or
+    // a deliberate reshuffle invalidates the cache. Indexing-progress
+    // invalidates with the SAME key, which means the seed stays
+    // constant and the order stays stable.
+    queryKey: ["images", tagIds, matchAllTags, sortMode, shuffleSeed],
+    queryFn: () =>
+      fetchImages(tagIds, searchText, matchAllTags, sortMode, shuffleSeed),
     enabled: true,
   });
 }

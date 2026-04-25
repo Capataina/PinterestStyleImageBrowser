@@ -72,10 +72,22 @@ export function useIndexingProgress(): IndexingState {
           const payload = event.payload;
           setProgress(payload);
 
-          // Throttled image-cache invalidation on the long phases.
+          // Cache-invalidation strategy:
+          //
+          // We used to invalidate every ~2s during thumbnail/encode
+          // phases. Combined with the backend's per-call shuffle, that
+          // produced visible "entire app reshuffles every 2 seconds"
+          // behaviour. The shuffle is now stable-by-id at the backend
+          // and frontend-side seeded; refetching no longer reorders.
+          //
+          // We still throttle invalidations during long phases so we
+          // get periodic visual updates of newly-indexed thumbnails
+          // without thrashing React. Empirically a 5-second cadence
+          // is plenty — the eye notices a refresh, not the lack of
+          // one for a few seconds.
           if (payload.phase === "thumbnail" || payload.phase === "encode") {
             const now = Date.now();
-            if (now - lastInvalidatedAt.current > 2000) {
+            if (now - lastInvalidatedAt.current > 5000) {
               lastInvalidatedAt.current = now;
               queryClient.invalidateQueries({ queryKey: ["images"] });
             }

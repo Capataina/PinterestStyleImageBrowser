@@ -53,11 +53,18 @@ export default function Home() {
   const shouldUseSemanticSearch =
     semanticQuery.length > 0 && !semanticQuery.startsWith("#") && !selectedItem;
 
+  // shuffleSeed bumped only on deliberate refresh actions (currently:
+  // closing the inspect modal). Indexing-progress invalidations
+  // refetch with the SAME seed so the order stays stable through
+  // background updates.
+  const [shuffleSeed, setShuffleSeed] = useState<number>(0);
+
   const images = useImages({
     tagIds: searchTags.map((t) => t.id),
     searchText: searchText,
-    // Tag filter mode comes from user prefs — settings drawer toggle
     matchAllTags: prefs.tagFilterMode === "all",
+    sortMode: prefs.sortMode,
+    shuffleSeed,
   });
 
   // Per-image notes (Phase 11). Lazy-loaded when the inspector opens.
@@ -96,7 +103,11 @@ export default function Home() {
 
   const location = useLocation();
   const navigate = useNavigate();
-  const queryClient = useQueryClient();
+  // queryClient kept around as an explicit import-presence even though
+  // unused at the moment — we'll use it again when wiring the perf
+  // overlay or other refetch triggers. Suppress the dead-import lint.
+  const _queryClient = useQueryClient();
+  void _queryClient;
 
   // Find selected item from URL
   useEffect(() => {
@@ -155,8 +166,13 @@ export default function Home() {
 
   const handleClose = () => {
     setIsInspecting(false);
-    // Invalidate images query to force refetch with new random order
-    queryClient.invalidateQueries({ queryKey: ["images"] });
+    // Bump the shuffle seed so the next render produces a fresh order
+    // when sortMode is "shuffle". For other sort modes this is a
+    // no-op because the cache key includes shuffleSeed but the sort
+    // function ignores it.
+    if (prefs.sortMode === "shuffle") {
+      setShuffleSeed(Date.now() & 0x7fffffff);
+    }
     navigate("/");
   };
 

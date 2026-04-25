@@ -7,10 +7,18 @@ import { ImageData, ImageItem, SimilarImageItem } from "../types";
 const DEFAULT_WIDTH = 800;
 const DEFAULT_HEIGHT = 600;
 
+/** Frontend-side sort modes. Backend always returns stable order
+ *  (by id ASC); we apply name/added/shuffle here. The shuffle uses
+ *  a seed argument so refetches with the same seed yield the same
+ *  order — only when the seed changes does the order change. */
+export type SortMode = "id" | "name" | "added" | "shuffle";
+
 export async function fetchImages(
   filterTagIds: number[] = [],
   filterString: string = "",
   matchAllTags: boolean = false,
+  sortMode: SortMode = "id",
+  shuffleSeed: number = 0,
 ): Promise<ImageItem[]> {
   try {
     const imagesDB: ImageData[] = await invoke("get_images", {
@@ -40,9 +48,66 @@ export async function fetchImages(
       };
     });
 
-    return images;
+    // Apply sort mode frontend-side. Backend returned stable order
+    // by id; we re-order here as the user prefers.
+    return applySortMode(images, sortMode, shuffleSeed);
   } catch (error) {
     throw new Error(`Failed to fetch images: ${error}`);
+  }
+}
+
+/**
+ * Apply the user's preferred sort to a list of images.
+ *
+ * Critically, "shuffle" uses a deterministic seeded shuffle: the
+ * same input + same seed always produces the same output. The
+ * frontend controls when the seed changes (e.g. on modal close, on
+ * pull-to-refresh, or on a deliberate "shuffle again" button), so
+ * progressive thumbnail loading during indexing doesn't keep
+ * re-rolling the order mid-session.
+ */
+export function applySortMode(
+  items: ImageItem[],
+  mode: SortMode,
+  seed: number,
+): ImageItem[] {
+  // Don't mutate the input — return a copy so React state changes
+  // are detected via reference inequality.
+  const out = items.slice();
+  switch (mode) {
+    case "id":
+    case "added":
+      // Backend already returns ASC by id. "added" is the same thing
+      // because newer rows get higher ids.
+      out.sort((a, b) => a.id - b.id);
+      return out;
+    case "name":
+      out.sort((a, b) => a.name.localeCompare(b.name));
+      return out;
+    case "shuffle": {
+      if (seed === 0) {
+        // Seed 0 = "no shuffle yet". Return stable order so the
+        // grid doesn't reshuffle on a session-fresh load until the
+        // user explicitly refreshes.
+        out.sort((a, b) => a.id - b.id);
+        return out;
+      }
+      // Mulberry32 — small, fast, seedable PRNG. Same seed → same
+      // output. Used here for Fisher-Yates shuffle.
+      let s = seed >>> 0;
+      const rand = () => {
+        s = (s + 0x6d2b79f5) >>> 0;
+        let t = s;
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+      for (let i = out.length - 1; i > 0; i--) {
+        const j = Math.floor(rand() * (i + 1));
+        [out[i], out[j]] = [out[j], out[i]];
+      }
+      return out;
+    }
   }
 }
 

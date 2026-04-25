@@ -44,7 +44,12 @@ const DEFAULTS: UserPreferences = {
   theme: "system",
   columnCount: 0,
   tileMinWidth: 236,
-  sortMode: "shuffle",
+  // Default to stable order (oldest first). Previously "shuffle" was
+  // the default but combined with progressive thumbnail loading it
+  // caused the visible "entire app refreshes" behaviour — every
+  // refetch reshuffled the grid. Users who actively want shuffle can
+  // pick it in Settings.
+  sortMode: "added",
   tileScale: 1.0,
   animationLevel: "standard",
   similarResultCount: 35,
