@@ -25,6 +25,26 @@ export interface PerfSnapshot {
   timestamp: number;
 }
 
+/**
+ * True if the binary was launched with `--profile`. Cached after the
+ * first call: the flag is decided once at process start and never
+ * changes, so we don't need to round-trip every render.
+ *
+ * Returns false if the IPC call fails for any reason — defaulting to
+ * "not profiling" is the safe behaviour (no overlay, no breadcrumbs,
+ * no recording overhead).
+ */
+let profilingCache: boolean | null = null;
+export async function isProfilingEnabled(): Promise<boolean> {
+  if (profilingCache !== null) return profilingCache;
+  try {
+    profilingCache = await invoke<boolean>("is_profiling_enabled");
+  } catch {
+    profilingCache = false;
+  }
+  return profilingCache;
+}
+
 export async function getPerfSnapshot(): Promise<PerfSnapshot> {
   return await invoke<PerfSnapshot>("get_perf_snapshot");
 }

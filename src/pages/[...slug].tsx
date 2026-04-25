@@ -17,6 +17,7 @@ import { PinterestModal } from "@/components/PinterestModal";
 import { IndexingStatusPill } from "@/components/IndexingStatusPill";
 import { SettingsDrawer } from "@/components/SettingsDrawer";
 import { PerfOverlay } from "@/components/PerfOverlay";
+import { isProfilingEnabled } from "@/services/perf";
 import { useQueryClient } from "@tanstack/react-query";
 import { FolderOpen, Settings as SettingsIcon } from "lucide-react";
 import { pickScanFolder, setScanRoot } from "@/services/images";
@@ -29,12 +30,29 @@ export default function Home() {
   const [searchTags, setSearchTags] = useState<Tag[]>([]);
   const [searchText, setSearchText] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // Profiling state — flipped to true once at mount if the binary was
+  // launched with `--profile`. Drives three things: whether the perf
+  // overlay mounts at all, whether cmd+shift+P does anything, and
+  // (later) whether action breadcrumbs get emitted to the backend.
+  // Without `--profile`, every profiling-related code path stays cold.
+  const [profiling, setProfiling] = useState(false);
   const [perfOpen, setPerfOpen] = useState(false);
   const { prefs } = useUserPreferences();
 
+  // Resolve the profiling flag once at mount. When set, auto-open the
+  // overlay so the user doesn't have to discover the cmd+shift+P
+  // shortcut — if you started the app with --profile, you wanted to
+  // see the diagnostics.
+  useEffect(() => {
+    isProfilingEnabled().then((on) => {
+      setProfiling(on);
+      if (on) setPerfOpen(true);
+    });
+  }, []);
+
   // Global keyboard shortcuts:
-  //   ⌘,        — toggle settings drawer
-  //   ⌘⇧P       — toggle performance overlay
+  //   ⌘,        — toggle settings drawer (always available)
+  //   ⌘⇧P       — toggle performance overlay (profiling mode only)
   // The shortcuts use ⌘ on macOS and Ctrl elsewhere, both are standard.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -44,7 +62,12 @@ export default function Home() {
         setSettingsOpen((s) => !s);
         return;
       }
-      if (cmdOrCtrl && e.shiftKey && (e.key === "P" || e.key === "p")) {
+      if (
+        profiling &&
+        cmdOrCtrl &&
+        e.shiftKey &&
+        (e.key === "P" || e.key === "p")
+      ) {
         e.preventDefault();
         setPerfOpen((s) => !s);
         return;
@@ -52,7 +75,7 @@ export default function Home() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, []);
+  }, [profiling]);
 
   // Debounce search text for semantic search (300ms delay)
   const debouncedSearchText = useDebouncedValue(searchText, 300);
@@ -228,7 +251,9 @@ export default function Home() {
       />
 
       {/* Performance overlay — toggled with ⌘⇧P */}
-      <PerfOverlay open={perfOpen} onClose={() => setPerfOpen(false)} />
+      {profiling && (
+        <PerfOverlay open={perfOpen} onClose={() => setPerfOpen(false)} />
+      )}
 
       {/* Pinterest Modal (inspect mode) - only shows when inspecting a selected image */}
       <AnimatePresence>

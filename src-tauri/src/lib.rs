@@ -176,6 +176,16 @@ fn list_roots(db: State<'_, ImageDatabase>) -> Result<Vec<Root>, String> {
     db.list_roots().map_err(|e| e.to_string())
 }
 
+/// True if the binary was launched with `--profile`. The frontend
+/// reads this once at startup to decide whether to mount the perf
+/// overlay, register the cmd+shift+P shortcut, and emit user-action
+/// breadcrumbs. Without the flag, all of those paths stay dormant
+/// and the app pays no profiling cost.
+#[tauri::command]
+fn is_profiling_enabled() -> bool {
+    perf::is_profiling_enabled()
+}
+
 /// Returns aggregated span timing stats for the in-app perf overlay.
 /// Frontend polls this to render the live diagnostics panel.
 #[tauri::command]
@@ -953,6 +963,7 @@ pub fn run(db: ImageDatabase, db_path: String) {
             set_root_enabled,
             get_image_notes,
             set_image_notes,
+            is_profiling_enabled,
             get_perf_snapshot,
             reset_perf_stats,
             export_perf_snapshot,

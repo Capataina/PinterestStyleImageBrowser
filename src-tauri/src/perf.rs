@@ -79,6 +79,28 @@ fn stats_map() -> &'static Mutex<HashMap<String, SpanStats>> {
     PERF_STATS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Process-global flag set once at startup from `--profile` on the
+/// command line. Everything perf-related — the PerfLayer registration,
+/// the frontend overlay mount, the user-action recorder, the on-exit
+/// report writer — keys off this single source of truth.
+///
+/// Read via `is_profiling_enabled()`; written exactly once via
+/// `set_profiling_enabled()` from `main.rs` before Tauri starts.
+static PROFILING_ENABLED: OnceLock<bool> = OnceLock::new();
+
+/// Mark this process as a profiling session. Idempotent — only the
+/// first call wins, subsequent calls are silently ignored. Call once
+/// at the very top of `main` before the tracing subscriber is built.
+pub fn set_profiling_enabled(on: bool) {
+    let _ = PROFILING_ENABLED.set(on);
+}
+
+/// True if this process was launched with `--profile`. Defaults to
+/// false if the flag was never set (the normal app run).
+pub fn is_profiling_enabled() -> bool {
+    *PROFILING_ENABLED.get().unwrap_or(&false)
+}
+
 /// `tracing` Layer that records every span's enter/exit and writes a
 /// duration sample on span close.
 pub struct PerfLayer;
