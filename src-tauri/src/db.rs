@@ -637,6 +637,23 @@ impl ImageDatabase {
         Ok(out)
     }
 
+    /// Look up the root_id for an image given its path. Returns None
+    /// when the path isn't in the DB or when the row's root_id is NULL
+    /// (legacy un-migrated rows). Used by the thumbnail generator to
+    /// route output into the correct per-root subfolder.
+    pub fn get_root_id_by_path(&self, path: &str) -> Option<ID> {
+        let conn = self.connection.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT root_id FROM images WHERE path = ?1 LIMIT 1")
+            .ok()?;
+        let mut rows = stmt.query([path]).ok()?;
+        if let Ok(Some(row)) = rows.next() {
+            row.get::<_, Option<ID>>(0).ok().flatten()
+        } else {
+            None
+        }
+    }
+
     pub fn get_image_id_by_path(&self, path: &str) -> rusqlite::Result<ID> {
         let conn = self.connection.lock().unwrap();
         let mut stmt = conn.prepare("SELECT id FROM images WHERE path = ?1 LIMIT 1")?;

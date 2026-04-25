@@ -19,6 +19,16 @@ interface MasonryProps {
   columnGap: number;
   verticalGap: number;
   onItemClick: (item: ImageItem) => void;
+  /**
+   * Override the computed column count. 0 or undefined = auto
+   * (computed from container width and minItemWidth, the original
+   * behaviour). Otherwise 1..8 forces that count.
+   */
+  columnCountOverride?: number;
+  /** Tile size scale multiplier. Default 1.0. */
+  tileScale?: number;
+  /** Forwarded to MasonryItem to control 3D tilt magnitude. */
+  animationLevel?: "off" | "subtle" | "standard";
 }
 
 export default function Masonry(props: MasonryProps) {
@@ -31,7 +41,14 @@ export default function Masonry(props: MasonryProps) {
     if (!props.items) return;
 
     const width = containerRef.current.clientWidth;
-    const colCount = Math.max(1, Math.floor(width / props.minItemWidth));
+    // Compute column count: explicit override beats auto. Auto uses
+    // minItemWidth (tile-size-scaled) to derive the count.
+    const scale = props.tileScale ?? 1.0;
+    const effectiveMin = props.minItemWidth * scale;
+    const autoCount = Math.max(1, Math.floor(width / effectiveMin));
+    const colCount = props.columnCountOverride && props.columnCountOverride > 0
+      ? Math.min(props.columnCountOverride, 12)
+      : autoCount;
     const columnWidth = (width - (colCount - 1) * props.columnGap) / colCount;
 
     const newItems: MasonryItemData[] = [];
@@ -88,7 +105,15 @@ export default function Masonry(props: MasonryProps) {
     const colMax = Math.max(...colHeights, 0);
     setHeight(colMax);
     setItems(newItems);
-  }, [props.items, props.selectedItem, props.verticalGap, props.columnGap, props.minItemWidth]);
+  }, [
+    props.items,
+    props.selectedItem,
+    props.verticalGap,
+    props.columnGap,
+    props.minItemWidth,
+    props.columnCountOverride,
+    props.tileScale,
+  ]);
 
   const refreshLayoutDebounced = useMemo(() => {
     return debounce(() => {
@@ -121,6 +146,7 @@ export default function Masonry(props: MasonryProps) {
             isSelected={item.isSelected}
             onClick={props.onItemClick}
             animationDelay={Math.min(index * 0.03, 0.5)}
+            animationLevel={props.animationLevel}
           />
         </MasonryAnchor>
       ))}

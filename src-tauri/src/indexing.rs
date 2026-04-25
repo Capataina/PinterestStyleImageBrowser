@@ -366,8 +366,24 @@ fn run_pipeline_inner(
         // ~60 events rather than ~1500.
         const EMIT_EVERY: usize = 25;
 
+        // Build a map from path -> root_id so each thumbnail lands in
+        // the right per-root subfolder. ImageData doesn't carry root_id
+        // so we look it up upfront — one DB call per image, but the
+        // mutex is brief and this is on the indexing thread, not the
+        // UI path. For thousands of images the latency is dwarfed by
+        // the JPEG codec time downstream.
+        let path_to_root: std::collections::HashMap<String, Option<i64>> = needs_thumbs
+            .iter()
+            .map(|img| (img.path.clone(), database.get_root_id_by_path(&img.path)))
+            .collect();
+
         needs_thumbs.par_iter().for_each(|image| {
-            match thumbnail_generator.generate_thumbnail(Path::new(&image.path), image.id) {
+            let root_id = path_to_root.get(&image.path).copied().flatten();
+            match thumbnail_generator.generate_thumbnail(
+                Path::new(&image.path),
+                image.id,
+                root_id,
+            ) {
                 Ok(result) => {
                     if let Err(e) = database.update_image_thumbnail(
                         image.id,

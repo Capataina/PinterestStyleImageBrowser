@@ -15,15 +15,32 @@ import { useTags, useCreateTag, useDeleteTag } from "@/queries/useTags";
 import { SearchBar } from "@/components/SearchBar";
 import { PinterestModal } from "@/components/PinterestModal";
 import { IndexingStatusPill } from "@/components/IndexingStatusPill";
+import { SettingsDrawer } from "@/components/SettingsDrawer";
 import { useQueryClient } from "@tanstack/react-query";
-import { FolderOpen } from "lucide-react";
+import { FolderOpen, Settings as SettingsIcon } from "lucide-react";
 import { pickScanFolder, setScanRoot } from "@/services/images";
+import { useUserPreferences } from "@/hooks/useUserPreferences";
 
 export default function Home() {
   const [selectedItem, setSelectedItem] = useState<ImageItem | null>(null);
   const [isInspecting, setIsInspecting] = useState(false);
   const [searchTags, setSearchTags] = useState<Tag[]>([]);
   const [searchText, setSearchText] = useState("");
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const { prefs } = useUserPreferences();
+
+  // Global keyboard shortcut: cmd+, (mac) / ctrl+, (others) opens settings.
+  // Standard preferences shortcut on every modern OS.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === ",") {
+        e.preventDefault();
+        setSettingsOpen((s) => !s);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   // Debounce search text for semantic search (300ms delay)
   const debouncedSearchText = useDebouncedValue(searchText, 300);
@@ -153,6 +170,12 @@ export default function Home() {
       {/* Live indexing-progress pill (top-right corner) */}
       <IndexingStatusPill />
 
+      {/* Settings drawer — slides in from the right */}
+      <SettingsDrawer
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+      />
+
       {/* Pinterest Modal (inspect mode) - only shows when inspecting a selected image */}
       <AnimatePresence>
         {selectedItem && isInspecting && (
@@ -207,9 +230,6 @@ export default function Home() {
                   const folder = await pickScanFolder();
                   if (!folder) return; // user cancelled
                   await setScanRoot(folder);
-                  // Pass 5: indexing now runs live in the background.
-                  // The IndexingStatusPill at the top-right surfaces
-                  // progress; no restart needed.
                 } catch (err) {
                   console.error("Folder picker failed:", err);
                   window.alert(
@@ -220,6 +240,16 @@ export default function Home() {
             >
               <FolderOpen className="h-4 w-4" />
               <span className="hidden md:inline">Choose folder</span>
+            </button>
+
+            <button
+              type="button"
+              title="Settings (⌘,)"
+              aria-label="Settings"
+              className="flex shrink-0 items-center justify-center rounded-full bg-secondary text-secondary-foreground p-3 transition-colors hover:bg-accent"
+              onClick={() => setSettingsOpen(true)}
+            >
+              <SettingsIcon className="h-4 w-4" />
             </button>
           </div>
         </div>
@@ -311,13 +341,16 @@ export default function Home() {
           )}
         </AnimatePresence>
 
-        {/* Masonry Grid */}
+        {/* Masonry Grid — column count and animation level driven by user prefs */}
         <Masonry
           items={displayImages}
           selectedItem={selectedItem}
           columnGap={16}
           verticalGap={16}
           minItemWidth={236}
+          columnCountOverride={prefs.columnCount}
+          tileScale={prefs.tileScale}
+          animationLevel={prefs.animationLevel}
           onItemClick={handleImageClick}
         />
       </div>

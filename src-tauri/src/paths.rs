@@ -42,9 +42,31 @@ pub fn database_path() -> PathBuf {
     app_data_dir().join("images.db")
 }
 
-/// Directory where thumbnails are cached. Created if missing.
+/// Top-level directory under which all thumbnails live, organised by
+/// root id (Phase 9 reorg per user feedback).
 pub fn thumbnails_dir() -> PathBuf {
     let p = app_data_dir().join("thumbnails");
+    let _ = ensure_dir(&p);
+    p
+}
+
+/// Per-root thumbnail directory.
+///
+/// Layout:
+///   app_data_dir/thumbnails/
+///     root_1/thumb_42.jpg
+///     root_2/thumb_99.jpg
+///
+/// Per-root segregation means removing a root from the multi-folder
+/// list can also cascade-delete its thumbnails on disk in one
+/// `rm -rf` rather than per-row file deletion.
+///
+/// Legacy layout (pre-multi-folder) put every thumbnail flat under
+/// `thumbnails/`. Old DBs with that layout still work because the
+/// thumbnail_path column stores absolute paths; new thumbnails just
+/// land under the per-root subfolder going forward.
+pub fn thumbnails_dir_for_root(root_id: i64) -> PathBuf {
+    let p = thumbnails_dir().join(format!("root_{root_id}"));
     let _ = ensure_dir(&p);
     p
 }

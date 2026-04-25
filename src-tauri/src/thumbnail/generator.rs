@@ -42,15 +42,30 @@ impl ThumbnailGenerator {
 
     /// Generate a thumbnail for a single image.
     ///
-    /// Returns the thumbnail path and the original image dimensions (width, height).
+    /// Returns the thumbnail path and the original image dimensions
+    /// (width, height). The thumbnail lands in
+    /// `<thumbnail_dir>/root_<root_id>/thumb_<image_id>.jpg` when a
+    /// root_id is supplied (Phase 9 per-root organisation), or in
+    /// `<thumbnail_dir>/thumb_<image_id>.jpg` when None (legacy
+    /// fallback for un-rooted rows).
     pub fn generate_thumbnail(
         &self,
         image_path: &Path,
         image_id: i64,
+        root_id: Option<i64>,
     ) -> Result<ThumbnailResult, Box<dyn Error>> {
-        // Determine thumbnail filename based on image ID
+        // Determine thumbnail filename based on image ID and per-root subfolder
         let thumbnail_filename = format!("thumb_{}.jpg", image_id);
-        let thumbnail_path = self.thumbnail_dir.join(&thumbnail_filename);
+        let thumbnail_path = match root_id {
+            Some(rid) => {
+                let dir = self.thumbnail_dir.join(format!("root_{rid}"));
+                if !dir.exists() {
+                    fs::create_dir_all(&dir)?;
+                }
+                dir.join(&thumbnail_filename)
+            }
+            None => self.thumbnail_dir.join(&thumbnail_filename),
+        };
 
         // Load the original image to get dimensions
         let img = ImageReader::open(image_path)?
@@ -133,7 +148,11 @@ impl ThumbnailGenerator {
                 debug!("Generating thumbnails... {}/{}", idx + 1, total_images);
             }
 
-            match self.generate_thumbnail(Path::new(&image.path), image.id) {
+            // Legacy bulk path: no per-root segregation (root_id None).
+            // The indexing pipeline calls generate_thumbnail directly
+            // with the actual root_id; this method is kept for the
+            // simple "regenerate all missing" use case.
+            match self.generate_thumbnail(Path::new(&image.path), image.id, None) {
                 Ok(result) => {
                     // Update database with thumbnail info and original dimensions
                     match db.update_image_thumbnail(

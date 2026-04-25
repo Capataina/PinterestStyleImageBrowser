@@ -179,7 +179,9 @@ fn add_root(
 }
 
 /// Remove a root. The CASCADE on images.root_id wipes its images;
-/// surviving image rows from other roots are unaffected.
+/// surviving image rows from other roots are unaffected. The root's
+/// dedicated thumbnail directory on disk is also recursively
+/// deleted so we don't leave orphaned cached files.
 #[tauri::command]
 fn remove_root(
     db: State<'_, ImageDatabase>,
@@ -187,6 +189,20 @@ fn remove_root(
     id: i64,
 ) -> Result<(), String> {
     db.remove_root(id).map_err(|e| e.to_string())?;
+    // Clean the per-root thumbnail subfolder. Best-effort — if the
+    // remove fails (permissions, file locked) we log and move on; the
+    // user can manually clean the directory.
+    let thumbnail_dir = paths::thumbnails_dir_for_root(id);
+    if thumbnail_dir.exists() {
+        if let Err(e) = std::fs::remove_dir_all(&thumbnail_dir) {
+            warn!(
+                "could not remove thumbnail dir {}: {e}",
+                thumbnail_dir.display()
+            );
+        } else {
+            info!("removed thumbnail dir {}", thumbnail_dir.display());
+        }
+    }
     // Cosine cache contains entries from the removed root; cheapest
     // way to clean is to drop the whole cache and let next-query
     // populate from the remaining DB rows.
