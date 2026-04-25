@@ -6,6 +6,7 @@ use ort::{
     value::{Tensor, Value},
 };
 use std::{error::Error, path::Path};
+use tracing::{debug, info, warn};
 
 use crate::db;
 
@@ -15,8 +16,8 @@ pub struct Encoder {
 
 impl Encoder {
     pub fn new(model_path: &Path) -> Result<Self, Box<dyn Error>> {
-        println!("=== Initializing Encoder ===");
-        println!("Attempting to enable CUDA...");
+        info!("=== Initializing Encoder ===");
+        info!("Attempting to enable CUDA...");
 
         // Try to build with CUDA explicitly
         let builder_result = Session::builder()?
@@ -33,14 +34,14 @@ impl Encoder {
         // leaving this fallback in for now just in case though
         match builder_result {
             Ok(builder) => {
-                println!("✓ CUDA execution provider accepted");
+                info!("✓ CUDA execution provider accepted");
                 let session = builder.commit_from_file(model_path)?;
-                println!("✓ Session created with CUDA");
+                info!("✓ Session created with CUDA");
                 Ok(Encoder { session })
             }
             Err(e) => {
-                println!("✗ CUDA execution provider failed: {}", e);
-                println!("Falling back to CPU...");
+                warn!("✗ CUDA execution provider failed: {}", e);
+                info!("Falling back to CPU...");
                 let session = Session::builder()?.commit_from_file(model_path)?;
                 Ok(Encoder { session })
             }
@@ -48,14 +49,14 @@ impl Encoder {
     }
 
     pub fn inspect_model(&self) {
-        println!("Model inputs:");
+        debug!("Model inputs:");
         for input in self.session.inputs.iter() {
-            println!("  Name: {:?}", input.name);
+            debug!("  Name: {:?}", input.name);
         }
 
-        println!("\nModel outputs:");
+        debug!("\nModel outputs:");
         for output in self.session.outputs.iter() {
-            println!("  Name: {:?}", output.name);
+            debug!("  Name: {:?}", output.name);
         }
     }
 
@@ -63,16 +64,22 @@ impl Encoder {
         &self,
         image_path: &Path,
     ) -> Result<ndarray::Array4<f32>, Box<dyn std::error::Error>> {
+        // Lanczos3 preserves edge information vastly better than the
+        // previous Nearest filter — this matters for CLIP because the
+        // 224x224 downsample is the only resampling step before the
+        // network sees the image. Reference CLIP uses bicubic; Lanczos3
+        // is closer to it than Nearest.
         let img = ImageReader::open(image_path)?
             .with_guessed_format()?
             .decode()?
-            .resize_exact(224, 224, image::imageops::FilterType::Nearest)
+            .resize_exact(224, 224, image::imageops::FilterType::Lanczos3)
             .to_rgb8();
 
         let mut input_tensor: Vec<f32> = Vec::with_capacity((224 * 224 * 3) as usize);
 
-        // Change layout from RGBRGB... to RRR...GGG...BBB...
-        // for some reason ONNX wants it like this
+        // ONNX expects channels-first (CHW) layout: all R values first,
+        // then all G, then all B. The image crate gives us interleaved
+        // RGBRGB pixels, so we split-and-concat here.
         let mut r = Vec::with_capacity((224 * 224) as usize);
         let mut g = Vec::with_capacity((224 * 224) as usize);
         let mut b = Vec::with_capacity((224 * 224) as usize);
@@ -87,9 +94,12 @@ impl Encoder {
         input_tensor.extend(g);
         input_tensor.extend(b);
 
-        // CLIP-style normalization, we use IMGNET stats here
-        let mean = [0.485, 0.456, 0.406];
-        let std = [0.229, 0.224, 0.225];
+        // CLIP-native normalization stats (from openai/CLIP repository).
+        // The previous code used ImageNet stats which subtly shift the
+        // embedding distribution away from what the OpenAI reference
+        // produces.
+        let mean = [0.48145466_f32, 0.4578275, 0.40821073];
+        let std = [0.26862954_f32, 0.26130258, 0.27577711];
 
         for c in 0..3 {
             for i in 0..(224 * 224) {
@@ -262,11 +272,11 @@ impl Encoder {
         let images = db.get_images_without_embeddings()?;
 
         if images.is_empty() {
-            println!("All images already have embeddings, skipping encoding.");
+            info!("All images already have embeddings, skipping encoding.");
             return Ok(());
         }
 
-        println!(
+        info!(
             "Found {} images without embeddings, encoding...",
             images.len()
         );
@@ -277,7 +287,7 @@ impl Encoder {
         let total_batches = batches.len();
 
         for (batch_idx, batch) in batches.iter().enumerate() {
-            println!(
+            debug!(
                 "Encoding batch {}/{} ({} images)...",
                 batch_idx + 1,
                 total_batches,
@@ -293,7 +303,7 @@ impl Encoder {
             }
         }
 
-        println!("Successfully encoded {} images.", total_images);
+        info!("Successfully encoded {} images.", total_images);
         Ok(())
     }
 }

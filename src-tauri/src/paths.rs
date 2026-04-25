@@ -14,6 +14,8 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
+use tracing::warn;
+
 /// Tauri bundle identifier — must stay in sync with `tauri.conf.json::identifier`.
 const BUNDLE_ID: &str = "com.ataca.image-browser";
 
@@ -24,8 +26,8 @@ const BUNDLE_ID: &str = "com.ataca.image-browser";
 /// We log to stderr in that case so the user has at least some signal.
 pub fn app_data_dir() -> PathBuf {
     let base = dirs::data_dir().unwrap_or_else(|| {
-        eprintln!(
-            "[paths] dirs::data_dir() returned None; falling back to ./app-data — \
+        warn!(
+            "dirs::data_dir() returned None; falling back to ./app-data — \
              your platform may not be fully supported"
         );
         PathBuf::from("./app-data")

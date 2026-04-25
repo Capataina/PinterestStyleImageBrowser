@@ -33,6 +33,7 @@ use std::thread;
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
+use tracing::{error, warn};
 
 use crate::db::ImageDatabase;
 use crate::filesystem::ImageScanner;
@@ -147,7 +148,7 @@ pub fn try_spawn_pipeline(
         let _guard = RunningGuard(state.clone());
 
         if let Err(e) = run_pipeline_inner(&app, &db_path, &cosine_index) {
-            eprintln!("[indexing] pipeline error: {e}");
+            error!("pipeline error: {e}");
             emit(
                 &app,
                 Phase::Error,
@@ -173,7 +174,7 @@ fn run_pipeline_inner(
     if let Err(e) = model_download::download_models_if_missing() {
         // Non-fatal: scan + thumbnail still work without models. Encode
         // gets skipped further down.
-        eprintln!("[indexing] model download skipped: {e}");
+        warn!("model download skipped: {e}");
         emit(
             app,
             Phase::ModelDownload,
@@ -246,8 +247,8 @@ fn run_pipeline_inner(
                     )?;
                 }
                 Err(e) => {
-                    eprintln!(
-                        "[indexing] thumbnail failed for {}: {e}",
+                    warn!(
+                        "thumbnail failed for {}: {e}",
                         image.path
                     );
                 }
@@ -282,8 +283,8 @@ fn run_pipeline_inner(
             }
         }
     } else {
-        eprintln!(
-            "[indexing] model_image.onnx missing; embeddings will be \
+        warn!(
+            "model_image.onnx missing; embeddings will be \
              empty until next launch."
         );
     }
@@ -324,7 +325,7 @@ fn emit(
     if let Err(e) = app.emit("indexing-progress", &payload) {
         // Don't crash on emit failure — just log. Receivers may have
         // disconnected (closing window mid-pipeline).
-        eprintln!("[indexing] failed to emit event: {e}");
+        warn!("failed to emit event: {e}");
     }
 }
 

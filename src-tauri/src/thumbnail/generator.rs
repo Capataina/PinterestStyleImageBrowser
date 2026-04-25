@@ -2,6 +2,7 @@ use image::ImageReader;
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
+use tracing::{debug, error, info};
 
 use crate::db::ImageDatabase;
 
@@ -28,9 +29,9 @@ impl ThumbnailGenerator {
         // Create thumbnail directory if it doesn't exist
         fs::create_dir_all(thumbnail_dir)?;
 
-        println!("=== Initializing ThumbnailGenerator ===");
-        println!("Thumbnail directory: {}", thumbnail_dir.to_string_lossy());
-        println!("Max dimensions: {}x{}", max_width, max_height);
+        info!("=== Initializing ThumbnailGenerator ===");
+        info!("Thumbnail directory: {}", thumbnail_dir.to_string_lossy());
+        info!("Max dimensions: {}x{}", max_width, max_height);
 
         Ok(ThumbnailGenerator {
             thumbnail_dir: thumbnail_dir.to_path_buf(),
@@ -76,7 +77,7 @@ impl ThumbnailGenerator {
         // Save as JPEG with good quality
         thumbnail.save_with_format(&thumbnail_path, image::ImageFormat::Jpeg)?;
 
-        println!(
+        debug!(
             "Generated thumbnail: {} ({}x{} -> {}x{})",
             image_path.file_name().unwrap_or_default().to_string_lossy(),
             original_width,
@@ -114,11 +115,11 @@ impl ThumbnailGenerator {
         let images = db.get_images_without_thumbnails()?;
 
         if images.is_empty() {
-            println!("All images already have thumbnails, skipping generation.");
+            info!("All images already have thumbnails, skipping generation.");
             return Ok(());
         }
 
-        println!(
+        info!(
             "Found {} images without thumbnails, generating...",
             images.len()
         );
@@ -129,7 +130,7 @@ impl ThumbnailGenerator {
 
         for (idx, image) in images.iter().enumerate() {
             if (idx + 1) % 10 == 0 || idx == 0 {
-                println!("Generating thumbnails... {}/{}", idx + 1, total_images);
+                debug!("Generating thumbnails... {}/{}", idx + 1, total_images);
             }
 
             match self.generate_thumbnail(Path::new(&image.path), image.id) {
@@ -145,19 +146,19 @@ impl ThumbnailGenerator {
                             success_count += 1;
                         }
                         Err(e) => {
-                            eprintln!("Failed to update database for image {}: {}", image.id, e);
+                            error!("Failed to update database for image {}: {}", image.id, e);
                             error_count += 1;
                         }
                     }
                 }
                 Err(e) => {
-                    eprintln!("Failed to generate thumbnail for {}: {}", image.path, e);
+                    error!("Failed to generate thumbnail for {}: {}", image.path, e);
                     error_count += 1;
                 }
             }
         }
 
-        println!(
+        info!(
             "Thumbnail generation complete: {} succeeded, {} failed",
             success_count, error_count
         );

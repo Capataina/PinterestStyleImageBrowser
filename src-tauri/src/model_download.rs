@@ -30,8 +30,11 @@
 
 use std::error::Error;
 use std::fs::{self, File};
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{BufWriter, Read, Write};
+
 use std::path::Path;
+
+use tracing::{debug, info};
 
 use crate::paths;
 
@@ -81,9 +84,8 @@ pub fn download_models_if_missing() -> Result<(), Box<dyn Error>> {
             continue;
         }
         if !anything_downloaded {
-            println!(
-                "[model-download] First-launch model setup begun — files \
-                 will land in {}",
+            info!(
+                "First-launch model setup begun — files will land in {}",
                 models_dir.display()
             );
             anything_downloaded = true;
@@ -92,7 +94,7 @@ pub fn download_models_if_missing() -> Result<(), Box<dyn Error>> {
     }
 
     if anything_downloaded {
-        println!("[model-download] All model files present.");
+        info!("All model files present.");
     }
     Ok(())
 }
@@ -103,7 +105,7 @@ pub fn download_models_if_missing() -> Result<(), Box<dyn Error>> {
 /// next run will see-and-delete-and-retry rather than treating as
 /// complete (see partial-file note below).
 fn download_to_file(url: &str, dest: &Path) -> Result<(), Box<dyn Error>> {
-    println!("[model-download] GET {url}");
+    info!("GET {url}");
 
     let resp = ureq::get(url).call()?;
     let total_bytes: Option<u64> = resp
@@ -146,17 +148,15 @@ fn download_to_file(url: &str, dest: &Path) -> Result<(), Box<dyn Error>> {
             let bucket = (percent / 10) * 10;
             if bucket > last_logged_percent {
                 last_logged_percent = bucket;
-                println!(
-                    "[model-download]   {bucket}% — {} / {} MB",
+                debug!(
+                    "  {bucket}% — {} / {} MB",
                     downloaded / 1_048_576,
                     total / 1_048_576
                 );
-                io::stdout().flush().ok();
             }
         } else if downloaded.is_multiple_of(10 * 1_048_576) {
             // No content-length — log every 10 MB.
-            println!("[model-download]   {} MB so far", downloaded / 1_048_576);
-            io::stdout().flush().ok();
+            debug!("  {} MB so far", downloaded / 1_048_576);
         }
     }
 
@@ -164,8 +164,8 @@ fn download_to_file(url: &str, dest: &Path) -> Result<(), Box<dyn Error>> {
     drop(writer);
 
     fs::rename(&part_path, dest)?;
-    println!(
-        "[model-download] saved {} ({} MB)",
+    info!(
+        "saved {} ({} MB)",
         dest.display(),
         downloaded / 1_048_576
     );

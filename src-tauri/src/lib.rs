@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, State};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     db::{ImageDatabase, ID},
@@ -142,7 +143,7 @@ fn set_scan_root(
     )
     .map_err(|e| e.to_string())?;
 
-    println!("[Backend] set_scan_root saved + wiped + indexing thread spawned.");
+    info!("set_scan_root saved + wiped + indexing thread spawned.");
     Ok(())
 }
 
@@ -177,8 +178,8 @@ fn semantic_search(
 ) -> Result<Vec<SemanticSearchResult>, String> {
     use ndarray::Array1;
 
-    println!(
-        "[Backend] semantic_search called - query: '{}', top_n: {}",
+    info!(
+        "semantic_search called - query: '{}', top_n: {}",
         query, top_n
     );
 
@@ -195,7 +196,7 @@ fn semantic_search(
         .map_err(|e| format!("Failed to lock text encoder: {e}"))?;
 
     if encoder_lock.is_none() {
-        println!("[Backend] Initializing text encoder...");
+        info!("Initializing text encoder...");
         let models_dir = paths::models_dir();
         let model_path = models_dir.join("model_text.onnx");
         let tokenizer_path = models_dir.join("tokenizer.json");
@@ -217,18 +218,18 @@ fn semantic_search(
             .map_err(|e| format!("Failed to initialize text encoder: {e}"))?;
 
         *encoder_lock = Some(encoder);
-        println!("[Backend] Text encoder initialized successfully");
+        info!("Text encoder initialized successfully");
     }
 
     let encoder = encoder_lock.as_mut().unwrap();
 
     // Encode the text query
-    println!("[Backend] Encoding query: '{}'", query);
+    debug!("Encoding query: '{}'", query);
     let text_embedding = encoder
         .encode(query)
         .map_err(|e| format!("Failed to encode query: {e}"))?;
-    println!(
-        "[Backend] Text embedding generated - length: {}",
+    debug!(
+        "Text embedding generated - length: {}",
         text_embedding.len()
     );
 
@@ -239,10 +240,10 @@ fn semantic_search(
         .map_err(|e| format!("Failed to lock cosine index: {e}"))?;
 
     if index.cached_images.is_empty() {
-        println!("[Backend] Populating cosine index from database...");
+        debug!("Populating cosine index from database...");
         index.populate_from_db(&cosine_state.db_path);
-        println!(
-            "[Backend] Cosine index populated with {} images",
+        debug!(
+            "Cosine index populated with {} images",
             index.cached_images.len()
         );
     }
@@ -251,8 +252,8 @@ fn semantic_search(
     // Use get_similar_images_sorted for semantic search to get results in proper order
     let query_array = Array1::from_vec(text_embedding);
     let raw_results = index.get_similar_images_sorted(&query_array, top_n, None);
-    println!(
-        "[Backend] Found {} similar images for query '{}'",
+    debug!(
+        "Found {} similar images for query '{}'",
         raw_results.len(),
         query
     );
@@ -318,15 +319,15 @@ fn semantic_search(
         })
         .collect();
 
-    println!(
-        "[Backend] semantic_search returning {} results",
+    info!(
+        "semantic_search returning {} results",
         results.len()
     );
 
     if !results.is_empty() {
-        println!("[Backend] Top 5 results:");
+        debug!("Top 5 results:");
         for (i, r) in results.iter().take(5).enumerate() {
-            println!(
+            debug!(
                 "  {}. id: {}, score: {:.4}, path: {}",
                 i + 1,
                 r.id,
@@ -351,8 +352,8 @@ fn get_tiered_similar_images(
     use ndarray::Array1;
     use std::path::PathBuf;
 
-    println!(
-        "[Backend] get_tiered_similar_images called - image_id: {}",
+    info!(
+        "get_tiered_similar_images called - image_id: {}",
         image_id
     );
 
@@ -362,7 +363,7 @@ fn get_tiered_similar_images(
         .map_err(|e| format!("Failed to lock cosine index: {e}"))?;
 
     if index.cached_images.is_empty() {
-        println!("[Backend] Cache is empty, populating from database...");
+        debug!("Cache is empty, populating from database...");
         index.populate_from_db(&cosine_state.db_path);
     }
 
@@ -451,8 +452,8 @@ fn get_tiered_similar_images(
         })
         .collect();
 
-    println!(
-        "[Backend] get_tiered_similar_images returning {} results",
+    info!(
+        "get_tiered_similar_images returning {} results",
         results.len()
     );
 
@@ -469,8 +470,8 @@ fn get_similar_images(
     use ndarray::Array1;
     use std::path::PathBuf;
 
-    println!(
-        "[Backend] get_similar_images called - image_id: {}, top_n: {}",
+    info!(
+        "get_similar_images called - image_id: {}, top_n: {}",
         image_id, top_n
     );
 
@@ -479,68 +480,68 @@ fn get_similar_images(
         .lock()
         .map_err(|e| format!("Failed to lock cosine index: {e}"))?;
 
-    println!(
-        "[Backend] Cache state - cached_images count: {}",
+    debug!(
+        "Cache state - cached_images count: {}",
         index.cached_images.len()
     );
 
     if index.cached_images.is_empty() {
-        println!("[Backend] Cache is empty, populating from database...");
+        debug!("Cache is empty, populating from database...");
         index.populate_from_db(&cosine_state.db_path);
-        println!(
-            "[Backend] Cache populated - cached_images count: {}",
+        debug!(
+            "Cache populated - cached_images count: {}",
             index.cached_images.len()
         );
     }
 
     // Get the path of the clicked image to exclude it from results
-    println!("[Backend] Looking up image path for image_id: {}", image_id);
+    debug!("Looking up image path for image_id: {}", image_id);
     let exclude_path = {
         let all_images = db
             .get_all_images()
             .map_err(|e| format!("Failed to get images: {e}"))?;
-        println!("[Backend] Total images in database: {}", all_images.len());
+        debug!("Total images in database: {}", all_images.len());
         let found = all_images.iter().find(|img| img.id == image_id).map(|img| {
-            println!("[Backend] Found image - id: {}, path: {}", img.id, img.path);
+            debug!("Found image - id: {}, path: {}", img.id, img.path);
             PathBuf::from(&img.path)
         });
         if found.is_none() {
-            println!(
-                "[Backend] WARNING: Could not find image with id: {}",
+            warn!(
+                "Could not find image with id: {}",
                 image_id
             );
         }
         found
     };
 
-    println!("[Backend] Fetching embedding for image_id: {}", image_id);
+    debug!("Fetching embedding for image_id: {}", image_id);
     let embedding = db
         .get_image_embedding(image_id)
         .map_err(|e| format!("Failed to fetch embedding: {e}"))?;
-    println!(
-        "[Backend] Retrieved embedding - length: {}",
+    debug!(
+        "Retrieved embedding - length: {}",
         embedding.len()
     );
 
     let query = Array1::from_vec(embedding);
-    println!(
-        "[Backend] Calling index.get_similar_images with top_n: {}, exclude_path: {:?}",
+    debug!(
+        "Calling index.get_similar_images with top_n: {}, exclude_path: {:?}",
         top_n, exclude_path
     );
     let raw_results = index.get_similar_images(&query, top_n, exclude_path.as_ref());
-    println!(
-        "[Backend] index.get_similar_images returned {} results",
+    debug!(
+        "index.get_similar_images returned {} results",
         raw_results.len()
     );
 
     if !raw_results.is_empty() {
-        println!("[Backend] Raw results (first 5):");
+        debug!("Raw results (first 5):");
         for (i, (path, score)) in raw_results.iter().take(5).enumerate() {
-            println!("  {}. path: {:?}, score: {:.4}", i + 1, path, score);
+            debug!("  {}. path: {:?}, score: {:.4}", i + 1, path, score);
         }
     }
 
-    println!("[Backend] Converting results to SimilarImage structs...");
+    debug!("Converting results to SimilarImage structs...");
     
     // Helper function to normalize path for database lookup
     // Removes Windows extended path prefix (\\?\) if present
@@ -556,7 +557,7 @@ fn get_similar_images(
     let all_images = match db.get_all_images() {
         Ok(images) => Some(images),
         Err(e) => {
-            println!("[Backend] Warning: Failed to get all images for flexible matching: {}", e);
+            warn!("Failed to get all images for flexible matching: {}", e);
             None
         }
     };
@@ -570,8 +571,8 @@ fn get_similar_images(
             // Try normalized path first (most common case)
             match db.get_image_id_by_path(&normalized_path) {
                 Ok(id) => {
-                    println!(
-                        "  [Backend] Mapped path to id - path: {:?}, id: {}, score: {:.4}",
+                    debug!(
+                        "  Mapped path to id - path: {:?}, id: {}, score: {:.4}",
                         path.file_name().unwrap_or_default(),
                         id,
                         score
@@ -586,8 +587,8 @@ fn get_similar_images(
                     // Try original path format
                     match db.get_image_id_by_path(&path_str) {
                         Ok(id) => {
-                            println!(
-                                "  [Backend] Mapped path to id (original format) - path: {:?}, id: {}, score: {:.4}",
+                            debug!(
+                                "  Mapped path to id (original format) - path: {:?}, id: {}, score: {:.4}",
                                 path.file_name().unwrap_or_default(),
                                 id,
                                 score
@@ -605,7 +606,7 @@ fn get_similar_images(
                                     .ok()
                                     .map(|p| p.to_string_lossy().to_string())
                                     .unwrap_or_else(|| normalize_path(&path_str));
-                                
+
                                 if let Some(matching_image) = images.iter().find(|img| {
                                     let img_normalized = normalize_path(&img.path);
                                     let img_canon = std::path::Path::new(&img.path)
@@ -613,15 +614,15 @@ fn get_similar_images(
                                         .ok()
                                         .map(|p| p.to_string_lossy().to_string())
                                         .unwrap_or_else(|| normalize_path(&img.path));
-                                    
+
                                     img_normalized == normalized_path ||
                                     img_normalized == path_str ||
                                     img.path == normalized_path ||
                                     img.path == path_str ||
                                     img_canon == search_path
                                 }) {
-                                    println!(
-                                        "  [Backend] Mapped path to id (flexible match) - path: {:?}, id: {}, score: {:.4}",
+                                    debug!(
+                                        "  Mapped path to id (flexible match) - path: {:?}, id: {}, score: {:.4}",
                                         path.file_name().unwrap_or_default(),
                                         matching_image.id,
                                         score
@@ -632,15 +633,15 @@ fn get_similar_images(
                                         score,
                                     })
                                 } else {
-                                    println!(
-                                        "  [Backend] Failed to map path to id - path: {:?}",
+                                    warn!(
+                                        "  Failed to map path to id - path: {:?}",
                                         path.file_name().unwrap_or_default()
                                     );
                                     None
                                 }
                             } else {
-                                println!(
-                                    "  [Backend] Failed to map path to id - path: {:?}",
+                                warn!(
+                                    "  Failed to map path to id - path: {:?}",
                                     path.file_name().unwrap_or_default()
                                 );
                                 None
@@ -652,11 +653,11 @@ fn get_similar_images(
         })
         .collect();
 
-    println!("[Backend] Final results count: {}", results.len());
+    info!("Final results count: {}", results.len());
     if !results.is_empty() {
-        println!("[Backend] Final results (first 5):");
+        debug!("Final results (first 5):");
         for (i, sim) in results.iter().take(5).enumerate() {
-            println!(
+            debug!(
                 "  {}. id: {}, path: {:?}, score: {:.4}",
                 i + 1,
                 sim.id,
@@ -717,7 +718,7 @@ pub fn run(db: ImageDatabase, db_path: String) {
                     db_path,
                     cosine_index,
                 ) {
-                    eprintln!("[setup] could not spawn indexing pipeline: {e}");
+                    error!("could not spawn indexing pipeline: {e}");
                 }
                 Ok(())
             }

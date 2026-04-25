@@ -2,6 +2,7 @@ use crate::db;
 use ndarray::Array1;
 use rand::prelude::*;
 use std::path::PathBuf;
+use tracing::{debug, info, warn};
 
 pub struct CosineIndex {
     pub cached_images: Vec<(PathBuf, Array1<f32>)>,
@@ -20,14 +21,14 @@ impl CosineIndex {
 
     // add a function thats going to connect to our sql database, query all images and their embeddings, and populate the cached_images vector
     pub fn populate_from_db(&mut self, _db_path: &str) {
-        println!(
-            "[CosineIndex] populate_from_db called with db_path: {}",
+        info!(
+            "populate_from_db called with db_path: {}",
             _db_path
         );
         let db = db::ImageDatabase::new(_db_path).expect("failed to init db");
         let images = db.get_all_images().expect("failed to get all images");
-        println!(
-            "[CosineIndex] Found {} total images in database",
+        debug!(
+            "Found {} total images in database",
             images.len()
         );
 
@@ -56,8 +57,10 @@ impl CosineIndex {
             }
         }
 
-        println!("[CosineIndex] Population complete - Added: {}, Skipped (no embedding): {}, Skipped (empty): {}", 
-            added_count, skipped_no_embedding, skipped_empty);
+        info!(
+            "Population complete - Added: {}, Skipped (no embedding): {}, Skipped (empty): {}",
+            added_count, skipped_no_embedding, skipped_empty
+        );
     }
 
     // Function to compute cosine similarity between two embeddings
@@ -83,8 +86,12 @@ impl CosineIndex {
         top_n: usize,
         exclude_path: Option<&PathBuf>,
     ) -> Vec<(PathBuf, f32)> {
-        println!("[CosineIndex] get_similar_images called - cached_images: {}, top_n: {}, exclude_path: {:?}", 
-            self.cached_images.len(), top_n, exclude_path);
+        debug!(
+            "get_similar_images called - cached_images: {}, top_n: {}, exclude_path: {:?}",
+            self.cached_images.len(),
+            top_n,
+            exclude_path
+        );
 
         let mut excluded_count = 0;
         let mut similarities: Vec<(PathBuf, f32)> = self
@@ -95,8 +102,8 @@ impl CosineIndex {
                 if let Some(exclude) = exclude_path {
                     if path == exclude {
                         excluded_count += 1;
-                        println!(
-                            "[CosineIndex] Excluding query image: {:?}",
+                        debug!(
+                            "Excluding query image: {:?}",
                             path.file_name().unwrap_or_default()
                         );
                         return None;
@@ -107,11 +114,15 @@ impl CosineIndex {
             })
             .collect();
 
-        println!("[CosineIndex] Calculated similarities for {} images (excluded {}), query embedding length: {}", 
-            similarities.len(), excluded_count, embedding.len());
+        debug!(
+            "Calculated similarities for {} images (excluded {}), query embedding length: {}",
+            similarities.len(),
+            excluded_count,
+            embedding.len()
+        );
 
         if similarities.is_empty() {
-            println!("[CosineIndex] WARNING: No similarities calculated! Returning empty result.");
+            warn!("No similarities calculated! Returning empty result.");
             return Vec::new();
         }
 
@@ -126,9 +137,9 @@ impl CosineIndex {
             }
         });
 
-        println!("[CosineIndex] Sorted similarities - top 5:");
+        debug!("Sorted similarities - top 5:");
         for (i, (path, sim)) in similarities.iter().take(5).enumerate() {
-            println!(
+            debug!(
                 "  {}. {:?} - score: {:.4}",
                 i + 1,
                 path.file_name().unwrap_or_default(),
@@ -140,8 +151,8 @@ impl CosineIndex {
         let base_pool = (similarities.len() as f32 * 0.2).ceil() as usize;
         let select_count = base_pool.max(top_n).min(similarities.len());
         let diverse_pool = &similarities[..select_count];
-        println!(
-            "[CosineIndex] Diversity pool - base_pool: {}, select_count: {}, diverse_pool size: {}",
+        debug!(
+            "Diversity pool - base_pool: {}, select_count: {}, diverse_pool size: {}",
             base_pool,
             select_count,
             diverse_pool.len()
@@ -154,12 +165,12 @@ impl CosineIndex {
             .cloned()
             .collect();
 
-        println!(
-            "[CosineIndex] Final selected results: {} images",
+        debug!(
+            "Final selected results: {} images",
             selected.len()
         );
         for (i, (path, sim)) in selected.iter().enumerate() {
-            println!(
+            debug!(
                 "  {}. {:?} - score: {:.4}",
                 i + 1,
                 path.file_name().unwrap_or_default(),
@@ -180,8 +191,8 @@ impl CosineIndex {
         top_n: usize,
         exclude_path: Option<&PathBuf>,
     ) -> Vec<(PathBuf, f32)> {
-        println!(
-            "[CosineIndex] get_similar_images_sorted called - cached_images: {}, top_n: {}, exclude_path: {:?}",
+        debug!(
+            "get_similar_images_sorted called - cached_images: {}, top_n: {}, exclude_path: {:?}",
             self.cached_images.len(),
             top_n,
             exclude_path
@@ -203,7 +214,7 @@ impl CosineIndex {
             .collect();
 
         if similarities.is_empty() {
-            println!("[CosineIndex] WARNING: No similarities calculated! Returning empty result.");
+            warn!("No similarities calculated! Returning empty result.");
             return Vec::new();
         }
 
@@ -218,15 +229,15 @@ impl CosineIndex {
         // Take exactly the top N results in order
         let result: Vec<(PathBuf, f32)> = similarities.into_iter().take(top_n).collect();
 
-        println!(
-            "[CosineIndex] Returning {} results sorted by similarity",
+        debug!(
+            "Returning {} results sorted by similarity",
             result.len()
         );
 
         if !result.is_empty() {
-            println!("[CosineIndex] Top 5 results:");
+            debug!("Top 5 results:");
             for (i, (path, sim)) in result.iter().take(5).enumerate() {
-                println!(
+                debug!(
                     "  {}. {:?} - score: {:.4}",
                     i + 1,
                     path.file_name().unwrap_or_default(),
@@ -234,8 +245,8 @@ impl CosineIndex {
                 );
             }
             if result.len() > 1 {
-                println!(
-                    "[CosineIndex] Score range: {:.4} (best) to {:.4} (worst in top N)",
+                debug!(
+                    "Score range: {:.4} (best) to {:.4} (worst in top N)",
                     result.first().map(|(_, s)| *s).unwrap_or(0.0),
                     result.last().map(|(_, s)| *s).unwrap_or(0.0)
                 );
@@ -256,8 +267,11 @@ impl CosineIndex {
         embedding: &Array1<f32>,
         exclude_path: Option<&PathBuf>,
     ) -> Vec<(PathBuf, f32)> {
-        println!("[CosineIndex] get_tiered_similar_images called - cached_images: {}, exclude_path: {:?}", 
-            self.cached_images.len(), exclude_path);
+        debug!(
+            "get_tiered_similar_images called - cached_images: {}, exclude_path: {:?}",
+            self.cached_images.len(),
+            exclude_path
+        );
 
         let mut similarities: Vec<(PathBuf, f32)> = self
             .cached_images
@@ -274,7 +288,7 @@ impl CosineIndex {
             .collect();
 
         if similarities.is_empty() {
-            println!("[CosineIndex] WARNING: No similarities calculated! Returning empty result.");
+            warn!("No similarities calculated! Returning empty result.");
             return Vec::new();
         }
 
@@ -329,8 +343,8 @@ impl CosineIndex {
             }
         }
 
-        println!(
-            "[CosineIndex] Tiered sampling complete - returned {} images from {} total",
+        debug!(
+            "Tiered sampling complete - returned {} images from {} total",
             result.len(),
             total
         );
@@ -340,8 +354,8 @@ impl CosineIndex {
             let scores: Vec<f32> = result.iter().map(|(_, s)| *s).collect();
             let min_score = scores.iter().cloned().fold(f32::INFINITY, f32::min);
             let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            println!(
-                "[CosineIndex] Score range: {:.4} to {:.4}",
+            debug!(
+                "Score range: {:.4} to {:.4}",
                 min_score, max_score
             );
         }

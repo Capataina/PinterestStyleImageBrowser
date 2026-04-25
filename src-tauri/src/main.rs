@@ -2,8 +2,28 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use image_browser_lib::db;
+use tracing_subscriber::{fmt, EnvFilter};
 
 fn main() {
+    // Initialise the tracing subscriber.
+    //
+    // Default filter: this crate at info, the rest of the dep tree at
+    // warn (so we don't drown in tao/wry/winit chatter). Override via
+    // `RUST_LOG=image_browser_lib=debug` for verbose dev output, or
+    // `RUST_LOG=trace` for everything.
+    //
+    // We deliberately don't `.expect()` the init — if a subscriber is
+    // already installed (e.g. during cargo test), we'd rather log
+    // through the existing one than crash the binary.
+    let _ = fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                EnvFilter::new("warn,image_browser_lib=info,image_browser=info")
+            }),
+        )
+        .with_target(true)
+        .try_init();
+
     // Pre-Tauri startup work is now minimal: open the SQLite handle and
     // ensure the schema is current. Everything that takes time (model
     // download, scan, thumbnails, embeddings) moved into the indexing

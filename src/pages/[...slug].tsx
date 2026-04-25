@@ -297,8 +297,14 @@ export default function Home() {
                 </p>
               )}
               {semanticSearchResults.isError && (
-                <p className="text-sm text-red-500 mt-1">
-                  Search failed. Make sure the text model is available.
+                <p
+                  className="text-sm text-red-500 mt-1"
+                  title={String(semanticSearchResults.error)}
+                >
+                  Search failed:{" "}
+                  {semanticSearchResults.error instanceof Error
+                    ? semanticSearchResults.error.message
+                    : String(semanticSearchResults.error)}
                 </p>
               )}
             </motion.div>

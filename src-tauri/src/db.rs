@@ -1,6 +1,7 @@
 use std::{collections::HashMap, sync::Mutex};
 
 use rusqlite::{fallible_iterator::FallibleIterator, params_from_iter};
+use tracing::info;
 
 use crate::{image_struct::ImageData, tag_struct::Tag};
 
@@ -70,11 +71,11 @@ impl ImageDatabase {
             .collect();
 
         if !columns.contains(&"thumbnail_path".to_string()) {
-            println!("Migrating database: Adding thumbnail columns...");
+            info!("Migrating database: Adding thumbnail columns...");
             conn.execute("ALTER TABLE images ADD COLUMN thumbnail_path TEXT", [])?;
             conn.execute("ALTER TABLE images ADD COLUMN width INTEGER", [])?;
             conn.execute("ALTER TABLE images ADD COLUMN height INTEGER", [])?;
-            println!("Migration complete.");
+            info!("Migration complete.");
         }
 
         Ok(())

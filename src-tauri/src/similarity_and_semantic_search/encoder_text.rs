@@ -1,10 +1,18 @@
 use ort::{execution_providers::CUDAExecutionProvider, session::Session, value::Tensor};
 use std::{collections::HashMap, error::Error, fs, path::Path};
+use tracing::{debug, info, warn};
 
 /// Simple tokenizer that loads from HuggingFace tokenizer.json format.
 /// This is a pure Rust implementation to avoid C library dependencies.
 pub struct SimpleTokenizer {
     vocab: HashMap<String, i64>,
+    /// Reverse lookup table built at load time. Currently unused — the
+    /// encoder only needs forward lookup — but kept because the cost of
+    /// building it is negligible (~1 MB for the multilingual vocab) and
+    /// future debugging features (decode token-ids back to text, dump
+    /// the BPE pieces a query produced) would need it. `#[allow(dead_code)]`
+    /// rather than removal so we don't have to re-add it later.
+    #[allow(dead_code)]
     vocab_reverse: HashMap<i64, String>,
     cls_token_id: i64,
     sep_token_id: i64,
@@ -57,8 +65,8 @@ impl SimpleTokenizer {
         let pad_token_id = *vocab.get("[PAD]").unwrap_or(&0);
         let unk_token_id = *vocab.get("[UNK]").unwrap_or(&100);
 
-        println!("Loaded vocabulary with {} tokens", vocab.len());
-        println!(
+        info!("Loaded vocabulary with {} tokens", vocab.len());
+        debug!(
             "Special tokens - CLS: {}, SEP: {}, PAD: {}, UNK: {}",
             cls_token_id, sep_token_id, pad_token_id, unk_token_id
         );
@@ -190,32 +198,32 @@ impl TextEncoder {
     /// * `model_path` - Path to the ONNX text model (e.g., "models/model_text.onnx")
     /// * `tokenizer_path` - Path to the tokenizer.json file (e.g., "models/tokenizer.json")
     pub fn new(model_path: &Path, tokenizer_path: &Path) -> Result<Self, Box<dyn Error>> {
-        println!("=== Initializing Text Encoder ===");
-        println!("Model path: {:?}", model_path);
-        println!("Tokenizer path: {:?}", tokenizer_path);
+        info!("=== Initializing Text Encoder ===");
+        info!("Model path: {:?}", model_path);
+        info!("Tokenizer path: {:?}", tokenizer_path);
 
         // Load the tokenizer
-        println!("Loading tokenizer...");
+        info!("Loading tokenizer...");
         let tokenizer = SimpleTokenizer::from_file(tokenizer_path)?;
-        println!("✓ Tokenizer loaded successfully");
+        info!("✓ Tokenizer loaded successfully");
 
         // Try to build with CUDA, fall back to CPU
-        println!("Attempting to enable CUDA...");
+        info!("Attempting to enable CUDA...");
         let builder_result = Session::builder()?
             .with_execution_providers([CUDAExecutionProvider::default().build()]);
 
         let session = match builder_result {
             Ok(builder) => {
-                println!("✓ CUDA execution provider accepted");
+                info!("✓ CUDA execution provider accepted");
                 let session = builder.commit_from_file(model_path)?;
-                println!("✓ Text encoder session created with CUDA");
+                info!("✓ Text encoder session created with CUDA");
                 session
             }
             Err(e) => {
-                println!("✗ CUDA execution provider failed: {}", e);
-                println!("Falling back to CPU...");
+                warn!("✗ CUDA execution provider failed: {}", e);
+                info!("Falling back to CPU...");
                 let session = Session::builder()?.commit_from_file(model_path)?;
-                println!("✓ Text encoder session created with CPU");
+                info!("✓ Text encoder session created with CPU");
                 session
             }
         };
@@ -232,14 +240,14 @@ impl TextEncoder {
 
     /// Inspect the model's input and output names (useful for debugging)
     pub fn inspect_model(&self) {
-        println!("Text Model inputs:");
+        debug!("Text Model inputs:");
         for input in self.session.inputs.iter() {
-            println!("  Name: {:?}", input.name);
+            debug!("  Name: {:?}", input.name);
         }
 
-        println!("\nText Model outputs:");
+        debug!("\nText Model outputs:");
         for output in self.session.outputs.iter() {
-            println!("  Name: {:?}", output.name);
+            debug!("  Name: {:?}", output.name);
         }
     }
 

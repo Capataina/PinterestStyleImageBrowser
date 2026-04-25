@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+use tracing::error;
 
 use crate::paths;
 
@@ -36,8 +37,8 @@ impl Settings {
             Ok(content) => match serde_json::from_str::<Settings>(&content) {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!(
-                        "[settings] failed to parse {} ({e}); using defaults",
+                    error!(
+                        "failed to parse {} ({e}); using defaults",
                         path.display()
                     );
                     Settings::default()
@@ -45,8 +46,8 @@ impl Settings {
             },
             Err(e) if e.kind() == io::ErrorKind::NotFound => Settings::default(),
             Err(e) => {
-                eprintln!(
-                    "[settings] failed to read {} ({e}); using defaults",
+                error!(
+                    "failed to read {} ({e}); using defaults",
                     path.display()
                 );
                 Settings::default()
