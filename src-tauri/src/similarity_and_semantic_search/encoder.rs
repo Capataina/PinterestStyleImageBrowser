@@ -7,8 +7,23 @@ use ort::{
 use std::{error::Error, path::Path};
 use tracing::{debug, info, warn};
 
-#[cfg(target_os = "macos")]
-use ort::execution_providers::CoreMLExecutionProvider;
+// CoreML is intentionally NOT used for the image encoder on macOS.
+//
+// We tested it: CoreML's GetCapability accepts ~54% of CLIP ViT-B/32's
+// nodes (980 of 1827) and session-create succeeds, but actual inference
+// fails at runtime with `Error executing model: Unable to compute the
+// prediction using a neural network model (error code: -1)`. The
+// compile-time partitioning is producing a graph that can't actually
+// run on the ANE/GPU at inference time — likely a known fragility in
+// ort's CoreML EP for some op combinations in dynamic-shape contexts.
+//
+// Plain CPU on M-series chips is still fast enough: ~200-500ms per
+// image, so ~6-15 min to encode a typical 1500-2000 image library.
+// Not as snappy as CoreML would have been, but it WORKS.
+//
+// Future work: experiment with CoreMLExecutionProvider's options
+// (subgraph_cache, mlprogram_v2 flag), or quantise to int8, or use
+// a different ONNX export. Not a Phase-X-quick-fix item.
 
 #[cfg(not(target_os = "macos"))]
 use ort::execution_providers::CUDAExecutionProvider;
@@ -46,11 +61,11 @@ impl Encoder {
 
     #[cfg(target_os = "macos")]
     fn build_session_with_accel(model_path: &Path) -> Result<Session, Box<dyn Error>> {
-        info!("trying CoreML execution provider (auto-routes to ANE / GPU / CPU)");
-        let session = Session::builder()?
-            .with_execution_providers([CoreMLExecutionProvider::default().build()])?
-            .commit_from_file(model_path)?;
-        info!("session ready (CoreML if supported, CPU otherwise — ort routes per-op)");
+        // macOS: CPU-only because CoreML's runtime inference errors on
+        // CLIP's image graph despite accepting the partition at compile
+        // time. See top-of-file comment for the full diagnosis.
+        info!("image encoder using CPU (CoreML disabled — see encoder.rs header)");
+        let session = Session::builder()?.commit_from_file(model_path)?;
         Ok(session)
     }
 
