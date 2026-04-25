@@ -27,3 +27,7 @@ images.db
 
 # Local Claude Code personality — not shared
 CLAUDE.md
+
+# Python bytecode caches (created when scripts/ helpers are syntax-checked)
+__pycache__/
+*.pyc
