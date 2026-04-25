@@ -25,6 +25,11 @@ dist-ssr
 
 images.db
 
+# Project-local user-state directory. Holds DB, thumbnails, models,
+# cosine cache, and settings — see paths.rs::app_data_dir(). Gitignored
+# so user state never lands in commits.
+Library/
+
 # Local Claude Code personality — not shared
 CLAUDE.md
 
