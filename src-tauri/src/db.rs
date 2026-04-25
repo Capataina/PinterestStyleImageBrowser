@@ -80,9 +80,13 @@ impl ImageDatabase {
         Ok(())
     }
 
+    /// Default path to the SQLite database file in the platform-correct
+    /// app data directory (e.g. `~/Library/Application Support/com.ataca.image-browser/images.db`
+    /// on macOS). Created on first launch.
     pub fn default_database_path() -> String {
-        let default_path = "../images.db".to_string();
-        default_path
+        crate::paths::database_path()
+            .to_string_lossy()
+            .into_owned()
     }
 
     pub fn add_image(&self, path: String) -> rusqlite::Result<()> {

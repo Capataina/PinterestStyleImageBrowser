@@ -2002,6 +2002,7 @@ name = "image-browser"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "dirs",
  "image",
  "ndarray 0.17.1",
  "ort",

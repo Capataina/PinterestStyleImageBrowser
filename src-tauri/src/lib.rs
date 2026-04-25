@@ -1,5 +1,4 @@
 use std::sync::Mutex;
-use std::path::Path;
 use tauri::State;
 
 use crate::{
@@ -31,6 +30,8 @@ struct SemanticSearchResult {
 pub mod db;
 pub mod filesystem;
 pub mod image_struct;
+pub mod paths;
+pub mod settings;
 pub mod similarity_and_semantic_search;
 pub mod tag_struct;
 pub mod thumbnail;
@@ -123,8 +124,9 @@ fn semantic_search(
 
     if encoder_lock.is_none() {
         println!("[Backend] Initializing text encoder...");
-        let model_path = Path::new("models/model_text.onnx");
-        let tokenizer_path = Path::new("models/tokenizer.json");
+        let models_dir = paths::models_dir();
+        let model_path = models_dir.join("model_text.onnx");
+        let tokenizer_path = models_dir.join("tokenizer.json");
 
         if !model_path.exists() {
             return Err(format!(
@@ -139,7 +141,7 @@ fn semantic_search(
             ));
         }
 
-        let encoder = TextEncoder::new(model_path, tokenizer_path)
+        let encoder = TextEncoder::new(&model_path, &tokenizer_path)
             .map_err(|e| format!("Failed to initialize text encoder: {e}"))?;
 
         *encoder_lock = Some(encoder);
