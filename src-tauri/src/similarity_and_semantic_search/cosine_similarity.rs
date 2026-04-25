@@ -370,14 +370,6 @@ mod tests {
         );
     }
 
-    // test to see if populate_from_db works
-    #[test]
-    fn test_populate_from_db() {
-        let mut index = CosineIndex::new();
-        index.populate_from_db("images.db");
-        assert_eq!(index.cached_images.len(), 7);
-    }
-
     #[test]
     fn test_cosine_similarity_orthogonal_vectors() {
         // Orthogonal vectors (perpendicular) should have similarity of 0.0

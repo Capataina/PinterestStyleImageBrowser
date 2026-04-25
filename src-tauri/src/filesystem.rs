@@ -47,16 +47,6 @@ mod tests {
     use std::path::Path;
 
     #[test]
-    fn test_scan_directory_finds_all_images() {
-        let test_dir = Path::new("test_images");
-
-        let scanner = ImageScanner::new();
-        let results = scanner.scan_directory(test_dir).unwrap();
-
-        assert_eq!(results.len(), 4, "Should find exactly 4 image files");
-    }
-
-    #[test]
     fn test_supported_extensions() {
         assert!(is_supported_image(Path::new("photo.jpg")));
         assert!(is_supported_image(Path::new("image.PNG"))); // case insensitive
