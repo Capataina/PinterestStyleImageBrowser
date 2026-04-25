@@ -155,8 +155,16 @@ def download_one(url: str, dest: pathlib.Path) -> tuple[str, str]:
                 part.rename(dest)
             return ("downloaded", str(dest.name))
         except urllib.error.HTTPError as e:
-            if e.code == 404:
-                return ("missing", f"{dest.name} (404 — skin not in CDN)")
+            # Both 404 and 403 are "the splash file isn't there." DDragon
+            # serves through Cloudfront which returns 403 (not 404) for
+            # missing keys. The biggest source of these is chromas: the
+            # per-champion JSON lists chromas as if they were full skins,
+            # but chromas share the parent skin's splash with a runtime
+            # tint and don't have their own file. Roughly 75-80% of the
+            # JSON entries will 403 for this reason — completely expected.
+            if e.code in (404, 403):
+                kind = {404: "404 — skin not in CDN", 403: "403 — likely a chroma (shares parent splash)"}[e.code]
+                return ("missing", f"{dest.name} ({kind})")
             last_error = e
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             last_error = e
@@ -276,8 +284,8 @@ def main() -> int:
     print("=" * 60)
     print(f"  Downloaded:  {counters['downloaded']}")
     print(f"  Skipped:     {counters['skipped']} (already on disk)")
-    print(f"  Missing:     {counters['missing']} (404 from CDN)")
-    print(f"  Failed:      {counters['failed']} (network errors)")
+    print(f"  Missing:     {counters['missing']} (404/403 from CDN — mostly chromas, expected)")
+    print(f"  Failed:      {counters['failed']} (network errors — these are real problems)")
     print("=" * 60)
     print(f"\nDone. Files are in: {output_dir}")
     print("Point the Image Browser at this folder via the Choose folder button.")
