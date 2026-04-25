@@ -37,6 +37,7 @@ pub mod image_struct;
 pub mod indexing;
 pub mod model_download;
 pub mod paths;
+pub mod perf;
 pub mod root_struct;
 pub mod settings;
 pub mod similarity_and_semantic_search;
@@ -59,6 +60,7 @@ pub struct TextEncoderState {
 }
 
 #[tauri::command]
+#[tracing::instrument(name = "ipc.get_images", skip(db), fields(tag_count = filter_tag_ids.len()))]
 fn get_images(
     db: State<'_, ImageDatabase>,
     filter_tag_ids: Vec<ID>,
@@ -73,11 +75,13 @@ fn get_images(
 }
 
 #[tauri::command]
+#[tracing::instrument(name = "ipc.get_tags", skip(db))]
 fn get_tags(db: State<'_, ImageDatabase>) -> Result<Vec<Tag>, String> {
     return db.get_tags().map_err(|e| e.to_string());
 }
 
 #[tauri::command]
+#[tracing::instrument(name = "ipc.create_tag", skip(db))]
 fn create_tag(db: State<'_, ImageDatabase>, name: String, color: String) -> Result<Tag, String> {
     return db.create_tag(name, color).map_err(|e| e.to_string());
 }
@@ -167,8 +171,42 @@ fn set_scan_root(
 
 /// Multi-folder management — list configured roots.
 #[tauri::command]
+#[tracing::instrument(name = "ipc.list_roots", skip(db))]
 fn list_roots(db: State<'_, ImageDatabase>) -> Result<Vec<Root>, String> {
     db.list_roots().map_err(|e| e.to_string())
+}
+
+/// Returns aggregated span timing stats for the in-app perf overlay.
+/// Frontend polls this to render the live diagnostics panel.
+#[tauri::command]
+fn get_perf_snapshot() -> perf::PerfSnapshot {
+    perf::snapshot()
+}
+
+/// Wipe collected perf stats. Useful between scenarios when measuring
+/// a specific operation in isolation.
+#[tauri::command]
+fn reset_perf_stats() -> Result<(), String> {
+    perf::reset();
+    Ok(())
+}
+
+/// Write the current perf snapshot to Library/exports/perf-<unix-ts>.json
+/// as pretty-printed JSON. Returns the absolute path so the frontend
+/// can show it in a confirmation message.
+#[tauri::command]
+fn export_perf_snapshot() -> Result<String, String> {
+    let snap = perf::snapshot();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let dest = paths::exports_dir().join(format!("perf-{now}.json"));
+    let json = serde_json::to_string_pretty(&snap)
+        .map_err(|e| format!("Failed to serialise snapshot: {e}"))?;
+    std::fs::write(&dest, json)
+        .map_err(|e| format!("Failed to write export: {e}"))?;
+    Ok(dest.to_string_lossy().into_owned())
 }
 
 /// Add a root and trigger an incremental re-index. Returns the new
@@ -277,6 +315,7 @@ fn remove_tag_from_image(
 
 /// Semantic search: find images matching a text query using CLIP embeddings
 #[tauri::command]
+#[tracing::instrument(name = "ipc.semantic_search", skip(db, cosine_state, text_encoder_state), fields(query_len = query.len(), top_n))]
 fn semantic_search(
     db: State<'_, ImageDatabase>,
     cosine_state: State<'_, CosineIndexState>,
@@ -452,6 +491,7 @@ fn semantic_search(
 }
 
 #[tauri::command]
+#[tracing::instrument(name = "ipc.get_tiered_similar_images", skip(db, cosine_state), fields(image_id))]
 fn get_tiered_similar_images(
     db: State<'_, ImageDatabase>,
     cosine_state: State<'_, CosineIndexState>,
@@ -569,6 +609,7 @@ fn get_tiered_similar_images(
 }
 
 #[tauri::command]
+#[tracing::instrument(name = "ipc.get_similar_images", skip(db, cosine_state), fields(image_id, top_n))]
 fn get_similar_images(
     db: State<'_, ImageDatabase>,
     cosine_state: State<'_, CosineIndexState>,
@@ -912,6 +953,9 @@ pub fn run(db: ImageDatabase, db_path: String) {
             set_root_enabled,
             get_image_notes,
             set_image_notes,
+            get_perf_snapshot,
+            reset_perf_stats,
+            export_perf_snapshot,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

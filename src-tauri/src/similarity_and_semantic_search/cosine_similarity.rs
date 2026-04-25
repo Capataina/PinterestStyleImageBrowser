@@ -29,6 +29,7 @@ impl CosineIndex {
     /// which was ~30x slower for libraries of 1000+ images. Also takes
     /// `&ImageDatabase` rather than a `db_path: &str` so the cosine
     /// module no longer opens its own second SQLite connection.
+    #[tracing::instrument(name = "cosine.populate_from_db", skip(self, db))]
     pub fn populate_from_db(&mut self, db: &db::ImageDatabase) {
         let start = Instant::now();
         info!("populate_from_db called");
@@ -174,6 +175,7 @@ impl CosineIndex {
     // write the return images function. This function is going to take an embedding and return the top n most similar images from the cached_images vector
     // the images that ir returns will be a top x percent of the cached images based on cosine similarity to encourage diversity
     // exclude_path: optional path to exclude from results (e.g., the query image itself)
+    #[tracing::instrument(name = "cosine.get_similar_images", skip(self, embedding, exclude_path), fields(cached = self.cached_images.len(), top_n))]
     pub fn get_similar_images(
         &self,
         embedding: &Array1<f32>,
@@ -279,6 +281,7 @@ impl CosineIndex {
     /// Unlike get_similar_images, this does NOT randomly sample - it returns
     /// results in exact order of similarity. Best for semantic search where
     /// ranking accuracy matters.
+    #[tracing::instrument(name = "cosine.get_similar_sorted", skip(self, embedding, exclude_path), fields(cached = self.cached_images.len(), top_n))]
     pub fn get_similar_images_sorted(
         &self,
         embedding: &Array1<f32>,
@@ -356,6 +359,7 @@ impl CosineIndex {
     /// - 5 random from top 5-10%
     /// - 5 random from top 10-15%
     /// ... and so on until top 50%
+    #[tracing::instrument(name = "cosine.get_tiered_similar", skip(self, embedding, exclude_path), fields(cached = self.cached_images.len()))]
     pub fn get_tiered_similar_images(
         &self,
         embedding: &Array1<f32>,

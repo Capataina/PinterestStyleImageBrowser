@@ -19,6 +19,7 @@ impl ImageScanner {
     }
 
     // CAN USE WALKDIR
+    #[tracing::instrument(name = "filesystem.scan", skip(self), fields(root = %root.display()))]
     pub fn scan_directory(&self, root: &Path) -> Result<Vec<String>, std::io::Error> {
         let mut img_paths: Vec<String> = Vec::new();
 

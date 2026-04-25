@@ -91,6 +91,7 @@ impl Encoder {
         }
     }
 
+    #[tracing::instrument(name = "clip.preprocess_image", skip(self, image_path))]
     pub fn preprocess_image(
         &self,
         image_path: &Path,
@@ -181,6 +182,7 @@ impl Encoder {
         Ok(batches)
     }
 
+    #[tracing::instrument(name = "clip.encode_image", skip(self), fields(path = %image_path.display()))]
     pub fn encode(&mut self, image_path: &Path) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
         let input_array = self.preprocess_image(image_path)?;
 
@@ -214,6 +216,7 @@ impl Encoder {
         Ok(embedding)
     }
 
+    #[tracing::instrument(name = "clip.encode_image_batch", skip(self, image_paths), fields(batch = image_paths.len()))]
     pub fn encode_batch(
         &mut self,
         image_paths: &[&Path],

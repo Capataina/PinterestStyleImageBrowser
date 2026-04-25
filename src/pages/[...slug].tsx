@@ -16,6 +16,7 @@ import { SearchBar } from "@/components/SearchBar";
 import { PinterestModal } from "@/components/PinterestModal";
 import { IndexingStatusPill } from "@/components/IndexingStatusPill";
 import { SettingsDrawer } from "@/components/SettingsDrawer";
+import { PerfOverlay } from "@/components/PerfOverlay";
 import { useQueryClient } from "@tanstack/react-query";
 import { FolderOpen, Settings as SettingsIcon } from "lucide-react";
 import { pickScanFolder, setScanRoot } from "@/services/images";
@@ -28,15 +29,25 @@ export default function Home() {
   const [searchTags, setSearchTags] = useState<Tag[]>([]);
   const [searchText, setSearchText] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [perfOpen, setPerfOpen] = useState(false);
   const { prefs } = useUserPreferences();
 
-  // Global keyboard shortcut: cmd+, (mac) / ctrl+, (others) opens settings.
-  // Standard preferences shortcut on every modern OS.
+  // Global keyboard shortcuts:
+  //   ⌘,        — toggle settings drawer
+  //   ⌘⇧P       — toggle performance overlay
+  // The shortcuts use ⌘ on macOS and Ctrl elsewhere, both are standard.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === ",") {
+      const cmdOrCtrl = e.metaKey || e.ctrlKey;
+      if (cmdOrCtrl && e.key === ",") {
         e.preventDefault();
         setSettingsOpen((s) => !s);
+        return;
+      }
+      if (cmdOrCtrl && e.shiftKey && (e.key === "P" || e.key === "p")) {
+        e.preventDefault();
+        setPerfOpen((s) => !s);
+        return;
       }
     };
     window.addEventListener("keydown", onKey);
@@ -215,6 +226,9 @@ export default function Home() {
         open={settingsOpen}
         onClose={() => setSettingsOpen(false)}
       />
+
+      {/* Performance overlay — toggled with ⌘⇧P */}
+      <PerfOverlay open={perfOpen} onClose={() => setPerfOpen(false)} />
 
       {/* Pinterest Modal (inspect mode) - only shows when inspecting a selected image */}
       <AnimatePresence>

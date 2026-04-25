@@ -48,6 +48,7 @@ impl ThumbnailGenerator {
     /// root_id is supplied (Phase 9 per-root organisation), or in
     /// `<thumbnail_dir>/thumb_<image_id>.jpg` when None (legacy
     /// fallback for un-rooted rows).
+    #[tracing::instrument(name = "thumbnail.generate", skip(self, image_path), fields(image_id, root_id))]
     pub fn generate_thumbnail(
         &self,
         image_path: &Path,

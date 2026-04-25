@@ -1,8 +1,8 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use image_browser_lib::db;
-use tracing_subscriber::{fmt, EnvFilter};
+use image_browser_lib::{db, perf::PerfLayer};
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 fn main() {
     // Initialise the tracing subscriber.
@@ -15,13 +15,24 @@ fn main() {
     // We deliberately don't `.expect()` the init — if a subscriber is
     // already installed (e.g. during cargo test), we'd rather log
     // through the existing one than crash the binary.
-    let _ = fmt()
-        .with_env_filter(
+    // Subscriber stack:
+    // - `fmt::layer` emits human-readable lines to stderr (the
+    //   familiar terminal output).
+    // - `PerfLayer` records every span's duration into the
+    //   process-global perf collector. Surfaced via the
+    //   get_perf_snapshot Tauri command + the in-app overlay.
+    //
+    // The same EnvFilter applies to both layers, so a `RUST_LOG`
+    // override that hides info-level lines also hides them from
+    // the perf collector — keep that in mind when measuring.
+    let _ = tracing_subscriber::registry()
+        .with(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| {
                 EnvFilter::new("warn,image_browser_lib=info,image_browser=info")
             }),
         )
-        .with_target(true)
+        .with(fmt::layer().with_target(true))
+        .with(PerfLayer::new())
         .try_init();
 
     // Pre-Tauri startup work is now minimal: open the SQLite handle and

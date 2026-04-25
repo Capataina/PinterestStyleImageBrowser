@@ -167,6 +167,7 @@ pub fn try_spawn_pipeline(
 
 /// The actual pipeline body. Errors propagate up and become a
 /// `Phase::Error` event in the spawning closure.
+#[tracing::instrument(name = "pipeline.run", skip(app, cosine_index))]
 fn run_pipeline_inner(
     app: &AppHandle,
     db_path: &str,

@@ -141,6 +141,19 @@ pub fn cosine_cache_path() -> PathBuf {
     app_data_dir().join("cosine_cache.bin")
 }
 
+/// User-facing exports directory. Anything the user might want to
+/// share, archive, or compare goes here:
+///   - perf-<unix-ts>.json — perf snapshots from the diagnostics overlay
+///   - (future) selected-set.csv, query-history.json, etc.
+///
+/// Lives under Library/ so it follows the same "all generated files
+/// in one place" rule as everything else.
+pub fn exports_dir() -> PathBuf {
+    let p = app_data_dir().join("exports");
+    let _ = ensure_dir(&p);
+    p
+}
+
 fn ensure_dir(path: &PathBuf) -> io::Result<()> {
     if !path.exists() {
         fs::create_dir_all(path)?;

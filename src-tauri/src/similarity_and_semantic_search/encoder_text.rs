@@ -283,6 +283,7 @@ impl TextEncoder {
     ///
     /// # Returns
     /// A 512-dimensional normalized embedding vector
+    #[tracing::instrument(name = "clip.encode_text", skip(self, text), fields(query_len = text.len()))]
     pub fn encode(&mut self, text: &str) -> Result<Vec<f32>, Box<dyn Error>> {
         // Tokenize the text
         let (mut input_ids, mut attention_mask) = self.tokenizer.encode(text, true);
