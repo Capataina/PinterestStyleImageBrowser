@@ -257,48 +257,93 @@ fn run_pipeline_inner(
         }
     }
 
-    // 2. Resolve the scan root from settings. If none, exit cleanly.
-    let user_settings = crate::settings::Settings::load();
-    let scan_root = match user_settings.scan_root {
-        Some(p) if p.exists() => p,
-        Some(p) => {
-            return Err(format!(
-                "Configured scan_root {} no longer exists; pick a new folder",
-                p.display()
-            )
-            .into())
-        }
-        None => {
-            // Nothing to do — the UI's empty state covers the no-folder case.
-            emit(app, Phase::Ready, 0, 0, Some("No folder configured".into()));
-            return Ok(());
-        }
-    };
-
-    // 3. Open a fresh DB handle. Mutex<Connection> coexists with the
-    //    Tauri-managed one (rusqlite supports multiple connections to the
-    //    same file). This mirrors the cosine module's existing pattern.
+    // 2. Open a fresh DB handle. Mutex<Connection> coexists with the
+    //    Tauri-managed one (rusqlite supports multiple connections to
+    //    the same file).
     let database = ImageDatabase::new(db_path)?;
     database.initialize()?;
 
-    // 4. Scan.
+    // 3. Resolve the list of roots to scan. Multi-folder support means
+    //    we walk every enabled root and tag each image with its source.
+    let all_roots = database.list_roots()?;
+    let enabled_roots: Vec<_> = all_roots.iter().filter(|r| r.enabled).collect();
+    if enabled_roots.is_empty() {
+        // Nothing to do — empty-state UI covers this case.
+        emit(
+            app,
+            Phase::Ready,
+            0,
+            0,
+            Some("No folders configured".into()),
+        );
+        return Ok(());
+    }
+
+    // 4. Scan every enabled root. We aggregate paths across roots so
+    //    progress reflects total work, not per-folder progress.
     emit(
         app,
         Phase::Scan,
         0,
         0,
-        Some(format!("Scanning {}", scan_root.display())),
+        Some(format!("Scanning {} folder(s)", enabled_roots.len())),
     );
     let scanner = ImageScanner::new();
-    let paths_found = scanner.scan_directory(&scan_root)?;
-    let total_found = paths_found.len();
-    for (i, path) in paths_found.iter().enumerate() {
-        database.add_image(path.clone())?;
-        // Lightweight progress: every 100 images is plenty.
+
+    // First pass: walk every enabled root, collect (path, root_id)
+    // tuples. We keep per-root path sets so we can run the orphan
+    // detection pass per-root in a moment.
+    let mut all_paths: Vec<(String, i64)> = Vec::new();
+    let mut paths_per_root: std::collections::HashMap<i64, Vec<String>> =
+        std::collections::HashMap::new();
+    for root in &enabled_roots {
+        let root_path = std::path::Path::new(&root.path);
+        if !root_path.exists() {
+            warn!(
+                "configured root {} no longer exists; skipping",
+                root.path
+            );
+            continue;
+        }
+        match scanner.scan_directory(root_path) {
+            Ok(paths) => {
+                let entry = paths_per_root.entry(root.id).or_default();
+                for p in paths {
+                    entry.push(p.clone());
+                    all_paths.push((p, root.id));
+                }
+            }
+            Err(e) => {
+                warn!("scan of {} failed: {e}", root.path);
+            }
+        }
+    }
+    let total_found = all_paths.len();
+
+    // Second pass: insert into DB. Idempotent — INSERT OR IGNORE on the
+    // path uniqueness constraint means existing rows aren't duplicated.
+    for (i, (path, root_id)) in all_paths.iter().enumerate() {
+        database.add_image(path.clone(), Some(*root_id))?;
         if (i + 1) % 100 == 0 || i + 1 == total_found {
             emit(app, Phase::Scan, i + 1, total_found, None);
         }
     }
+
+    // Orphan-detection pass: for each enabled root, mark any DB row
+    // whose path isn't in the just-scanned alive set as orphaned. The
+    // grid query filters orphaned rows out, so the user doesn't see
+    // tiles for files that were deleted between launches.
+    for root in &enabled_roots {
+        let alive = paths_per_root.remove(&root.id).unwrap_or_default();
+        match database.mark_orphaned(root.id, &alive) {
+            Ok(n) if n > 0 => {
+                info!("orphan-detection: {} rows marked orphaned in root {}", n, root.path);
+            }
+            Ok(_) => {}
+            Err(e) => warn!("orphan-detection for root {} failed: {e}", root.path),
+        }
+    }
+
     emit(app, Phase::Scan, total_found, total_found, None);
 
     // 5. Thumbnails (parallel via rayon).

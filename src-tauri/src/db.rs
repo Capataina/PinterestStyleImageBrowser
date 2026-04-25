@@ -1,9 +1,13 @@
-use std::{collections::HashMap, sync::Mutex};
+use std::{
+    collections::HashMap,
+    sync::Mutex,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
-use rusqlite::{fallible_iterator::FallibleIterator, params_from_iter};
+use rusqlite::{fallible_iterator::FallibleIterator, params, params_from_iter};
 use tracing::info;
 
-use crate::{image_struct::ImageData, tag_struct::Tag};
+use crate::{image_struct::ImageData, root_struct::Root, tag_struct::Tag};
 
 pub struct ImageDatabase {
     connection: Mutex<rusqlite::Connection>,
@@ -20,22 +24,50 @@ impl ImageDatabase {
     }
 
     pub fn initialize(&self) -> rusqlite::Result<()> {
-        // Create images table with all columns including thumbnail support
+        // Foreign-key enforcement is OFF by default in SQLite; turn it
+        // on so ON DELETE CASCADE actually fires.
+        self.connection
+            .lock()
+            .unwrap()
+            .execute("PRAGMA foreign_keys = ON;", [])?;
+
+        // Roots table — created here so the images table's root_id FK
+        // has a target. Multi-folder support (Phase 6); existing single-
+        // folder users get migrated below.
         self.connection.lock().unwrap().execute(
-            "
-            CREATE TABLE IF NOT EXISTS images (
+            "CREATE TABLE IF NOT EXISTS roots (
+                id INTEGER PRIMARY KEY,
+                path TEXT NOT NULL UNIQUE,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                added_at INTEGER NOT NULL
+            );",
+            [],
+        )?;
+
+        // Images table — `notes` and `orphaned` are Phase 11 / Phase 7
+        // additions; `root_id` is Phase 6. Existing DBs migrate via
+        // ALTER TABLE below.
+        self.connection.lock().unwrap().execute(
+            "CREATE TABLE IF NOT EXISTS images (
                 id INTEGER PRIMARY KEY,
                 path TEXT NOT NULL UNIQUE,
                 embedding BLOB,
                 thumbnail_path TEXT,
                 width INTEGER,
-                height INTEGER
+                height INTEGER,
+                root_id INTEGER REFERENCES roots(id) ON DELETE CASCADE,
+                notes TEXT,
+                orphaned INTEGER NOT NULL DEFAULT 0
             );",
             [],
         )?;
 
-        // Migration: Add thumbnail columns if they don't exist (for existing databases)
+        // Migrations for existing DBs: add thumbnail columns, then
+        // multi-folder columns, then notes/orphaned. Each is gated by
+        // a PRAGMA table_info check so they're idempotent.
         self.migrate_add_thumbnail_columns()?;
+        self.migrate_add_multifolder_columns()?;
+        self.migrate_add_notes_and_orphaned_columns()?;
 
         self.connection.lock().unwrap().execute(
             "CREATE TABLE IF NOT EXISTS tags (
@@ -75,7 +107,56 @@ impl ImageDatabase {
             conn.execute("ALTER TABLE images ADD COLUMN thumbnail_path TEXT", [])?;
             conn.execute("ALTER TABLE images ADD COLUMN width INTEGER", [])?;
             conn.execute("ALTER TABLE images ADD COLUMN height INTEGER", [])?;
-            info!("Migration complete.");
+            info!("Thumbnail-columns migration complete.");
+        }
+
+        Ok(())
+    }
+
+    /// Add the root_id column to images for multi-folder support. Old
+    /// rows get root_id = NULL initially; the lib.rs::run setup
+    /// callback handles the per-row backfill once it knows what root
+    /// (if any) was previously configured via settings.json.
+    fn migrate_add_multifolder_columns(&self) -> rusqlite::Result<()> {
+        let conn = self.connection.lock().unwrap();
+        let mut stmt = conn.prepare("PRAGMA table_info(images)")?;
+        let columns: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        if !columns.contains(&"root_id".to_string()) {
+            info!("Migrating database: Adding root_id column for multi-folder...");
+            conn.execute(
+                "ALTER TABLE images ADD COLUMN root_id INTEGER REFERENCES roots(id) ON DELETE CASCADE",
+                [],
+            )?;
+            info!("Multi-folder migration complete.");
+        }
+
+        Ok(())
+    }
+
+    /// Add notes (free-text per-image annotations, Phase 11) and
+    /// orphaned (deleted-from-disk marker, Phase 7) columns.
+    fn migrate_add_notes_and_orphaned_columns(&self) -> rusqlite::Result<()> {
+        let conn = self.connection.lock().unwrap();
+        let mut stmt = conn.prepare("PRAGMA table_info(images)")?;
+        let columns: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        if !columns.contains(&"notes".to_string()) {
+            info!("Migrating database: Adding notes column...");
+            conn.execute("ALTER TABLE images ADD COLUMN notes TEXT", [])?;
+        }
+        if !columns.contains(&"orphaned".to_string()) {
+            info!("Migrating database: Adding orphaned column...");
+            conn.execute(
+                "ALTER TABLE images ADD COLUMN orphaned INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
         }
 
         Ok(())
@@ -90,12 +171,180 @@ impl ImageDatabase {
             .into_owned()
     }
 
-    pub fn add_image(&self, path: String) -> rusqlite::Result<()> {
+    /// Set or clear the orphaned flag on every image in a given root.
+    /// Used by the indexing pipeline's orphan-detection pass — after a
+    /// scan we know exactly which paths exist on disk, and any DB row
+    /// for that root whose path isn't in the live set gets marked
+    /// orphaned. The grid query filters orphaned rows out so the user
+    /// doesn't see deleted images.
+    ///
+    /// Returns the number of rows updated.
+    pub fn mark_orphaned(&self, root_id: ID, alive_paths: &[String]) -> rusqlite::Result<usize> {
+        let conn = self.connection.lock().unwrap();
+
+        // Re-mark every row from this root as not-orphaned first.
+        // Necessary because a previously-orphaned row whose file came
+        // back (rename, restore from trash) should re-appear in the grid.
+        conn.execute(
+            "UPDATE images SET orphaned = 0 WHERE root_id = ?1",
+            [root_id],
+        )?;
+
+        if alive_paths.is_empty() {
+            // Edge case: empty scan (e.g. user pointed at a now-empty
+            // folder). Mark every row from this root orphaned.
+            let n = conn.execute(
+                "UPDATE images SET orphaned = 1 WHERE root_id = ?1",
+                [root_id],
+            )?;
+            return Ok(n);
+        }
+
+        // Two-pass approach without temp tables: load all paths from the
+        // root, diff against the alive set in Rust, then UPDATE the
+        // diff. This avoids constructing a multi-thousand-element IN
+        // clause that would blow past SQLite's parameter limits on
+        // large libraries.
+        let mut stmt = conn.prepare("SELECT id, path FROM images WHERE root_id = ?1")?;
+        let rows: Vec<(ID, String)> = stmt
+            .query_map([root_id], |r| Ok((r.get::<_, ID>(0)?, r.get::<_, String>(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(stmt);
+
+        use std::collections::HashSet;
+        let alive_set: HashSet<&str> = alive_paths.iter().map(|s| s.as_str()).collect();
+        let to_orphan: Vec<ID> = rows
+            .iter()
+            .filter(|(_, p)| !alive_set.contains(p.as_str()))
+            .map(|(id, _)| *id)
+            .collect();
+
+        if to_orphan.is_empty() {
+            return Ok(0);
+        }
+
+        let mut updated = 0;
+        for chunk in to_orphan.chunks(500) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!(
+                "UPDATE images SET orphaned = 1 WHERE id IN ({placeholders})"
+            );
+            updated += conn.execute(&sql, params_from_iter(chunk))?;
+        }
+        Ok(updated)
+    }
+
+    /// Insert an image path. With multi-folder support each row remembers
+    /// which root it came from. Idempotent via `INSERT OR IGNORE` on the
+    /// path uniqueness constraint — a re-scan never duplicates rows.
+    pub fn add_image(&self, path: String, root_id: Option<ID>) -> rusqlite::Result<()> {
+        let conn = self.connection.lock().unwrap();
+        match root_id {
+            Some(rid) => {
+                conn.execute(
+                    "INSERT OR IGNORE INTO images (path, root_id) VALUES (?1, ?2)",
+                    params![path, rid],
+                )?;
+            }
+            None => {
+                conn.execute(
+                    "INSERT OR IGNORE INTO images (path) VALUES (?1)",
+                    [path],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    // ==================== Roots (multi-folder) ====================
+
+    /// List every configured root, ordered by add date (oldest first).
+    pub fn list_roots(&self) -> rusqlite::Result<Vec<Root>> {
+        let conn = self.connection.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, path, enabled, added_at FROM roots ORDER BY added_at ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(Root {
+                id: r.get(0)?,
+                path: r.get(1)?,
+                enabled: r.get::<_, i64>(2)? != 0,
+                added_at: r.get(3)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+    }
+
+    /// Insert a new root. Returns the populated Root row. The path
+    /// uniqueness constraint surfaces as an `Err` to the caller when
+    /// the user adds the same path twice.
+    pub fn add_root(&self, path: String) -> rusqlite::Result<Root> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let conn = self.connection.lock().unwrap();
+        conn.execute(
+            "INSERT INTO roots (path, enabled, added_at) VALUES (?1, 1, ?2)",
+            params![path, now],
+        )?;
+        let id = conn.last_insert_rowid();
+        Ok(Root::new(id, path, true, now))
+    }
+
+    /// Remove a root. The ON DELETE CASCADE on images.root_id wipes
+    /// every image that came from this root.
+    pub fn remove_root(&self, id: ID) -> rusqlite::Result<()> {
         self.connection
             .lock()
             .unwrap()
-            .execute("INSERT OR IGNORE INTO images (path) VALUES (?1)", [path])?;
+            .execute("DELETE FROM roots WHERE id = ?1", [id])?;
         Ok(())
+    }
+
+    /// Toggle a root's enabled flag. Disabled roots keep their image
+    /// rows on disk (re-enabling is instant — no re-index) but the
+    /// grid filter excludes them.
+    pub fn set_root_enabled(&self, id: ID, enabled: bool) -> rusqlite::Result<()> {
+        self.connection.lock().unwrap().execute(
+            "UPDATE roots SET enabled = ?1 WHERE id = ?2",
+            params![enabled as i64, id],
+        )?;
+        Ok(())
+    }
+
+    /// One-shot migration helper — used by the lib.rs setup callback
+    /// when an old single-root setup (settings.json::scan_root) needs to
+    /// be folded into the new roots table. Returns the new Root, or
+    /// None if a root with that path already exists. Also backfills any
+    /// images.root_id NULLs that fall under this path.
+    pub fn migrate_legacy_scan_root(&self, path: String) -> rusqlite::Result<Option<Root>> {
+        // Idempotent: if a row already exists, leave it alone.
+        let conn = self.connection.lock().unwrap();
+        let existing: rusqlite::Result<i64> = conn.query_row(
+            "SELECT id FROM roots WHERE path = ?1",
+            [&path],
+            |r| r.get(0),
+        );
+        if existing.is_ok() {
+            return Ok(None);
+        }
+        drop(conn);
+
+        let root = self.add_root(path.clone())?;
+
+        // Backfill: every NULL-root_id row whose path starts with this
+        // root path now belongs to this root.
+        let conn = self.connection.lock().unwrap();
+        let prefix_pattern = format!("{}%", path);
+        let updated = conn.execute(
+            "UPDATE images SET root_id = ?1
+             WHERE root_id IS NULL AND path LIKE ?2",
+            params![root.id, prefix_pattern],
+        )?;
+        info!("legacy scan_root migration: backfilled {} image rows", updated);
+        Ok(Some(root))
     }
 
     /// Clear every image and image-tag row, leaving the schema intact and
@@ -484,7 +733,14 @@ impl ImageDatabase {
         Ok(None)
     }
 
-    /// Get images with their thumbnail info included
+    /// Get images with their thumbnail info included.
+    ///
+    /// Filters out:
+    /// - rows whose root is disabled (multi-folder, Phase 6)
+    /// - rows marked orphaned (file removed from disk, Phase 7)
+    ///
+    /// Rows with NULL root_id are kept — those are legacy un-migrated
+    /// rows from before multi-folder support and should still display.
     pub fn get_images_with_thumbnails(
         &self,
         filter_tag_ids: Vec<ID>,
@@ -492,7 +748,17 @@ impl ImageDatabase {
     ) -> rusqlite::Result<Vec<ImageData>> {
         let conn = self.connection.lock().unwrap();
 
-        let sql = if filter_tag_ids.len() > 0 {
+        // Common WHERE for root-and-orphan filtering. Used both with
+        // and without tag-filter SQL.
+        let root_filter = "(
+            images.orphaned = 0
+            AND (
+                images.root_id IS NULL
+                OR images.root_id IN (SELECT id FROM roots WHERE enabled = 1)
+            )
+        )";
+
+        let sql = if !filter_tag_ids.is_empty() {
             let placeholders = vec!["?"; filter_tag_ids.len()].join(", ");
             format!(
                 "SELECT images.id AS img_id, images.path AS img_path,
@@ -501,22 +767,24 @@ impl ImageDatabase {
                 FROM images
                 LEFT JOIN images_tags ON images.id = images_tags.image_id
                 LEFT JOIN tags ON tags.id = images_tags.tag_id
-                WHERE EXISTS (
+                WHERE {root_filter}
+                AND EXISTS (
                     SELECT 1
                     FROM images_tags it2
                     WHERE it2.image_id = images.id
-                    AND it2.tag_id IN ({})
-                );",
-                placeholders
+                    AND it2.tag_id IN ({placeholders})
+                );"
             )
         } else {
-            "SELECT images.id AS img_id, images.path AS img_path,
-            images.thumbnail_path, images.width, images.height,
-            tags.id AS tag_id, tags.name AS tag_name, tags.color AS tag_color
-            FROM images
-            LEFT JOIN images_tags ON images.id = images_tags.image_id
-            LEFT JOIN tags ON tags.id = images_tags.tag_id;"
-                .to_string()
+            format!(
+                "SELECT images.id AS img_id, images.path AS img_path,
+                images.thumbnail_path, images.width, images.height,
+                tags.id AS tag_id, tags.name AS tag_name, tags.color AS tag_color
+                FROM images
+                LEFT JOIN images_tags ON images.id = images_tags.image_id
+                LEFT JOIN tags ON tags.id = images_tags.tag_id
+                WHERE {root_filter};"
+            )
         };
         let mut stmt = conn.prepare(&sql)?;
 
@@ -578,7 +846,7 @@ mod tests {
         db.initialize().unwrap();
 
         let test_image_path = "/path/to/image.jpg";
-        db.add_image(test_image_path.to_owned()).unwrap();
+        db.add_image(test_image_path.to_owned(), None).unwrap();
 
         let images = db.get_images(vec![], "".to_string()).unwrap();
         assert_eq!(images.len(), 1);
@@ -590,8 +858,8 @@ mod tests {
         db.initialize().unwrap();
 
         let test_image_path = "/path/to/image.jpg";
-        db.add_image(test_image_path.to_owned()).unwrap();
-        db.add_image(test_image_path.to_owned()).unwrap(); // Attempt to add duplicate
+        db.add_image(test_image_path.to_owned(), None).unwrap();
+        db.add_image(test_image_path.to_owned(), None).unwrap();
 
         let images = db.get_images(vec![], "".to_string()).unwrap();
         assert_eq!(images.len(), 1); // Should still be only one image
@@ -613,7 +881,7 @@ mod tests {
 
         // Add an image first
         let test_image_path = "/path/to/image.jpg";
-        db.add_image(test_image_path.to_owned()).unwrap();
+        db.add_image(test_image_path.to_owned(), None).unwrap();
 
         // Get the image ID
         let image_id = db.get_image_id_by_path(test_image_path).unwrap();
@@ -653,7 +921,7 @@ mod tests {
         db.initialize().unwrap();
 
         let test_image_path = "/path/to/test_image.png";
-        db.add_image(test_image_path.to_owned()).unwrap();
+        db.add_image(test_image_path.to_owned(), None).unwrap();
         let image_id = db.get_image_id_by_path(test_image_path).unwrap();
 
         // Create a realistic embedding (normalized vector)
@@ -692,7 +960,7 @@ mod tests {
         db.initialize().unwrap();
 
         let test_image_path = "/path/to/image.jpg";
-        db.add_image(test_image_path.to_owned()).unwrap();
+        db.add_image(test_image_path.to_owned(), None).unwrap();
         let image_id = db.get_image_id_by_path(test_image_path).unwrap();
 
         // Store first embedding
@@ -748,7 +1016,7 @@ mod tests {
         db.initialize().unwrap();
 
         let test_image_path = "/path/to/image.jpg";
-        db.add_image(test_image_path.to_owned()).unwrap();
+        db.add_image(test_image_path.to_owned(), None).unwrap();
         let image_id = db.get_image_id_by_path(test_image_path).unwrap();
 
         // Store empty embedding
@@ -768,7 +1036,7 @@ mod tests {
         db.initialize().unwrap();
 
         let test_image_path = "/path/to/image.jpg";
-        db.add_image(test_image_path.to_owned()).unwrap();
+        db.add_image(test_image_path.to_owned(), None).unwrap();
         let image_id = db.get_image_id_by_path(test_image_path).unwrap();
 
         // Create a large embedding (larger than typical 512)
@@ -788,7 +1056,7 @@ mod tests {
         db.initialize().unwrap();
 
         let test_image_path = "/path/to/image.jpg";
-        db.add_image(test_image_path.to_owned()).unwrap();
+        db.add_image(test_image_path.to_owned(), None).unwrap();
         let image_id = db.get_image_id_by_path(test_image_path).unwrap();
 
         // Try to get embedding before it's set (should be NULL in DB)

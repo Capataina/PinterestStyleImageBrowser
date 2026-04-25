@@ -7,6 +7,7 @@ use crate::{
     db::{ImageDatabase, ID},
     image_struct::ImageData,
     indexing::IndexingState,
+    root_struct::Root,
     similarity_and_semantic_search::cosine_similarity::CosineIndex,
     similarity_and_semantic_search::encoder_text::TextEncoder,
     tag_struct::Tag,
@@ -36,10 +37,12 @@ pub mod image_struct;
 pub mod indexing;
 pub mod model_download;
 pub mod paths;
+pub mod root_struct;
 pub mod settings;
 pub mod similarity_and_semantic_search;
 pub mod tag_struct;
 pub mod thumbnail;
+pub mod watcher;
 
 pub struct CosineIndexState {
     /// Wrapped in Arc<Mutex<...>> rather than plain Mutex<...> so the
@@ -91,24 +94,12 @@ fn get_scan_root() -> Result<Option<String>, String> {
         .map(|p| p.to_string_lossy().into_owned()))
 }
 
-/// Set the scan root and trigger a live re-index without restart.
+/// Replace every configured root with a single new one and trigger a
+/// live re-index. This is what the "Choose folder" button calls — the
+/// "I just want one folder, replace what's there" UX. For multi-folder
+/// management see `add_root` / `remove_root` / `set_root_enabled`.
 ///
-/// Steps:
-/// 1. Validate the path exists and is a directory.
-/// 2. Persist to settings.json. If this fails we don't proceed — the
-///    user shouldn't end up in a half-state with a wiped DB and no
-///    saved scan root.
-/// 3. Wipe image rows (the tag catalogue is preserved — tag names are
-///    user knowledge that should survive moving libraries).
-/// 4. Clear the in-memory cosine cache so previous-root embeddings
-///    don't leak into similarity queries.
-/// 5. Spawn the background indexing pipeline. If a previous indexing
-///    run is still in flight, return Err so the user can wait or
-///    cancel; the frontend surfaces this cleanly.
-///
-/// The tag catalogue is intentionally preserved across root switches,
-/// because tag names are user knowledge (e.g. "favourite") that should
-/// survive moving libraries.
+/// The tag catalogue is preserved across root replacement.
 #[tauri::command]
 fn set_scan_root(
     app: AppHandle,
@@ -122,14 +113,17 @@ fn set_scan_root(
         return Err(format!("Not a directory: {path}"));
     }
 
-    let mut user_settings = settings::Settings::load();
-    user_settings.scan_root = Some(scan_root);
-    user_settings
-        .save()
-        .map_err(|e| format!("Failed to save settings.json: {e}"))?;
-
+    // Remove existing roots (CASCADE deletes their images), wipe any
+    // orphan rows (NULL root_id from older DBs), then add the new one.
+    let existing = db.list_roots().map_err(|e| e.to_string())?;
+    for r in existing {
+        db.remove_root(r.id).map_err(|e| e.to_string())?;
+    }
     db.wipe_images_for_new_root()
-        .map_err(|e| format!("Failed to wipe images table: {e}"))?;
+        .map_err(|e| format!("Failed to wipe legacy NULL-root_id rows: {e}"))?;
+
+    db.add_root(path.clone())
+        .map_err(|e| format!("Failed to add root: {e}"))?;
 
     if let Ok(mut idx) = cosine_state.index.lock() {
         idx.cached_images.clear();
@@ -143,7 +137,81 @@ fn set_scan_root(
     )
     .map_err(|e| e.to_string())?;
 
-    info!("set_scan_root saved + wiped + indexing thread spawned.");
+    info!("set_scan_root replaced roots + spawned indexing.");
+    Ok(())
+}
+
+/// Multi-folder management — list configured roots.
+#[tauri::command]
+fn list_roots(db: State<'_, ImageDatabase>) -> Result<Vec<Root>, String> {
+    db.list_roots().map_err(|e| e.to_string())
+}
+
+/// Add a root and trigger an incremental re-index. Returns the new
+/// Root row so the UI can show it immediately without round-tripping
+/// list_roots.
+#[tauri::command]
+fn add_root(
+    app: AppHandle,
+    db: State<'_, ImageDatabase>,
+    cosine_state: State<'_, CosineIndexState>,
+    indexing_state: State<'_, Arc<IndexingState>>,
+    path: String,
+) -> Result<Root, String> {
+    let scan_root = PathBuf::from(&path);
+    if !scan_root.is_dir() {
+        return Err(format!("Not a directory: {path}"));
+    }
+    let root = db
+        .add_root(path)
+        .map_err(|e| format!("Failed to add root: {e}"))?;
+
+    indexing::try_spawn_pipeline(
+        app.clone(),
+        indexing_state.inner().clone(),
+        cosine_state.db_path.clone(),
+        cosine_state.index.clone(),
+    )
+    .map_err(|e| e.to_string())?;
+
+    info!("add_root persisted ({}) and spawned re-index.", root.path);
+    Ok(root)
+}
+
+/// Remove a root. The CASCADE on images.root_id wipes its images;
+/// surviving image rows from other roots are unaffected.
+#[tauri::command]
+fn remove_root(
+    db: State<'_, ImageDatabase>,
+    cosine_state: State<'_, CosineIndexState>,
+    id: i64,
+) -> Result<(), String> {
+    db.remove_root(id).map_err(|e| e.to_string())?;
+    // Cosine cache contains entries from the removed root; cheapest
+    // way to clean is to drop the whole cache and let next-query
+    // populate from the remaining DB rows.
+    if let Ok(mut idx) = cosine_state.index.lock() {
+        idx.cached_images.clear();
+    }
+    info!("remove_root removed root id {}", id);
+    Ok(())
+}
+
+/// Toggle a root's enabled flag. No re-index needed — the grid query
+/// filters by enabled status, so the toggle is instant.
+#[tauri::command]
+fn set_root_enabled(
+    db: State<'_, ImageDatabase>,
+    cosine_state: State<'_, CosineIndexState>,
+    id: i64,
+    enabled: bool,
+) -> Result<(), String> {
+    db.set_root_enabled(id, enabled).map_err(|e| e.to_string())?;
+    // Cosine cache may include images from the toggled root; clear so
+    // the next similarity query rebuilds with the right active set.
+    if let Ok(mut idx) = cosine_state.index.lock() {
+        idx.cached_images.clear();
+    }
     Ok(())
 }
 
@@ -690,6 +758,13 @@ pub fn run(db: ImageDatabase, db_path: String) {
     // hand a clone to the indexing thread.
     let indexing_state = Arc::new(IndexingState::new());
 
+    // Filesystem watcher handle is stashed here so it lives for the
+    // duration of the app process. Dropping the handle cancels every
+    // watch; we wrap in Mutex<Option<...>> so the setup callback can
+    // initialise it (or replace it later if root list changes).
+    let watcher_state: Arc<Mutex<Option<watcher::WatcherHandle>>> =
+        Arc::new(Mutex::new(None));
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -697,28 +772,84 @@ pub fn run(db: ImageDatabase, db_path: String) {
         .manage(cosine_state)
         .manage(text_encoder_state)
         .manage(indexing_state.clone())
+        .manage(watcher_state.clone())
         .setup({
             let db_path = db_path.clone();
             let cosine_index = cosine_index.clone();
             let indexing_state = indexing_state.clone();
+            let watcher_state = watcher_state.clone();
             move |app| {
+                // One-shot legacy migration: if the user upgraded from
+                // a single-folder build, settings.json has a `scan_root`
+                // field but the new `roots` table is empty. Convert it
+                // here so the indexing pipeline (which only reads roots
+                // table) sees the user's existing folder.
+                {
+                    let user_settings = settings::Settings::load();
+                    if let Some(legacy_path) = user_settings.scan_root.clone() {
+                        if let Ok(temp_db) = ImageDatabase::new(&db_path) {
+                            let _ = temp_db.initialize();
+                            match temp_db.migrate_legacy_scan_root(
+                                legacy_path.to_string_lossy().into_owned(),
+                            ) {
+                                Ok(Some(root)) => {
+                                    info!(
+                                        "migrated legacy scan_root -> roots[{}] ({})",
+                                        root.id, root.path
+                                    );
+                                    // Clear the legacy field so we don't
+                                    // re-migrate on every launch.
+                                    let mut s = user_settings.clone();
+                                    s.scan_root = None;
+                                    let _ = s.save();
+                                }
+                                Ok(None) => {} // already migrated previously
+                                Err(e) => warn!("legacy migration failed: {e}"),
+                            }
+                        }
+                    }
+                }
+
                 // Auto-spawn the indexing pipeline at app startup. This
                 // refreshes the catalog whenever the user reopens the
-                // app — picks up any new images they added since last
-                // launch, regenerates missing thumbnails, encodes any
-                // new images.
-                //
-                // No-op when no scan_root is configured (Phase::Ready
-                // fires immediately with zero counts so the UI knows
-                // the pipeline ran).
+                // app — picks up new images, regenerates missing
+                // thumbnails, encodes anything missing.
                 let app_handle = app.handle().clone();
                 if let Err(e) = indexing::try_spawn_pipeline(
-                    app_handle,
-                    indexing_state,
-                    db_path,
-                    cosine_index,
+                    app_handle.clone(),
+                    indexing_state.clone(),
+                    db_path.clone(),
+                    cosine_index.clone(),
                 ) {
                     error!("could not spawn indexing pipeline: {e}");
+                }
+
+                // Start the filesystem watcher. Listens to every
+                // currently-enabled root and triggers a debounced
+                // rescan when files change on disk.
+                {
+                    let temp_db = ImageDatabase::new(&db_path);
+                    let watch_paths: Vec<std::path::PathBuf> = match temp_db {
+                        Ok(d) => d
+                            .list_roots()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|r| r.enabled)
+                            .map(|r| std::path::PathBuf::from(r.path))
+                            .filter(|p| p.exists())
+                            .collect(),
+                        Err(_) => vec![],
+                    };
+                    let handle = watcher::start(
+                        app_handle,
+                        watch_paths,
+                        db_path,
+                        indexing_state,
+                        cosine_index,
+                    );
+                    if let Ok(mut slot) = watcher_state.lock() {
+                        *slot = handle;
+                    }
                 }
                 Ok(())
             }
@@ -734,7 +865,11 @@ pub fn run(db: ImageDatabase, db_path: String) {
             get_tiered_similar_images,
             semantic_search,
             get_scan_root,
-            set_scan_root
+            set_scan_root,
+            list_roots,
+            add_root,
+            remove_root,
+            set_root_enabled,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

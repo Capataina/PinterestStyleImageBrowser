@@ -9,6 +9,8 @@ export type ImageData = {
   width?: number;
   /** Original image height in pixels (from backend) */
   height?: number;
+  /** Free-text annotation (Phase 11) */
+  notes?: string | null;
 };
 
 export type ImageItem = {
@@ -21,6 +23,8 @@ export type ImageItem = {
   height: number;
   name: string;
   tags: Tag[];
+  /** Free-text annotation (Phase 11) */
+  notes?: string | null;
 };
 
 export type Tag = {
@@ -40,4 +44,13 @@ export type SimilarImageItem = {
   height: number;
   score: number;
   name?: string;
+};
+
+/** A configured scan root (multi-folder support, Phase 6). */
+export type Root = {
+  id: number;
+  path: string;
+  enabled: boolean;
+  /** Unix epoch seconds */
+  added_at: number;
 };
