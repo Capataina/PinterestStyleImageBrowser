@@ -1143,4 +1143,455 @@ mod tests {
         // This should fail because the embedding is NULL
         assert!(result.is_err(), "Should fail to retrieve NULL embedding");
     }
+
+    // ============================================================
+    //  Phase 6: roots CRUD + multi-folder lifecycle
+    // ============================================================
+
+    fn fresh_db() -> ImageDatabase {
+        let db = ImageDatabase::new(":memory:").unwrap();
+        db.initialize().unwrap();
+        db
+    }
+
+    #[test]
+    fn add_root_creates_row_with_enabled_true() {
+        let db = fresh_db();
+        let r = db.add_root("/tmp/photos".into()).unwrap();
+        assert_eq!(r.path, "/tmp/photos");
+        assert!(r.enabled);
+        assert!(r.added_at > 0);
+    }
+
+    #[test]
+    fn add_root_rejects_duplicate_path() {
+        let db = fresh_db();
+        db.add_root("/tmp/photos".into()).unwrap();
+        // Path UNIQUE constraint should error on second insert.
+        let result = db.add_root("/tmp/photos".into());
+        assert!(
+            result.is_err(),
+            "second add_root with the same path must error"
+        );
+    }
+
+    #[test]
+    fn list_roots_orders_by_added_at_ascending() {
+        let db = fresh_db();
+        let a = db.add_root("/a".into()).unwrap();
+        // Sleep 1s so added_at differs (unix-second granularity).
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let b = db.add_root("/b".into()).unwrap();
+        let listed = db.list_roots().unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].id, a.id);
+        assert_eq!(listed[1].id, b.id);
+    }
+
+    #[test]
+    fn remove_root_cascades_to_images() {
+        let db = fresh_db();
+        let r = db.add_root("/x".into()).unwrap();
+        db.add_image("/x/a.jpg".into(), Some(r.id)).unwrap();
+        db.add_image("/x/b.jpg".into(), Some(r.id)).unwrap();
+        // Sanity: rows are there
+        let imgs = db.get_all_images().unwrap();
+        assert_eq!(imgs.len(), 2);
+
+        db.remove_root(r.id).unwrap();
+        let after = db.get_all_images().unwrap();
+        assert_eq!(after.len(), 0, "CASCADE should have wiped image rows");
+        let roots = db.list_roots().unwrap();
+        assert!(roots.is_empty());
+    }
+
+    #[test]
+    fn remove_root_does_not_affect_other_roots_images() {
+        let db = fresh_db();
+        let a = db.add_root("/a".into()).unwrap();
+        let b = db.add_root("/b".into()).unwrap();
+        db.add_image("/a/x.jpg".into(), Some(a.id)).unwrap();
+        db.add_image("/b/y.jpg".into(), Some(b.id)).unwrap();
+        db.remove_root(a.id).unwrap();
+        let after = db.get_all_images().unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].path, "/b/y.jpg");
+    }
+
+    #[test]
+    fn set_root_enabled_round_trips() {
+        let db = fresh_db();
+        let r = db.add_root("/r".into()).unwrap();
+        assert!(r.enabled);
+        db.set_root_enabled(r.id, false).unwrap();
+        let listed = db.list_roots().unwrap();
+        assert!(!listed[0].enabled);
+        db.set_root_enabled(r.id, true).unwrap();
+        let listed = db.list_roots().unwrap();
+        assert!(listed[0].enabled);
+    }
+
+    #[test]
+    fn migrate_legacy_scan_root_inserts_and_backfills() {
+        let db = fresh_db();
+        // Simulate old single-folder state: image rows with NULL root_id
+        // whose path falls under a legacy scan_root.
+        db.add_image("/legacy/a.jpg".into(), None).unwrap();
+        db.add_image("/legacy/sub/b.jpg".into(), None).unwrap();
+        // And one image NOT under the legacy root — should NOT be backfilled.
+        db.add_image("/elsewhere/c.jpg".into(), None).unwrap();
+
+        let migrated = db.migrate_legacy_scan_root("/legacy".into()).unwrap();
+        assert!(migrated.is_some());
+        let root = migrated.unwrap();
+        assert_eq!(root.path, "/legacy");
+
+        // Backfill verification: the two /legacy rows should now point at
+        // the new root, the /elsewhere one should not.
+        let conn = db.connection.lock().unwrap();
+        let count_for_root: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM images WHERE root_id = ?1",
+                [root.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count_for_root, 2);
+        let count_orphan: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM images WHERE root_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count_orphan, 1);
+    }
+
+    #[test]
+    fn migrate_legacy_scan_root_is_idempotent() {
+        let db = fresh_db();
+        let first = db.migrate_legacy_scan_root("/legacy".into()).unwrap();
+        assert!(first.is_some());
+        // Second call should detect an existing row and return None
+        // rather than create a duplicate or error.
+        let second = db.migrate_legacy_scan_root("/legacy".into()).unwrap();
+        assert!(second.is_none());
+        let roots = db.list_roots().unwrap();
+        assert_eq!(roots.len(), 1);
+    }
+
+    // ============================================================
+    //  Phase 6: get_images_with_thumbnails — multi-folder filter
+    // ============================================================
+
+    #[test]
+    fn grid_query_excludes_disabled_root_images() {
+        let db = fresh_db();
+        let a = db.add_root("/a".into()).unwrap();
+        let b = db.add_root("/b".into()).unwrap();
+        db.add_image("/a/x.jpg".into(), Some(a.id)).unwrap();
+        db.add_image("/b/y.jpg".into(), Some(b.id)).unwrap();
+
+        // Both enabled → both in the grid.
+        let imgs = db
+            .get_images_with_thumbnails(vec![], "".into(), false)
+            .unwrap();
+        assert_eq!(imgs.len(), 2);
+
+        // Disable root b.
+        db.set_root_enabled(b.id, false).unwrap();
+        let imgs = db
+            .get_images_with_thumbnails(vec![], "".into(), false)
+            .unwrap();
+        assert_eq!(imgs.len(), 1);
+        assert_eq!(imgs[0].path, "/a/x.jpg");
+    }
+
+    #[test]
+    fn grid_query_includes_null_root_id_images() {
+        let db = fresh_db();
+        // Legacy un-migrated rows (root_id = NULL) should still appear.
+        db.add_image("/legacy.jpg".into(), None).unwrap();
+        let imgs = db
+            .get_images_with_thumbnails(vec![], "".into(), false)
+            .unwrap();
+        assert_eq!(imgs.len(), 1);
+    }
+
+    // ============================================================
+    //  Phase 6: get_images_with_thumbnails — AND vs OR tag filter
+    // ============================================================
+
+    fn setup_tagged_images(db: &ImageDatabase) -> (i64, i64, i64, i64) {
+        let r = db.add_root("/r".into()).unwrap();
+        // 3 images: A has tag-1, B has tag-2, C has both.
+        db.add_image("/r/a.jpg".into(), Some(r.id)).unwrap();
+        db.add_image("/r/b.jpg".into(), Some(r.id)).unwrap();
+        db.add_image("/r/c.jpg".into(), Some(r.id)).unwrap();
+        let imgs = db.get_all_images().unwrap();
+        let id_a = imgs.iter().find(|i| i.path == "/r/a.jpg").unwrap().id;
+        let id_b = imgs.iter().find(|i| i.path == "/r/b.jpg").unwrap().id;
+        let id_c = imgs.iter().find(|i| i.path == "/r/c.jpg").unwrap().id;
+        let t1 = db.create_tag("one".into(), "#fff".into()).unwrap().id;
+        let t2 = db.create_tag("two".into(), "#000".into()).unwrap().id;
+        db.add_tag_to_image(id_a, t1).unwrap();
+        db.add_tag_to_image(id_b, t2).unwrap();
+        db.add_tag_to_image(id_c, t1).unwrap();
+        db.add_tag_to_image(id_c, t2).unwrap();
+        (id_a, id_b, id_c, t1)
+    }
+
+    #[test]
+    fn or_filter_matches_any_selected_tag() {
+        let db = fresh_db();
+        let (id_a, id_b, id_c, t1) = setup_tagged_images(&db);
+        let _ = id_b;
+
+        // Filter by t1 alone — should return A and C (both have t1).
+        let imgs = db
+            .get_images_with_thumbnails(vec![t1], "".into(), false)
+            .unwrap();
+        let ids: Vec<i64> = imgs.iter().map(|i| i.id).collect();
+        assert!(ids.contains(&id_a));
+        assert!(ids.contains(&id_c));
+        assert_eq!(ids.len(), 2);
+    }
+
+    #[test]
+    fn and_filter_requires_all_selected_tags() {
+        let db = fresh_db();
+        let (id_a, id_b, id_c, t1) = setup_tagged_images(&db);
+        let _ = id_a;
+        let _ = id_b;
+        // Re-fetch t2 since setup returns only t1
+        let tags = db.get_tags().unwrap();
+        let t2 = tags.iter().find(|t| t.name == "two").unwrap().id;
+
+        // OR semantic: t1 + t2 → A, B, C all match.
+        let or_match = db
+            .get_images_with_thumbnails(vec![t1, t2], "".into(), false)
+            .unwrap();
+        assert_eq!(or_match.len(), 3);
+
+        // AND semantic: only C has BOTH tags.
+        let and_match = db
+            .get_images_with_thumbnails(vec![t1, t2], "".into(), true)
+            .unwrap();
+        assert_eq!(and_match.len(), 1);
+        assert_eq!(and_match[0].id, id_c);
+    }
+
+    // ============================================================
+    //  Phase 7: orphan detection
+    // ============================================================
+
+    #[test]
+    fn mark_orphaned_marks_missing_paths() {
+        let db = fresh_db();
+        let r = db.add_root("/r".into()).unwrap();
+        db.add_image("/r/keep.jpg".into(), Some(r.id)).unwrap();
+        db.add_image("/r/lost.jpg".into(), Some(r.id)).unwrap();
+
+        // Only "keep" is in the alive set.
+        let alive = vec!["/r/keep.jpg".to_string()];
+        let n = db.mark_orphaned(r.id, &alive).unwrap();
+        assert_eq!(n, 1, "exactly one image should have been orphaned");
+
+        let imgs = db
+            .get_images_with_thumbnails(vec![], "".into(), false)
+            .unwrap();
+        assert_eq!(imgs.len(), 1, "orphaned row should be filtered out");
+        assert_eq!(imgs[0].path, "/r/keep.jpg");
+    }
+
+    #[test]
+    fn mark_orphaned_unmarks_returned_files() {
+        let db = fresh_db();
+        let r = db.add_root("/r".into()).unwrap();
+        db.add_image("/r/file.jpg".into(), Some(r.id)).unwrap();
+        // First scan: file is alive.
+        db.mark_orphaned(r.id, &["/r/file.jpg".into()]).unwrap();
+        // Second scan: file disappeared.
+        db.mark_orphaned(r.id, &[]).unwrap();
+        let visible = db
+            .get_images_with_thumbnails(vec![], "".into(), false)
+            .unwrap();
+        assert!(visible.is_empty());
+        // Third scan: file returned.
+        db.mark_orphaned(r.id, &["/r/file.jpg".into()]).unwrap();
+        let visible = db
+            .get_images_with_thumbnails(vec![], "".into(), false)
+            .unwrap();
+        assert_eq!(visible.len(), 1);
+    }
+
+    #[test]
+    fn mark_orphaned_empty_alive_set_orphans_everything_in_root() {
+        let db = fresh_db();
+        let r = db.add_root("/r".into()).unwrap();
+        for i in 0..3 {
+            db.add_image(format!("/r/{i}.jpg"), Some(r.id)).unwrap();
+        }
+        let n = db.mark_orphaned(r.id, &[]).unwrap();
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn mark_orphaned_does_not_affect_other_roots() {
+        let db = fresh_db();
+        let a = db.add_root("/a".into()).unwrap();
+        let b = db.add_root("/b".into()).unwrap();
+        db.add_image("/a/1.jpg".into(), Some(a.id)).unwrap();
+        db.add_image("/b/1.jpg".into(), Some(b.id)).unwrap();
+
+        // Empty alive set for root a should orphan a's images, not b's.
+        db.mark_orphaned(a.id, &[]).unwrap();
+        let visible = db
+            .get_images_with_thumbnails(vec![], "".into(), false)
+            .unwrap();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].path, "/b/1.jpg");
+    }
+
+    #[test]
+    fn mark_orphaned_chunks_handle_large_libraries() {
+        // The chunked-IN logic kicks in above 500 ids. Stress with 1200
+        // to exercise the chunk boundary.
+        let db = fresh_db();
+        let r = db.add_root("/big".into()).unwrap();
+        for i in 0..1200 {
+            db.add_image(format!("/big/{i}.jpg"), Some(r.id)).unwrap();
+        }
+        // Empty alive set => all 1200 orphan.
+        let n = db.mark_orphaned(r.id, &[]).unwrap();
+        assert_eq!(n, 1200);
+    }
+
+    // ============================================================
+    //  Phase 11: notes
+    // ============================================================
+
+    #[test]
+    fn notes_round_trip() {
+        let db = fresh_db();
+        db.add_image("/img.jpg".into(), None).unwrap();
+        let id = db.get_image_id_by_path("/img.jpg").unwrap();
+        // Initially NULL.
+        assert_eq!(db.get_image_notes(id).unwrap(), None);
+
+        db.set_image_notes(id, "a personal note").unwrap();
+        assert_eq!(
+            db.get_image_notes(id).unwrap(),
+            Some("a personal note".to_string())
+        );
+
+        // Setting empty / whitespace should clear the field.
+        db.set_image_notes(id, "   ").unwrap();
+        assert_eq!(db.get_image_notes(id).unwrap(), None);
+    }
+
+    #[test]
+    fn notes_get_returns_none_when_unset() {
+        let db = fresh_db();
+        db.add_image("/img.jpg".into(), None).unwrap();
+        let id = db.get_image_id_by_path("/img.jpg").unwrap();
+        assert!(db.get_image_notes(id).unwrap().is_none());
+    }
+
+    #[test]
+    fn notes_persist_across_reads() {
+        let db = fresh_db();
+        db.add_image("/img.jpg".into(), None).unwrap();
+        let id = db.get_image_id_by_path("/img.jpg").unwrap();
+        db.set_image_notes(id, "first").unwrap();
+        // Second read should still see the value.
+        for _ in 0..5 {
+            assert_eq!(
+                db.get_image_notes(id).unwrap(),
+                Some("first".to_string())
+            );
+        }
+    }
+
+    // ============================================================
+    //  Phase 5: get_all_embeddings (N+1 fix)
+    // ============================================================
+
+    #[test]
+    fn get_all_embeddings_returns_only_populated_rows() {
+        let db = fresh_db();
+        db.add_image("/with.jpg".into(), None).unwrap();
+        db.add_image("/without.jpg".into(), None).unwrap();
+        let with_id = db.get_image_id_by_path("/with.jpg").unwrap();
+
+        // Embedding only on the first row.
+        let emb: Vec<f32> = (0..512).map(|i| i as f32).collect();
+        db.update_image_embedding(with_id, emb.clone()).unwrap();
+
+        let rows = db.get_all_embeddings().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, with_id);
+        assert_eq!(rows[0].1, "/with.jpg");
+        assert_eq!(rows[0].2.len(), 512);
+        assert!(
+            (rows[0].2[0] - 0.0).abs() < 1e-6
+                && (rows[0].2[511] - 511.0).abs() < 1e-6
+        );
+    }
+
+    #[test]
+    fn get_all_embeddings_is_empty_when_nothing_encoded() {
+        let db = fresh_db();
+        db.add_image("/a.jpg".into(), None).unwrap();
+        let rows = db.get_all_embeddings().unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn get_root_id_by_path_returns_some_when_known() {
+        let db = fresh_db();
+        let r = db.add_root("/r".into()).unwrap();
+        db.add_image("/r/a.jpg".into(), Some(r.id)).unwrap();
+        assert_eq!(db.get_root_id_by_path("/r/a.jpg"), Some(r.id));
+    }
+
+    #[test]
+    fn get_root_id_by_path_returns_none_when_unknown_or_null() {
+        let db = fresh_db();
+        // Unknown path
+        assert_eq!(db.get_root_id_by_path("/missing.jpg"), None);
+        // Known but root_id is NULL
+        db.add_image("/null.jpg".into(), None).unwrap();
+        assert_eq!(db.get_root_id_by_path("/null.jpg"), None);
+    }
+
+    // ============================================================
+    //  Migration: schema upgrades are idempotent
+    // ============================================================
+
+    #[test]
+    fn initialize_is_idempotent() {
+        // Running initialize() twice should not error or duplicate
+        // schema. Real-world callers may call it on every launch.
+        let db = ImageDatabase::new(":memory:").unwrap();
+        db.initialize().unwrap();
+        db.initialize().unwrap();
+        // And the basic flow still works.
+        db.add_image("/x.jpg".into(), None).unwrap();
+        let imgs = db.get_all_images().unwrap();
+        assert_eq!(imgs.len(), 1);
+    }
+
+    #[test]
+    fn wipe_images_for_new_root_preserves_tags() {
+        let db = fresh_db();
+        db.add_image("/x.jpg".into(), None).unwrap();
+        db.create_tag("keepme".into(), "#fff".into()).unwrap();
+        db.wipe_images_for_new_root().unwrap();
+        let imgs = db.get_all_images().unwrap();
+        assert!(imgs.is_empty());
+        let tags = db.get_tags().unwrap();
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].name, "keepme");
+    }
 }

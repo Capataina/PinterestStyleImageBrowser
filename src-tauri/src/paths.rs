@@ -4,18 +4,19 @@
 //! the user prefers project-local visibility over the standard
 //! platform-convention paths. Layout:
 //!
-//!     <repo>/Library/
-//!     ├── images.db
-//!     ├── settings.json
-//!     ├── cosine_cache.bin
-//!     ├── models/
-//!     │   ├── model_image.onnx
-//!     │   ├── model_text.onnx
-//!     │   └── tokenizer.json
-//!     └── thumbnails/
-//!         ├── root_1/thumb_42.jpg
-//!         ├── root_2/thumb_99.jpg
-//!         └── ...
+//! ```text
+//! <repo>/Library/
+//!   images.db
+//!   settings.json
+//!   cosine_cache.bin
+//!   models/
+//!     model_image.onnx
+//!     model_text.onnx
+//!     tokenizer.json
+//!   thumbnails/
+//!     root_1/thumb_42.jpg
+//!     root_2/thumb_99.jpg
+//! ```
 //!
 //! Library/ is gitignored so user state never lands in commits.
 //!
@@ -171,6 +172,28 @@ mod tests {
         assert!(thumbnails_dir().starts_with(&root));
         assert!(models_dir().starts_with(&root));
         assert!(settings_path().starts_with(&root));
+    }
+
+    #[test]
+    fn thumbnails_dir_for_root_creates_subfolder() {
+        // Phase 9 reorganisation — each root gets its own thumbnail
+        // subfolder so remove_root can rm -rf it cleanly.
+        let dir = thumbnails_dir_for_root(42);
+        assert!(dir.exists(), "thumbnails_dir_for_root should create the dir");
+        assert_eq!(
+            dir.file_name().and_then(|s| s.to_str()),
+            Some("root_42")
+        );
+    }
+
+    #[test]
+    fn cosine_cache_path_is_under_app_data_dir() {
+        let cache = cosine_cache_path();
+        assert!(cache.starts_with(app_data_dir()));
+        assert_eq!(
+            cache.file_name().and_then(|s| s.to_str()),
+            Some("cosine_cache.bin")
+        );
     }
 
     #[test]

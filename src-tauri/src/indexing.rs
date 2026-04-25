@@ -520,4 +520,70 @@ mod tests {
         assert!(json.contains("\"processed\":42"));
         assert!(json.contains("\"message\":\"done\""));
     }
+
+    #[test]
+    fn single_flight_first_acquire_succeeds() {
+        // Direct test of the AtomicBool gate semantics that
+        // try_spawn_pipeline relies on. We don't actually spawn the
+        // pipeline (it'd need a Tauri app handle) — just exercise
+        // the compare_exchange behaviour.
+        let state = IndexingState::new();
+        let acquired = state
+            .is_running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst);
+        assert!(acquired.is_ok());
+        // Now the slot is held; second attempt should fail.
+        let denied = state
+            .is_running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst);
+        assert!(denied.is_err());
+    }
+
+    #[test]
+    fn single_flight_releases_after_clear() {
+        let state = IndexingState::new();
+        state.is_running.store(true, Ordering::SeqCst);
+        // Simulate the RAII guard's drop behaviour.
+        state.is_running.store(false, Ordering::SeqCst);
+        // The slot is open again.
+        let reacquired = state
+            .is_running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst);
+        assert!(reacquired.is_ok());
+    }
+
+    #[test]
+    fn indexing_error_displays_human_readable_message() {
+        let err = IndexingError::AlreadyRunning;
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("already in progress"),
+            "expected human-readable AlreadyRunning message, got {msg}"
+        );
+    }
+
+    #[test]
+    fn all_phases_serialise_to_kebab_case() {
+        for (variant, expected_str) in [
+            (Phase::Scan, "scan"),
+            (Phase::ModelDownload, "model-download"),
+            (Phase::Thumbnail, "thumbnail"),
+            (Phase::Encode, "encode"),
+            (Phase::Ready, "ready"),
+            (Phase::Error, "error"),
+        ] {
+            let progress = IndexingProgress {
+                phase: variant,
+                processed: 0,
+                total: 0,
+                message: None,
+            };
+            let json = serde_json::to_string(&progress).unwrap();
+            let needle = format!("\"phase\":\"{}\"", expected_str);
+            assert!(
+                json.contains(&needle),
+                "Phase {expected_str:?} did not serialise as expected: {json}"
+            );
+        }
+    }
 }
