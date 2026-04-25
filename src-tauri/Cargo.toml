@@ -29,6 +29,7 @@ image = "0.25.9"
 ndarray = "0.17.1"
 rand = "0.9.2"
 dirs = "6"
+tauri-plugin-dialog = "2.7.0"
 # Tokenizer is now implemented in pure Rust within encoder_text.rs
 # No external tokenizer dependency needed!
 

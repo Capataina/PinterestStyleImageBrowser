@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Mutex;
 use tauri::State;
 
@@ -72,6 +73,58 @@ fn create_tag(db: State<'_, ImageDatabase>, name: String, color: String) -> Resu
 #[tauri::command]
 fn delete_tag(db: State<'_, ImageDatabase>, tag_id: i64) -> Result<(), String> {
     db.delete_tag(tag_id).map_err(|e| e.to_string())
+}
+
+/// Read the currently-configured scan root from settings.json, if any.
+/// Returns Ok(None) when no root has been picked yet (first-launch state).
+#[tauri::command]
+fn get_scan_root() -> Result<Option<String>, String> {
+    Ok(settings::Settings::load()
+        .scan_root
+        .map(|p| p.to_string_lossy().into_owned()))
+}
+
+/// Set the scan root the next launch will index. Validates the path,
+/// persists it to settings.json, and wipes the existing image rows from
+/// the database so the new root indexes clean (the single-root
+/// replaceable model — Pass 4a doesn't yet trigger re-indexing live;
+/// the user must restart for now. Pass 5 will replace this with an async
+/// re-index + progress events).
+///
+/// The tag catalogue is intentionally preserved across root switches,
+/// because tag names are user knowledge (e.g. "favourite") that should
+/// survive moving libraries.
+#[tauri::command]
+fn set_scan_root(
+    db: State<'_, ImageDatabase>,
+    cosine_state: State<'_, CosineIndexState>,
+    path: String,
+) -> Result<(), String> {
+    let scan_root = PathBuf::from(&path);
+    if !scan_root.is_dir() {
+        return Err(format!("Not a directory: {path}"));
+    }
+
+    // Persist first; if this fails we don't want to wipe the DB and end
+    // up in a half-state with no scan root and no images.
+    let mut user_settings = settings::Settings::load();
+    user_settings.scan_root = Some(scan_root);
+    user_settings
+        .save()
+        .map_err(|e| format!("Failed to save settings.json: {e}"))?;
+
+    // Wipe image rows (tags catalog stays).
+    db.wipe_images_for_new_root()
+        .map_err(|e| format!("Failed to wipe images table: {e}"))?;
+
+    // Clear the in-memory cosine cache so similarity queries don't return
+    // results based on the previous root's embeddings.
+    if let Ok(mut idx) = cosine_state.index.lock() {
+        idx.cached_images.clear();
+    }
+
+    println!("[Backend] set_scan_root saved + wiped — restart required to re-index.");
+    Ok(())
 }
 
 #[tauri::command]
@@ -613,6 +666,7 @@ pub fn run(db: ImageDatabase, db_path: String) {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(db)
         .manage(cosine_state)
         .manage(text_encoder_state)
@@ -625,7 +679,9 @@ pub fn run(db: ImageDatabase, db_path: String) {
             remove_tag_from_image,
             get_similar_images,
             get_tiered_similar_images,
-            semantic_search
+            semantic_search,
+            get_scan_root,
+            set_scan_root
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

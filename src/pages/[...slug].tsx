@@ -15,6 +15,8 @@ import { useTags, useCreateTag, useDeleteTag } from "@/queries/useTags";
 import { SearchBar } from "@/components/SearchBar";
 import { PinterestModal } from "@/components/PinterestModal";
 import { useQueryClient } from "@tanstack/react-query";
+import { FolderOpen } from "lucide-react";
+import { pickScanFolder, setScanRoot } from "@/services/images";
 
 export default function Home() {
   const [selectedItem, setSelectedItem] = useState<ImageItem | null>(null);
@@ -171,26 +173,71 @@ export default function Home() {
       </AnimatePresence>
 
       <div className="px-4 md:px-8 lg:px-16 py-6 w-full h-full overflow-y-auto box-border">
-        {/* Search Bar */}
+        {/* Search Bar + folder-picker control */}
         <div className="flex justify-center mb-8">
-          <div className="w-full max-w-2xl">
-            <SearchBar
-              tags={tags.data}
-              onSearchChange={(selectedTags, text) => {
-                setSearchTags(selectedTags);
-                setSearchText(text);
+          <div className="flex w-full max-w-2xl items-center gap-3">
+            <div className="flex-1">
+              <SearchBar
+                tags={tags.data}
+                onSearchChange={(selectedTags, text) => {
+                  setSearchTags(selectedTags);
+                  setSearchText(text);
+                }}
+                placeholder="Search images or type # to filter by tags..."
+                onCreateTag={async (name, color) => {
+                  const tag = await createTagMutation.mutateAsync({
+                    name,
+                    color,
+                  });
+                  return tag;
+                }}
+              />
+            </div>
+            <button
+              type="button"
+              title="Choose image folder"
+              aria-label="Choose image folder"
+              className="flex shrink-0 items-center gap-2 rounded-full bg-gray-100 px-4 py-3 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-200"
+              onClick={async () => {
+                try {
+                  const folder = await pickScanFolder();
+                  if (!folder) return; // user cancelled
+                  await setScanRoot(folder);
+                  // Pass 4a: re-indexing requires a restart. Pass 5 will
+                  // replace this alert with live progress.
+                  window.alert(
+                    `Folder set:\n\n${folder}\n\nRestart the app to index this folder.`
+                  );
+                } catch (err) {
+                  console.error("Folder picker failed:", err);
+                  window.alert(
+                    `Could not set folder: ${err instanceof Error ? err.message : String(err)}`
+                  );
+                }
               }}
-              placeholder="Search images or type # to filter by tags..."
-              onCreateTag={async (name, color) => {
-                const tag = await createTagMutation.mutateAsync({
-                  name,
-                  color,
-                });
-                return tag;
-              }}
-            />
+            >
+              <FolderOpen className="h-4 w-4" />
+              <span className="hidden md:inline">Choose folder</span>
+            </button>
           </div>
         </div>
+
+        {/* First-launch / empty-state hint */}
+        {!selectedItem &&
+          !shouldUseSemanticSearch &&
+          images.data &&
+          images.data.length === 0 && (
+            <div className="mb-8 rounded-xl bg-white p-6 text-center shadow-sm border border-gray-100">
+              <h2 className="mb-2 text-lg font-semibold text-gray-800">
+                No images yet
+              </h2>
+              <p className="mb-4 text-sm text-gray-500">
+                Pick a folder above to start indexing your library. The app
+                searches recursively, so you can point it at a parent folder
+                and let it sweep through every subfolder.
+              </p>
+            </div>
+          )}
 
         {/* Section header when viewing similar images */}
         <AnimatePresence>

@@ -97,6 +97,21 @@ impl ImageDatabase {
         Ok(())
     }
 
+    /// Clear every image and image-tag row, leaving the schema intact and
+    /// preserving the user's tag catalogue. Used when the user picks a new
+    /// scan root — the single-root replaceable model means orphan rows from
+    /// the previous root must go.
+    ///
+    /// `images_tags` clears via the `ON DELETE CASCADE` on the FK from the
+    /// images delete; we still issue the explicit DELETE first as a belt-
+    /// and-braces measure in case a future schema change drops the cascade.
+    pub fn wipe_images_for_new_root(&self) -> rusqlite::Result<()> {
+        let conn = self.connection.lock().unwrap();
+        conn.execute("DELETE FROM images_tags", [])?;
+        conn.execute("DELETE FROM images", [])?;
+        Ok(())
+    }
+
     pub fn create_tag(&self, name: String, color: String) -> rusqlite::Result<Tag> {
         let conn = self.connection.lock().unwrap();
         conn.execute(

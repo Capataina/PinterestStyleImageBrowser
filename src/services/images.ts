@@ -1,4 +1,5 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 import { getImageSize } from "../utils";
 import { ImageData, ImageItem, SimilarImageItem } from "../types";
 
@@ -73,10 +74,54 @@ export async function removeTagFromImage(
   }
 }
 
-// Helper to construct thumbnail path from image ID
-// Thumbnails are stored as .thumbnails/thumb_{id}.jpg
+// Helper to construct thumbnail path from image ID.
+// Backend stores thumbnails inside app_data_dir()/thumbnails/ but the
+// canonical path comes back on the ImageData / SemanticSearchResult
+// objects, so this function is only a fallback when the backend didn't
+// supply one (very old DB rows pre-migration). The exact filename
+// pattern still matches `thumb_{id}.jpg` as defined in
+// src-tauri/src/thumbnail/generator.rs.
 function getThumbnailPath(imageId: number): string {
-  return `.thumbnails/thumb_${imageId}.jpg`;
+  return `thumbnails/thumb_${imageId}.jpg`;
+}
+
+/**
+ * Open a native folder picker and return the selected directory path.
+ * Returns null if the user cancelled the dialog.
+ */
+export async function pickScanFolder(): Promise<string | null> {
+  const selected = await open({
+    directory: true,
+    multiple: false,
+    title: "Choose your image folder",
+  });
+  // open() returns null on cancel, a string for single selection, or an
+  // array for multiple — we forced multiple: false so it's string | null.
+  if (typeof selected === "string") return selected;
+  return null;
+}
+
+export async function getScanRoot(): Promise<string | null> {
+  try {
+    return (await invoke<string | null>("get_scan_root")) ?? null;
+  } catch (error) {
+    throw new Error(`Failed to read scan root: ${error}`);
+  }
+}
+
+/**
+ * Persist the chosen scan root and wipe the existing image index.
+ *
+ * Pass 4a behaviour: the backend persists the path and clears image
+ * rows. Re-indexing happens on the next app launch — Pass 5 will
+ * trigger it live and emit progress events.
+ */
+export async function setScanRoot(path: string): Promise<void> {
+  try {
+    await invoke("set_scan_root", { path });
+  } catch (error) {
+    throw new Error(`Failed to set scan root: ${error}`);
+  }
 }
 
 export async function fetchSimilarImages(imageId: number, topN: number = 8) {
