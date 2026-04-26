@@ -15,6 +15,62 @@ pub struct ImageDatabase {
 
 pub type ID = i64;
 
+/// Aggregate the standard "images LEFT JOIN images_tags LEFT JOIN tags"
+/// row shape into a Vec of `(id, path, tags, thumbnail_path, width, height)`.
+///
+/// Audit finding: this aggregation pattern (HashMap-keyed-by-image-id,
+/// each entry collecting Tags as the LEFT JOIN unrolls) was duplicated
+/// across `get_images`, `get_images_without_embeddings`,
+/// `get_images_without_thumbnails`, and `get_images_with_thumbnails`.
+/// Four near-identical 25-line blocks → one helper. The next change to
+/// tag-aggregation logic happens in one place; ditto the thumbnail-
+/// column shape.
+///
+/// Expected column names (the SELECT must alias accordingly):
+///   img_id, img_path,
+///   thumbnail_path, width, height — nullable, OK to be absent in the
+///     SELECT (treated as NULL in that case via the COALESCE pattern
+///     each caller uses),
+///   tag_id, tag_name, tag_color — nullable LEFT JOIN columns.
+///
+/// Callers that don't need the thumbnail columns simply discard them
+/// from the returned tuples; callers that don't include the columns in
+/// their SELECT must alias `NULL AS thumbnail_path`, etc., so the
+/// helper's `row.get("thumbnail_path")` resolves to `None`.
+fn aggregate_image_rows(
+    rows: &mut rusqlite::Rows<'_>,
+) -> rusqlite::Result<Vec<(ID, String, Vec<Tag>, Option<String>, Option<i64>, Option<i64>)>> {
+    let mut map: HashMap<ID, (String, Vec<Tag>, Option<String>, Option<i64>, Option<i64>)> =
+        HashMap::new();
+    while let Some(row) = rows.next()? {
+        let img_id: ID = row.get("img_id")?;
+        let img_path: String = row.get("img_path")?;
+        let thumbnail_path: Option<String> = row.get("thumbnail_path")?;
+        let width: Option<i64> = row.get("width")?;
+        let height: Option<i64> = row.get("height")?;
+        let tag_id_opt: Option<ID> = row.get("tag_id")?;
+
+        let entry = map.entry(img_id).or_insert((
+            img_path,
+            Vec::new(),
+            thumbnail_path,
+            width,
+            height,
+        ));
+        if let Some(tag_id) = tag_id_opt {
+            entry.1.push(Tag {
+                id: tag_id,
+                name: row.get("tag_name")?,
+                color: row.get("tag_color")?,
+            });
+        }
+    }
+    Ok(map
+        .into_iter()
+        .map(|(id, (path, tags, tp, w, h))| (id, path, tags, tp, w, h))
+        .collect())
+}
+
 impl ImageDatabase {
     pub fn new(db_path: &str) -> rusqlite::Result<Self> {
         let connection = rusqlite::Connection::open(db_path)?;
@@ -449,24 +505,31 @@ impl ImageDatabase {
     ) -> rusqlite::Result<Vec<ImageData>> {
         let conn = self.connection.lock().unwrap();
 
-        let sql = if filter_tag_ids.len() > 0 {
+        // Always SELECT the thumbnail columns as NULL aliases so the
+        // shared `aggregate_image_rows` helper can read by name. This
+        // function discards them — the legacy "no thumbnail data"
+        // shape — but the helper's contract is uniform across all
+        // four callers.
+        let sql = if !filter_tag_ids.is_empty() {
             let placeholders = vec!["?"; filter_tag_ids.len()].join(", ");
             format!(
                 "SELECT images.id AS img_id, images.path AS img_path,
-            tags.id AS tag_id, tags.name AS tag_name, tags.color AS tag_color
-            FROM images
-            LEFT JOIN images_tags ON images.id = images_tags.image_id
-            LEFT JOIN tags ON tags.id = images_tags.tag_id
-            WHERE EXISTS (
-                SELECT 1
-                FROM images_tags it2
-                WHERE it2.image_id = images.id
-                AND it2.tag_id IN ({})
-            );",
+                NULL AS thumbnail_path, NULL AS width, NULL AS height,
+                tags.id AS tag_id, tags.name AS tag_name, tags.color AS tag_color
+                FROM images
+                LEFT JOIN images_tags ON images.id = images_tags.image_id
+                LEFT JOIN tags ON tags.id = images_tags.tag_id
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM images_tags it2
+                    WHERE it2.image_id = images.id
+                    AND it2.tag_id IN ({})
+                );",
                 placeholders
             )
         } else {
             "SELECT images.id AS img_id, images.path AS img_path,
+            NULL AS thumbnail_path, NULL AS width, NULL AS height,
             tags.id AS tag_id, tags.name AS tag_name, tags.color AS tag_color
             FROM images
             LEFT JOIN images_tags ON images.id = images_tags.image_id
@@ -474,30 +537,14 @@ impl ImageDatabase {
                 .to_string()
         };
         let mut stmt = conn.prepare(&sql)?;
-
         let mut rows = stmt.query(params_from_iter(filter_tag_ids))?;
-        let mut map: HashMap<ID, (String, Vec<Tag>)> = HashMap::new();
+        let aggregated = aggregate_image_rows(&mut rows)?;
 
-        // aggregate tags
-        while let Some(row) = rows.next()? {
-            let img_id: ID = row.get("img_id")?;
-            let img_path: String = row.get("img_path")?;
-            let tag_id_opt: Option<ID> = row.get("tag_id")?;
-
-            let entry = map.entry(img_id).or_insert((img_path, Vec::new()));
-            if let Some(tag_id) = tag_id_opt {
-                let tag = Tag {
-                    id: tag_id,
-                    name: row.get("tag_name")?,
-                    color: row.get("tag_color")?,
-                };
-                entry.1.push(tag);
-            }
-        }
-
-        let mut images: Vec<ImageData> = map
+        let mut images: Vec<ImageData> = aggregated
             .into_iter()
-            .map(|(id, (path, tags))| ImageData::new(id, std::path::Path::new(&path), tags))
+            .map(|(id, path, tags, _tp, _w, _h)| {
+                ImageData::new(id, std::path::Path::new(&path), tags)
+            })
             .collect();
         images.sort_by_key(|img| img.id);
 
@@ -513,36 +560,21 @@ impl ImageDatabase {
         let conn = self.connection.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT images.id AS img_id, images.path AS img_path,
+            NULL AS thumbnail_path, NULL AS width, NULL AS height,
             tags.id AS tag_id, tags.name AS tag_name, tags.color AS tag_color
             FROM images
             LEFT JOIN images_tags ON images.id = images_tags.image_id
             LEFT JOIN tags ON tags.id = images_tags.tag_id
             WHERE images.embedding IS NULL;",
         )?;
-
         let mut rows = stmt.query([])?;
-        let mut map: HashMap<ID, (String, Vec<Tag>)> = HashMap::new();
+        let aggregated = aggregate_image_rows(&mut rows)?;
 
-        // aggregate tags
-        while let Some(row) = rows.next()? {
-            let img_id: ID = row.get("img_id")?;
-            let img_path: String = row.get("img_path")?;
-            let tag_id_opt: Option<ID> = row.get("tag_id")?;
-
-            let entry = map.entry(img_id).or_insert((img_path, Vec::new()));
-            if let Some(tag_id) = tag_id_opt {
-                let tag = Tag {
-                    id: tag_id,
-                    name: row.get("tag_name")?,
-                    color: row.get("tag_color")?,
-                };
-                entry.1.push(tag);
-            }
-        }
-
-        let mut images: Vec<ImageData> = map
+        let mut images: Vec<ImageData> = aggregated
             .into_iter()
-            .map(|(id, (path, tags))| ImageData::new(id, std::path::Path::new(&path), tags))
+            .map(|(id, path, tags, _tp, _w, _h)| {
+                ImageData::new(id, std::path::Path::new(&path), tags)
+            })
             .collect();
         images.sort_by_key(|img| img.id);
 
@@ -761,30 +793,18 @@ impl ImageDatabase {
             LEFT JOIN tags ON tags.id = images_tags.tag_id
             WHERE images.thumbnail_path IS NULL OR images.thumbnail_path = '';",
         )?;
-
         let mut rows = stmt.query([])?;
-        let mut map: HashMap<ID, (String, Vec<Tag>)> = HashMap::new();
+        let aggregated = aggregate_image_rows(&mut rows)?;
 
-        // aggregate tags
-        while let Some(row) = rows.next()? {
-            let img_id: ID = row.get("img_id")?;
-            let img_path: String = row.get("img_path")?;
-            let tag_id_opt: Option<ID> = row.get("tag_id")?;
-
-            let entry = map.entry(img_id).or_insert((img_path, Vec::new()));
-            if let Some(tag_id) = tag_id_opt {
-                let tag = Tag {
-                    id: tag_id,
-                    name: row.get("tag_name")?,
-                    color: row.get("tag_color")?,
-                };
-                entry.1.push(tag);
-            }
-        }
-
-        let mut images: Vec<ImageData> = map
+        // This function returns images that need thumbnails — by
+        // definition the thumbnail columns are NULL/empty, so we
+        // discard them when materialising into ImageData. The helper
+        // returns them anyway because its contract is uniform.
+        let mut images: Vec<ImageData> = aggregated
             .into_iter()
-            .map(|(id, (path, tags))| ImageData::new(id, std::path::Path::new(&path), tags))
+            .map(|(id, path, tags, _tp, _w, _h)| {
+                ImageData::new(id, std::path::Path::new(&path), tags)
+            })
             .collect();
         images.sort_by_key(|img| img.id);
 
@@ -919,38 +939,15 @@ impl ImageDatabase {
             )
         };
         let mut stmt = conn.prepare(&sql)?;
-
         let mut rows = stmt.query(params_from_iter(filter_tag_ids))?;
+        let aggregated = aggregate_image_rows(&mut rows)?;
 
-        // Map: image_id -> (path, tags, thumbnail_path, width, height)
-        let mut map: HashMap<ID, (String, Vec<Tag>, Option<String>, Option<i64>, Option<i64>)> =
-            HashMap::new();
-
-        // aggregate tags and thumbnail info
-        while let Some(row) = rows.next()? {
-            let img_id: ID = row.get("img_id")?;
-            let img_path: String = row.get("img_path")?;
-            let thumbnail_path: Option<String> = row.get("thumbnail_path")?;
-            let width: Option<i64> = row.get("width")?;
-            let height: Option<i64> = row.get("height")?;
-            let tag_id_opt: Option<ID> = row.get("tag_id")?;
-
-            let entry =
-                map.entry(img_id)
-                    .or_insert((img_path, Vec::new(), thumbnail_path, width, height));
-            if let Some(tag_id) = tag_id_opt {
-                let tag = Tag {
-                    id: tag_id,
-                    name: row.get("tag_name")?,
-                    color: row.get("tag_color")?,
-                };
-                entry.1.push(tag);
-            }
-        }
-
-        let mut images: Vec<ImageData> = map
+        // This function is the only one that USES the thumbnail
+        // columns — the helper provides them uniformly; we read them
+        // here when materialising into ImageData.
+        let mut images: Vec<ImageData> = aggregated
             .into_iter()
-            .map(|(id, (path, tags, thumbnail_path, width, height))| {
+            .map(|(id, path, tags, thumbnail_path, width, height)| {
                 let mut img = ImageData::new(id, std::path::Path::new(&path), tags);
                 img.thumbnail_path = thumbnail_path;
                 img.width = width.map(|w| w as u32);
