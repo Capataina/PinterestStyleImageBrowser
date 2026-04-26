@@ -349,7 +349,44 @@ fn run_pipeline_inner(
     emit(app, Phase::Scan, total_found, total_found, None);
     drop(_scan_phase);
 
-    // 5. Thumbnails (parallel via rayon).
+    // 5. Thumbnails + encoder run in PARALLEL.
+    //
+    // Previously these were sequential phases — first thumbnails for
+    // every image (rayon-parallel), then embeddings (single-threaded
+    // CLIP) — so on a fresh ~1500-image library the user stared at
+    // a partially-empty grid for ~80s waiting for the encoder to
+    // finish. Now they run concurrently:
+    //
+    //   - The thumbnail rayon loop occupies the CPU pool
+    //   - The encoder runs on a dedicated thread with its own DB
+    //     connection (WAL mode lets concurrent writes coexist —
+    //     thumbnails write `thumbnail_path/width/height`, the encoder
+    //     writes `embedding`; different columns, no row-level conflict)
+    //
+    // The thumbnail phase finishes first (rayon makes it ~10× faster
+    // than encoder per-image), so the user sees a fully populated
+    // grid in ~7s while the encoder cooks in the background. Cosine
+    // repopulate joins both before running.
+    //
+    // The encoder phase span lives inside its spawned thread so the
+    // perf report still attributes its time correctly.
+    let image_model_path = paths::models_dir().join("model_image.onnx");
+    let encoder_handle: Option<thread::JoinHandle<Result<(), String>>> =
+        if image_model_path.exists() {
+            let app = app.clone();
+            let db_path_for_encoder = db_path.to_string();
+            let model_path = image_model_path.clone();
+            Some(thread::spawn(move || {
+                run_encoder_phase(&app, &db_path_for_encoder, &model_path)
+            }))
+        } else {
+            warn!(
+                "model_image.onnx missing; embeddings will be \
+                 empty until next launch."
+            );
+            None
+        };
+
     let _thumb_phase = tracing::info_span!("pipeline.thumbnail_phase").entered();
     //
     //    Per-image cost is dominated by JPEG decode+encode, which is
@@ -420,37 +457,16 @@ fn run_pipeline_inner(
     emit(app, Phase::Thumbnail, total_thumbs, total_thumbs, None);
     drop(_thumb_phase);
 
-    // 6. Encode embeddings (only if the model is available).
-    let _encode_phase = tracing::info_span!("pipeline.encode_phase").entered();
-    let image_model_path = paths::models_dir().join("model_image.onnx");
-    if image_model_path.exists() {
-        let needs_embed = database.get_images_without_embeddings()?;
-        let total_embed = needs_embed.len();
-        if total_embed > 0 {
-            emit(app, Phase::Encode, 0, total_embed, None);
-            let mut encoder = Encoder::new(&image_model_path)?;
-            // Match the existing batch size from main.rs.
-            const BATCH_SIZE: usize = 32;
-            let mut processed = 0usize;
-            for chunk in needs_embed.chunks(BATCH_SIZE) {
-                let batch_paths: Vec<&Path> =
-                    chunk.iter().map(|i| Path::new(&i.path)).collect();
-                let embeddings = encoder.encode_batch(&batch_paths)?;
-                for (image, embedding) in chunk.iter().zip(embeddings.iter()) {
-                    database.update_image_embedding(image.id, embedding.clone())?;
-                }
-                processed += chunk.len();
-                emit(app, Phase::Encode, processed, total_embed, None);
-            }
+    // Join the encoder thread that was spawned before the thumbnail
+    // loop. Cosine repopulate (next step) needs every embedding
+    // committed to disk first, so this barrier is load-bearing.
+    if let Some(handle) = encoder_handle {
+        match handle.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!("encoder phase failed: {e}"),
+            Err(_) => warn!("encoder thread panicked"),
         }
-    } else {
-        warn!(
-            "model_image.onnx missing; embeddings will be \
-             empty until next launch."
-        );
     }
-
-    drop(_encode_phase);
 
     // 7. Repopulate the in-memory cosine cache from the now-fresh
     //    embeddings, then persist to disk so next-launch starts hot.
@@ -471,6 +487,58 @@ fn run_pipeline_inner(
         Some(format!("{final_count} images indexed")),
     );
 
+    Ok(())
+}
+
+/// Encoder phase — runs the CLIP image encoder over every row that
+/// doesn't yet have an embedding, in batches of 32. Lives on its own
+/// thread (spawned from `run_pipeline_inner` in parallel with the
+/// thumbnail rayon loop) so its single-threaded ONNX inference doesn't
+/// block the multi-core JPEG codec work that happens alongside.
+///
+/// Opens its own `ImageDatabase` (separate SQLite connection) so it
+/// doesn't contend with the thumbnail thread for the same Mutex.
+/// WAL mode (initialise() pragmas) makes the concurrent writes safe —
+/// thumbnails write the `thumbnail_path/width/height` columns, this
+/// writes `embedding`; no row-level conflict because the columns are
+/// disjoint and SQLite's WAL serialises commits at the page level
+/// without blocking readers.
+fn run_encoder_phase(
+    app: &AppHandle,
+    db_path: &str,
+    image_model_path: &Path,
+) -> Result<(), String> {
+    // Returns Result<_, String> rather than the trait-object error
+    // type so the JoinHandle is Send (the encoder library's error
+    // boxes aren't Send + Sync everywhere). String loses some
+    // structure but the encoder phase is a leaf — failure is logged
+    // by the caller via tracing::warn!, no further dispatch.
+    let _encode_phase = tracing::info_span!("pipeline.encode_phase").entered();
+
+    let database = ImageDatabase::new(db_path).map_err(|e| e.to_string())?;
+    let needs_embed = database
+        .get_images_without_embeddings()
+        .map_err(|e| e.to_string())?;
+    let total_embed = needs_embed.len();
+    if total_embed == 0 {
+        return Ok(());
+    }
+    emit(app, Phase::Encode, 0, total_embed, None);
+
+    let mut encoder = Encoder::new(image_model_path).map_err(|e| e.to_string())?;
+    const BATCH_SIZE: usize = 32;
+    let mut processed = 0usize;
+    for chunk in needs_embed.chunks(BATCH_SIZE) {
+        let batch_paths: Vec<&Path> = chunk.iter().map(|i| Path::new(&i.path)).collect();
+        let embeddings = encoder.encode_batch(&batch_paths).map_err(|e| e.to_string())?;
+        for (image, embedding) in chunk.iter().zip(embeddings.iter()) {
+            database
+                .update_image_embedding(image.id, embedding.clone())
+                .map_err(|e| e.to_string())?;
+        }
+        processed += chunk.len();
+        emit(app, Phase::Encode, processed, total_embed, None);
+    }
     Ok(())
 }
 
