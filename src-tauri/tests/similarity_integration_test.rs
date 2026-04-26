@@ -1,5 +1,5 @@
 use image_browser_lib::similarity_and_semantic_search::cosine_similarity::CosineIndex;
-use image_browser_lib::similarity_and_semantic_search::encoder::Encoder;
+use image_browser_lib::similarity_and_semantic_search::encoder::ClipImageEncoder;
 use ndarray::Array1;
 use std::fs;
 use std::path::PathBuf;
@@ -27,7 +27,7 @@ fn test_real_image_similarity_search() {
         return;
     }
 
-    let mut encoder = Encoder::new(&model_path).expect("Failed to create encoder");
+    let mut encoder = ClipImageEncoder::new(&model_path).expect("Failed to create encoder");
 
     println!("Scanning references directory...");
     let mut image_paths = Vec::new();
@@ -260,7 +260,7 @@ fn test_similarity_distribution() {
         return;
     }
 
-    let mut encoder = Encoder::new(&model_path).expect("Failed to create encoder");
+    let mut encoder = ClipImageEncoder::new(&model_path).expect("Failed to create encoder");
 
     // Find all images
     let mut image_paths = Vec::new();

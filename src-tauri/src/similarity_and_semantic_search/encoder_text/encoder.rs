@@ -4,6 +4,10 @@ use tracing::{debug, info, warn};
 
 use super::pooling::{normalize, try_extract_single_embedding};
 use super::tokenizer::SimpleTokenizer;
+// Trait import aliased to avoid the name collision with our concrete
+// struct ClipTextEncoder. The trait lives in the sibling encoders
+// module and is what the runtime dispatches against.
+use crate::similarity_and_semantic_search::encoders::TextEncoder as TextEncoderTrait;
 
 // CoreML is intentionally NOT used for the text encoder on macOS.
 // The multilingual CLIP text model is a transformer (DistilBERT-based,
@@ -21,14 +25,14 @@ use ort::execution_providers::CUDAExecutionProvider;
 /// Text encoder for CLIP-based semantic search.
 /// Uses the multilingual CLIP model (clip-ViT-B-32-multilingual-v1) to encode text
 /// into the same 512-dimensional embedding space as images.
-pub struct TextEncoder {
+pub struct ClipTextEncoder {
     session: Session,
     tokenizer: SimpleTokenizer,
     max_seq_length: usize,
 }
 
-impl TextEncoder {
-    /// Create a new TextEncoder from ONNX model and tokenizer files.
+impl ClipTextEncoder {
+    /// Create a new ClipTextEncoder from ONNX model and tokenizer files.
     ///
     /// # Arguments
     /// * `model_path` - Path to the ONNX text model (e.g., "models/model_text.onnx")
@@ -79,7 +83,7 @@ impl TextEncoder {
         // The multilingual CLIP model uses max_seq_length of 128
         let max_seq_length = 128;
 
-        Ok(TextEncoder {
+        Ok(ClipTextEncoder {
             session,
             tokenizer,
             max_seq_length,
@@ -228,11 +232,31 @@ impl TextEncoder {
     }
 }
 
+/// Implement the new trait via delegation to the inherent methods.
+/// This is the seam that lets the runtime hold a `Box<dyn TextEncoder>`
+/// containing either ClipTextEncoder, the upcoming SigLIP2-Text
+/// encoder, or any future text encoder.
+impl TextEncoderTrait for ClipTextEncoder {
+    fn encode(&mut self, text: &str) -> Result<Vec<f32>, Box<dyn Error>> {
+        ClipTextEncoder::encode(self, text)
+    }
+    fn embedding_dim(&self) -> usize {
+        // Multilingual CLIP-ViT-B/32 always outputs 512-d.
+        512
+    }
+    fn id(&self) -> &'static str {
+        // Used as the database column suffix and the user-facing
+        // label. Stable forever — changing this would orphan
+        // existing embedding rows.
+        "clip_multilingual_v1"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn get_test_encoder() -> Option<TextEncoder> {
+    fn get_test_encoder() -> Option<ClipTextEncoder> {
         let model_path = Path::new("models/model_text.onnx");
         let tokenizer_path = Path::new("models/tokenizer.json");
 
@@ -241,7 +265,7 @@ mod tests {
             return None;
         }
 
-        TextEncoder::new(model_path, tokenizer_path).ok()
+        ClipTextEncoder::new(model_path, tokenizer_path).ok()
     }
 
     fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {

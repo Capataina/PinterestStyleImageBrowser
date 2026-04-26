@@ -4,7 +4,7 @@ use tracing::{debug, info};
 use crate::commands::{resolve_image_id_for_cosine_path, ApiError, ImageSearchResult};
 use crate::db::ImageDatabase;
 use crate::paths;
-use crate::similarity_and_semantic_search::encoder_text::TextEncoder;
+use crate::similarity_and_semantic_search::encoder_text::ClipTextEncoder;
 use crate::{CosineIndexState, TextEncoderState};
 
 /// Semantic search: find images matching a text query using CLIP embeddings
@@ -54,7 +54,7 @@ pub fn semantic_search(
             ));
         }
 
-        let encoder = TextEncoder::new(&model_path, &tokenizer_path)
+        let encoder = ClipTextEncoder::new(&model_path, &tokenizer_path)
             .map_err(|e| ApiError::Encoder(format!("text encoder init failed: {e}")))?;
 
         *encoder_lock = Some(encoder);

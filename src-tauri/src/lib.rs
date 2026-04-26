@@ -5,7 +5,7 @@ use crate::{
     db::ImageDatabase,
     indexing::IndexingState,
     similarity_and_semantic_search::cosine_similarity::CosineIndex,
-    similarity_and_semantic_search::encoder_text::TextEncoder,
+    similarity_and_semantic_search::encoder_text::ClipTextEncoder,
 };
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
@@ -36,7 +36,7 @@ pub struct CosineIndexState {
 /// State for the text encoder used in semantic search
 /// Lazy-loaded on first semantic search query
 pub struct TextEncoderState {
-    pub encoder: Mutex<Option<TextEncoder>>,
+    pub encoder: Mutex<Option<ClipTextEncoder>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

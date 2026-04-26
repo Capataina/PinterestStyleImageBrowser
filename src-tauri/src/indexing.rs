@@ -41,8 +41,8 @@ use crate::filesystem::ImageScanner;
 use crate::model_download;
 use crate::paths;
 use crate::similarity_and_semantic_search::cosine_similarity::CosineIndex;
-use crate::similarity_and_semantic_search::encoder::Encoder;
-use crate::similarity_and_semantic_search::encoder_text::TextEncoder;
+use crate::similarity_and_semantic_search::encoder::ClipImageEncoder;
+use crate::similarity_and_semantic_search::encoder_text::ClipTextEncoder;
 use crate::thumbnail::ThumbnailGenerator;
 use crate::TextEncoderState;
 
@@ -249,7 +249,7 @@ fn run_pipeline_inner(
             if let Ok(mut lock) = lock_result {
                 if lock.is_none() {
                     info!("pre-warming text encoder");
-                    match TextEncoder::new(&model_path, &tokenizer_path) {
+                    match ClipTextEncoder::new(&model_path, &tokenizer_path) {
                         Ok(encoder) => *lock = Some(encoder),
                         Err(e) => warn!("text encoder pre-warm failed: {e}"),
                     }
@@ -525,7 +525,7 @@ fn run_encoder_phase(
     }
     emit(app, Phase::Encode, 0, total_embed, None);
 
-    let mut encoder = Encoder::new(image_model_path).map_err(|e| e.to_string())?;
+    let mut encoder = ClipImageEncoder::new(image_model_path).map_err(|e| e.to_string())?;
     const BATCH_SIZE: usize = 32;
     let mut processed = 0usize;
     for chunk in needs_embed.chunks(BATCH_SIZE) {

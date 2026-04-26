@@ -7,6 +7,8 @@ use ort::{
 use std::{error::Error, path::Path};
 use tracing::{debug, info, warn};
 
+use super::encoders::ImageEncoder;
+
 // CoreML is intentionally NOT used for the image encoder on macOS.
 //
 // We tested it: CoreML's GetCapability accepts ~54% of CLIP ViT-B/32's
@@ -30,11 +32,11 @@ use ort::execution_providers::CUDAExecutionProvider;
 
 use crate::db;
 
-pub struct Encoder {
+pub struct ClipImageEncoder {
     session: Session,
 }
 
-impl Encoder {
+impl ClipImageEncoder {
     pub fn new(model_path: &Path) -> Result<Self, Box<dyn Error>> {
         info!("=== Initializing image encoder ===");
 
@@ -48,13 +50,13 @@ impl Encoder {
         // contain the registered provider; absent that, we just trust
         // ort to do the right thing and avoid claiming a specific EP.
         match Self::build_session_with_accel(model_path) {
-            Ok(session) => Ok(Encoder { session }),
+            Ok(session) => Ok(ClipImageEncoder { session }),
             Err(e) => {
                 warn!(
                     "accelerator initialization failed ({e}); falling back to CPU"
                 );
                 let session = Session::builder()?.commit_from_file(model_path)?;
-                Ok(Encoder { session })
+                Ok(ClipImageEncoder { session })
             }
         }
     }
@@ -266,8 +268,11 @@ impl Encoder {
         Ok(all_embeddings)
     }
 
-    // Encode all images in the database and store the embeddings as BLOBs.
-    // Idempotent: only images without an embedding are processed.
+    /// Encode-all-in-database helper. Kept for back-compat with the
+    /// pre-pipeline-thread era; the indexing pipeline now drives this
+    /// loop directly so it can interleave with the thumbnail rayon
+    /// pool. Retained because the test suite + smoke scripts still
+    /// call it.
     pub fn encode_all_images_in_database(
         &mut self,
         batch_size: usize,
@@ -304,5 +309,31 @@ impl Encoder {
 
         info!("Successfully encoded {} images.", total_images);
         Ok(())
+    }
+}
+
+/// Implement the new trait via delegation to the inherent methods.
+/// This is the seam that lets the runtime hold a `Box<dyn ImageEncoder>`
+/// containing either ClipImageEncoder, the upcoming SigLIP2-Image
+/// encoder, or the upcoming DINOv2 encoder.
+impl ImageEncoder for ClipImageEncoder {
+    fn encode(&mut self, image_path: &Path) -> Result<Vec<f32>, Box<dyn Error>> {
+        ClipImageEncoder::encode(self, image_path)
+    }
+    fn encode_batch(
+        &mut self,
+        image_paths: &[&Path],
+    ) -> Result<Vec<Vec<f32>>, Box<dyn Error>> {
+        ClipImageEncoder::encode_batch(self, image_paths)
+    }
+    fn embedding_dim(&self) -> usize {
+        // OpenAI CLIP-ViT-B/32 always outputs 512-d.
+        512
+    }
+    fn id(&self) -> &'static str {
+        // Used as the database column suffix and the user-facing
+        // label. Stable forever — changing this would orphan
+        // existing embedding rows.
+        "clip_vit_b_32"
     }
 }
