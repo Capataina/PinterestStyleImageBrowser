@@ -24,6 +24,38 @@ impl ImageDatabase {
     }
 
     pub fn initialize(&self) -> rusqlite::Result<()> {
+        // WAL journal mode + NORMAL synchronous (audit finding).
+        //
+        // Why WAL: the indexing pipeline opens its own ImageDatabase
+        // instance (a second SQLite connection to the same file) so the
+        // background indexing thread doesn't block the UI thread on
+        // every embedding write. In SQLite's default DELETE journal
+        // mode, the writer holds an exclusive lock for the duration of
+        // every write transaction, blocking all readers; in WAL mode,
+        // readers and the single writer can coexist. SQLite's official
+        // recommendation for any multi-connection or write-heavy
+        // workload (https://sqlite.org/wal.html).
+        //
+        // Why NORMAL synchronous: the default FULL fsyncs after every
+        // commit — appropriate for a database where torn writes corrupt
+        // structure, but unnecessary for this app where every commit is
+        // either a tag mutation (user can re-do), a thumbnail update
+        // (next launch regenerates), or an embedding write (next launch
+        // re-encodes). Power-loss "lose at most the last commit" is
+        // recoverable on every code path, and `synchronous = NORMAL` is
+        // SQLite's explicitly-recommended pairing for WAL when this
+        // trade-off is acceptable.
+        //
+        // Both PRAGMAs persist for the connection's lifetime; WAL also
+        // persists across reopens (it's a property of the DB file).
+        // pragma_update is the rusqlite path that returns Result so we
+        // surface migration-time failures rather than ignoring them.
+        {
+            let conn = self.connection.lock().unwrap();
+            conn.pragma_update(None, "journal_mode", "WAL")?;
+            conn.pragma_update(None, "synchronous", "NORMAL")?;
+        }
+
         // Foreign-key enforcement is OFF by default in SQLite; turn it
         // on so ON DELETE CASCADE actually fires.
         self.connection
@@ -532,13 +564,13 @@ impl ImageDatabase {
             return Ok(());
         }
 
-        // Convert Vec<f32> to bytes for BLOB storage
-        let embedding_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                embedding.as_ptr() as *const u8,
-                embedding.len() * std::mem::size_of::<f32>(),
-            )
-        };
+        // Convert Vec<f32> to bytes for BLOB storage. bytemuck::cast_slice
+        // proves at compile time (via the `Pod` marker on f32) that the
+        // reinterpretation is safe — no manual unsafe block required.
+        // Audit finding: replaces three unsafe slice::from_raw_parts blocks
+        // with one trait-checked safe API. Same zero-copy view, same bytes
+        // hit the BLOB.
+        let embedding_bytes: &[u8] = bytemuck::cast_slice(&embedding);
         self.connection.lock().unwrap().execute(
             "UPDATE images SET embedding = ?1 WHERE id = ?2",
             rusqlite::params![embedding_bytes, image_id],
@@ -578,14 +610,12 @@ impl ImageDatabase {
                         ));
                     }
 
-                    // Convert bytes back to Vec<f32>
-                    let embedding: Vec<f32> = unsafe {
-                        std::slice::from_raw_parts(
-                            bytes.as_ptr() as *const f32,
-                            bytes.len() / f32_size,
-                        )
-                        .to_vec()
-                    };
+                    // Convert bytes back to Vec<f32>. bytemuck::cast_slice
+                    // does the alignment + size proof at compile time;
+                    // the runtime length-mod-f32 check above stays as a
+                    // belt-and-braces guard against malformed BLOBs.
+                    let embedding: Vec<f32> =
+                        bytemuck::cast_slice::<u8, f32>(&bytes).to_vec();
                     Ok(embedding)
                 }
             }
@@ -628,10 +658,9 @@ impl ImageDatabase {
                 // wipe and re-encode.
                 continue;
             }
-            let embedding: Vec<f32> = unsafe {
-                std::slice::from_raw_parts(bytes.as_ptr() as *const f32, bytes.len() / f32_size)
-                    .to_vec()
-            };
+            // bytemuck::cast_slice is the safe, alignment-checked-at-
+            // compile-time replacement for slice::from_raw_parts here.
+            let embedding: Vec<f32> = bytemuck::cast_slice::<u8, f32>(&bytes).to_vec();
             out.push((id, path, embedding));
         }
         Ok(out)
@@ -665,10 +694,35 @@ impl ImageDatabase {
         Ok(())
     }
 
+    /// Return a map from every image's path to its root_id (or None
+    /// for legacy un-migrated rows) in a single SELECT.
+    ///
+    /// Replaces the indexing pipeline's previous N+1 pattern (one
+    /// `get_root_id_by_path` per image-needing-thumbnail, holding the
+    /// DB Mutex 1500 times in rapid succession on a typical first
+    /// run). Aligned with the existing `get_all_embeddings` shape —
+    /// "fetch the whole table in one SELECT, the caller filters in
+    /// memory" is the established pattern in this module.
+    ///
+    /// Used by `indexing::run_pipeline_inner` to route each generated
+    /// thumbnail into its per-root subfolder.
+    pub fn get_paths_to_root_ids(&self) -> rusqlite::Result<HashMap<String, Option<ID>>> {
+        let conn = self.connection.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT path, root_id FROM images")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<ID>>(1)?))
+        })?;
+        rows.collect()
+    }
+
     /// Look up the root_id for an image given its path. Returns None
     /// when the path isn't in the DB or when the row's root_id is NULL
     /// (legacy un-migrated rows). Used by the thumbnail generator to
     /// route output into the correct per-root subfolder.
+    ///
+    /// Prefer `get_paths_to_root_ids` when looking up many paths at
+    /// once (e.g., the indexing pipeline) — it's one SELECT versus
+    /// N. This single-path variant remains for incremental lookups.
     pub fn get_root_id_by_path(&self, path: &str) -> Option<ID> {
         let conn = self.connection.lock().unwrap();
         let mut stmt = conn

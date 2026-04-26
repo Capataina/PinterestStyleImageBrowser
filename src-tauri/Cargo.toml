@@ -37,6 +37,7 @@ rayon = "1.10"
 bincode = "1.3"
 notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
 notify-debouncer-mini = { version = "0.7", default-features = false }
+bytemuck = "1.25.0"
 
 # Platform-gated ONNX Runtime so each OS pulls in only the execution
 # providers it can actually use:

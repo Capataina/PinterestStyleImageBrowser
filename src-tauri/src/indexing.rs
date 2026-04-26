@@ -368,15 +368,17 @@ fn run_pipeline_inner(
         const EMIT_EVERY: usize = 25;
 
         // Build a map from path -> root_id so each thumbnail lands in
-        // the right per-root subfolder. ImageData doesn't carry root_id
-        // so we look it up upfront — one DB call per image, but the
-        // mutex is brief and this is on the indexing thread, not the
-        // UI path. For thousands of images the latency is dwarfed by
-        // the JPEG codec time downstream.
-        let path_to_root: std::collections::HashMap<String, Option<i64>> = needs_thumbs
-            .iter()
-            .map(|img| (img.path.clone(), database.get_root_id_by_path(&img.path)))
-            .collect();
+        // the right per-root subfolder. Single SELECT — was N+1 before
+        // (audit finding): `get_root_id_by_path` per image-needing-
+        // thumbnail held the DB Mutex 1500 times in rapid succession on
+        // a typical first run. The new `get_paths_to_root_ids` returns
+        // the entire (path, root_id) map in one query, matching the
+        // pattern `populate_from_db` already uses for embeddings.
+        //
+        // unwrap_or_default preserves the previous failure semantic:
+        // if the SELECT fails, downstream `generate_thumbnail` falls
+        // back to the legacy flat thumbnail directory (root_id None).
+        let path_to_root = database.get_paths_to_root_ids().unwrap_or_default();
 
         needs_thumbs.par_iter().for_each(|image| {
             let root_id = path_to_root.get(&image.path).copied().flatten();
