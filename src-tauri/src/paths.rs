@@ -61,13 +61,33 @@ const BUNDLE_ID: &str = "com.ataca.image-browser";
 
 /// Root of all app-managed state.
 ///
-/// Dev builds resolve to `<repo>/Library/` via the build-time-captured
-/// `CARGO_MANIFEST_DIR` env var (which Cargo sets to `src-tauri/`,
-/// hence the `.parent()` step to land at the repo root).
+/// Resolution order (first match wins):
 ///
-/// Release builds fall back to the platform's app data directory because
-/// there is no "project folder" once the binary is bundled and shipped.
+/// 1. `IMAGE_BROWSER_DATA_DIR` env var, if set. Lets you point ANY
+///    build (release or debug) at any directory — useful when running
+///    a release-mode profiling session against your dev `<repo>/Library/`
+///    so you don't re-download the 1.1GB models. Set it to an absolute
+///    path:
+///        IMAGE_BROWSER_DATA_DIR=/path/to/repo/Library cargo tauri dev --release
+/// 2. Debug builds resolve to `<repo>/Library/` via `CARGO_MANIFEST_DIR`
+///    (captured at compile time; points at `src-tauri/`, so `.parent()`
+///    lands at the repo root).
+/// 3. Release builds fall back to the platform's app data directory
+///    (`~/Library/Application Support/com.ataca.image-browser/` on
+///    macOS) because a packaged binary has no project folder.
 pub fn app_data_dir() -> PathBuf {
+    // Env-var override comes first so it works in EITHER cfg branch.
+    // The whole point of this escape hatch is to let release-mode
+    // dev runs (cargo tauri dev --release) point at the dev data
+    // dir, sharing the model cache + DB across build modes.
+    if let Ok(override_path) = std::env::var("IMAGE_BROWSER_DATA_DIR") {
+        if !override_path.is_empty() {
+            let dir = PathBuf::from(override_path);
+            let _ = ensure_dir(&dir);
+            return dir;
+        }
+    }
+
     #[cfg(debug_assertions)]
     {
         // CARGO_MANIFEST_DIR is captured by env! at compile time; it
