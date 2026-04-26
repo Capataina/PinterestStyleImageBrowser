@@ -62,6 +62,7 @@ pub type ProgressFn = dyn Fn(u64, u64, Option<&str>) + Send + Sync;
 /// land. The callback is also invoked once at the start with
 /// `(0, total_bytes_to_download, None)` after the HEAD preflight, so
 /// the UI can show the eventual size before any actual download begins.
+#[tracing::instrument(name = "model_download.all", skip(progress))]
 pub fn download_models_if_missing<F>(progress: F) -> Result<(), Box<dyn Error>>
 where
     F: Fn(u64, u64, Option<&str>) + Send + Sync + 'static,
@@ -116,6 +117,7 @@ where
 /// HEAD a URL to read its Content-Length. Falls through to None on any
 /// error; the caller treats unknown sizes as zero in the aggregate
 /// total (so the bar is slightly less accurate but still progresses).
+#[tracing::instrument(name = "model_download.head")]
 fn head_content_length(url: &str) -> Option<u64> {
     let resp = ureq::head(url).call().ok()?;
     resp.headers()
@@ -131,6 +133,7 @@ fn head_content_length(url: &str) -> Option<u64> {
 /// `dest.with_extension("part")` first then renames atomically on
 /// success; an interrupted download leaves a stale `.part` that the
 /// next run cleans up before retrying.
+#[tracing::instrument(name = "model_download.file", skip(bytes_so_far, progress))]
 fn download_to_file(
     url: &str,
     dest: &Path,

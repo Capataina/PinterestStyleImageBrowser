@@ -282,6 +282,7 @@ fn run_pipeline_inner(
 
     // 4. Scan every enabled root. We aggregate paths across roots so
     //    progress reflects total work, not per-folder progress.
+    let _scan_phase = tracing::info_span!("pipeline.scan_phase").entered();
     emit(
         app,
         Phase::Scan,
@@ -346,8 +347,10 @@ fn run_pipeline_inner(
     }
 
     emit(app, Phase::Scan, total_found, total_found, None);
+    drop(_scan_phase);
 
     // 5. Thumbnails (parallel via rayon).
+    let _thumb_phase = tracing::info_span!("pipeline.thumbnail_phase").entered();
     //
     //    Per-image cost is dominated by JPEG decode+encode, which is
     //    embarrassingly parallel. The DB write under the mutex is
@@ -415,8 +418,10 @@ fn run_pipeline_inner(
         });
     }
     emit(app, Phase::Thumbnail, total_thumbs, total_thumbs, None);
+    drop(_thumb_phase);
 
     // 6. Encode embeddings (only if the model is available).
+    let _encode_phase = tracing::info_span!("pipeline.encode_phase").entered();
     let image_model_path = paths::models_dir().join("model_image.onnx");
     if image_model_path.exists() {
         let needs_embed = database.get_images_without_embeddings()?;
@@ -445,12 +450,16 @@ fn run_pipeline_inner(
         );
     }
 
+    drop(_encode_phase);
+
     // 7. Repopulate the in-memory cosine cache from the now-fresh
     //    embeddings, then persist to disk so next-launch starts hot.
+    let _cosine_phase = tracing::info_span!("pipeline.cosine_repopulate").entered();
     if let Ok(mut idx) = cosine_index.lock() {
         idx.populate_from_db(&database);
         idx.save_to_disk();
     }
+    drop(_cosine_phase);
 
     // 8. Done — total image count is what the user sees in the grid.
     let final_count = database.get_all_images().map(|v| v.len()).unwrap_or(0);

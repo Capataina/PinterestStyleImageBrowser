@@ -48,6 +48,7 @@ pub type WatcherHandle = Debouncer<notify::RecommendedWatcher>;
 /// must outlive the app — typically held in a Tauri-managed state
 /// struct. Returns None if no roots are enabled or if the underlying
 /// notify backend can't be initialised on the current platform.
+#[tracing::instrument(name = "watcher.start", skip(app, indexing_state, cosine_index))]
 pub fn start(
     app: AppHandle,
     paths_to_watch: Vec<PathBuf>,
@@ -67,21 +68,27 @@ pub fn start(
 
     let mut debouncer = match new_debouncer(
         Duration::from_secs(5),
-        move |result: DebounceEventResult| match result {
-            Ok(events) => {
-                debug!(
-                    "watcher: {} events received, triggering rescan",
-                    events.len()
-                );
-                let _ = indexing::try_spawn_pipeline(
-                    app_for_handler.clone(),
-                    indexing_state_for_handler.clone(),
-                    db_path_for_handler.clone(),
-                    cosine_index_for_handler.clone(),
-                );
-            }
-            Err(e) => {
-                warn!("watcher debounce error: {e:?}");
+        move |result: DebounceEventResult| {
+            // Wrap the event handler in a manual span so each debounce
+            // batch gets timed individually. Closure-based callbacks
+            // can't carry #[tracing::instrument] directly.
+            let _span = tracing::info_span!("watcher.event").entered();
+            match result {
+                Ok(events) => {
+                    debug!(
+                        "watcher: {} events received, triggering rescan",
+                        events.len()
+                    );
+                    let _ = indexing::try_spawn_pipeline(
+                        app_for_handler.clone(),
+                        indexing_state_for_handler.clone(),
+                        db_path_for_handler.clone(),
+                        cosine_index_for_handler.clone(),
+                    );
+                }
+                Err(e) => {
+                    warn!("watcher debounce error: {e:?}");
+                }
             }
         },
     ) {
