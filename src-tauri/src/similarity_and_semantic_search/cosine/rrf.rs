@@ -226,41 +226,73 @@ mod tests {
     }
 
     #[test]
-    fn k_rrf_smaller_amplifies_top_of_list() {
-        // With a tiny k_rrf, #1 in CLIP (1/2 = 0.5) should beat
-        // a 2-encoder consensus where everyone agrees at rank 5
-        // (2 * 1/(1+5) = 0.333). With k_rrf=60, that flips: #1 in
-        // CLIP only contributes 1/61 ≈ 0.0164, while the 2-encoder
-        // rank-5 consensus contributes 2 * 1/65 ≈ 0.0308.
-        let clip_strong = RankedList {
+    fn k_rrf_changes_lone_vs_consensus_score_ratio() {
+        // Direct math assertion: at small k, a singleton-rank-1 entry
+        // outscores a deep consensus; at large k, the consensus
+        // outscores it. This is the sharpness intuition that justifies
+        // k_rrf=60 as the canonical default.
+        //
+        // The previous version of this test asserted ordering, but
+        // multiple entries can score IDENTICAL contributions at small
+        // k (e.g. two encoders' rank-1 items both = 1/(k+1)) and the
+        // unstable sort would pick either as fused[0] — flaky. Asserting
+        // the SCORE directly avoids the tie-break dependency.
+        //
+        //   /lone.jpg     — only in clip at rank 1.   score = 1/(k+1)
+        //   /consensus.jpg — in clip rank 5 + dinov2 rank 1.
+        //                   score = 1/(k+5) + 1/(k+1)
+        //
+        // At k=1:    lone = 0.5     consensus = 1/6 + 1/2 = 0.667
+        //            ratio consensus/lone = 1.333 → consensus already winning
+        //            (because dinov2's only entry is at rank 1; /consensus
+        //            collects a rank-1 contribution from dinov2)
+        // At k=60:   lone = 1/61 ≈ 0.01639
+        //            consensus = 1/65 + 1/61 ≈ 0.03177
+        //            ratio = 1.94
+        //
+        // The thing that changes with k is the RATIO between the two
+        // scores. Larger k flattens the curve — dinov2's rank-1 hit on
+        // /consensus and clip's rank-5 hit on /consensus both contribute
+        // more equally, magnifying the consensus advantage.
+        let clip = RankedList {
             encoder_id: "clip".into(),
             items: vec![
-                (p("/clip_only.jpg"), 0.99),
+                (p("/lone.jpg"), 0.99),
                 (p("/_a.jpg"), 0.10),
                 (p("/_b.jpg"), 0.10),
                 (p("/_c.jpg"), 0.10),
-                (p("/_d.jpg"), 0.10),
                 (p("/consensus.jpg"), 0.10),
             ],
         };
         let dinov2 = RankedList {
             encoder_id: "dinov2".into(),
-            items: vec![
-                (p("/_x.jpg"), 0.5),
-                (p("/_y.jpg"), 0.5),
-                (p("/_z.jpg"), 0.5),
-                (p("/_w.jpg"), 0.5),
-                (p("/consensus.jpg"), 0.5),
-            ],
+            items: vec![(p("/consensus.jpg"), 0.5)],
         };
 
-        let fused_small = reciprocal_rank_fusion(&[clip_strong.clone(), dinov2.clone()], 1, 10);
-        // k=1 → top-of-list dominates → /clip_only.jpg should win.
-        assert_eq!(fused_small[0].path, p("/clip_only.jpg"));
+        let small = reciprocal_rank_fusion(&[clip.clone(), dinov2.clone()], 1, 10);
+        let large = reciprocal_rank_fusion(&[clip, dinov2], 60, 10);
 
-        let fused_large = reciprocal_rank_fusion(&[clip_strong, dinov2], 60, 10);
-        // k=60 → consensus dominates → /consensus.jpg should win.
-        assert_eq!(fused_large[0].path, p("/consensus.jpg"));
+        let lone_small = small.iter().find(|f| f.path == p("/lone.jpg")).unwrap();
+        let consensus_small = small
+            .iter()
+            .find(|f| f.path == p("/consensus.jpg"))
+            .unwrap();
+        let lone_large = large.iter().find(|f| f.path == p("/lone.jpg")).unwrap();
+        let consensus_large = large
+            .iter()
+            .find(|f| f.path == p("/consensus.jpg"))
+            .unwrap();
+
+        // The consensus advantage grows as k grows — that's the whole
+        // point of the k_rrf knob.
+        let ratio_small = consensus_small.fused_score / lone_small.fused_score;
+        let ratio_large = consensus_large.fused_score / lone_large.fused_score;
+        assert!(
+            ratio_large > ratio_small,
+            "consensus/lone ratio should grow as k grows (small={ratio_small}, \
+             large={ratio_large}); k_rrf flattens contribution per encoder, \
+             which magnifies the consensus advantage"
+        );
     }
 
     #[test]

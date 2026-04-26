@@ -28,26 +28,43 @@ export async function fetchImages(
       matchAllTags,
     });
 
-    // Convert backend data to frontend ImageItem format
-    // Now using dimensions from backend (stored during thumbnail generation)
-    const images: ImageItem[] = imagesDB.map((img) => {
-      const url = convertFileSrc(img.path);
-      // Use thumbnail URL if available, otherwise fall back to full image
-      const thumbnailUrl = img.thumbnail_path
-        ? convertFileSrc(img.thumbnail_path)
-        : url;
+    // Convert backend data to frontend ImageItem format.
+    //
+    // Filter out images that haven't been thumbnailed yet (NULL
+    // width/height in the DB). The Masonry layout sizes each tile by
+    // aspect ratio; rows with missing dimensions used to fall back to
+    // the 800×600 default, which produced a visibly mixed grid during
+    // indexing — placeholder tiles rendered at 4:3 next to actual
+    // ~16:9 phone photos. The user's report described it as "really
+    // vertical [tiles] and weird spacing between them."
+    //
+    // Better UX: skip the row entirely until its thumbnail is generated
+    // (which is what populates width/height in the DB). The status pill
+    // already shows progress; the grid populates progressively as
+    // thumbnails land. Layout never reshuffles mid-encoding.
+    //
+    // The DEFAULT_WIDTH/DEFAULT_HEIGHT constants are kept as a
+    // belt-and-braces fallback in case a row somehow gets through with
+    // partial dimensions, but the filter below means they should
+    // basically never fire in practice.
+    const images: ImageItem[] = imagesDB
+      .filter((img) => img.width != null && img.height != null)
+      .map((img) => {
+        const url = convertFileSrc(img.path);
+        const thumbnailUrl = img.thumbnail_path
+          ? convertFileSrc(img.thumbnail_path)
+          : url;
 
-      return {
-        id: img.id,
-        name: img.name,
-        url,
-        thumbnailUrl,
-        // Use dimensions from backend, or defaults if not available
-        width: img.width ?? DEFAULT_WIDTH,
-        height: img.height ?? DEFAULT_HEIGHT,
-        tags: img.tags,
-      };
-    });
+        return {
+          id: img.id,
+          name: img.name,
+          url,
+          thumbnailUrl,
+          width: img.width ?? DEFAULT_WIDTH,
+          height: img.height ?? DEFAULT_HEIGHT,
+          tags: img.tags,
+        };
+      });
 
     // Apply sort mode frontend-side. Backend returned stable order
     // by id; we re-order here as the user prefers.
@@ -296,10 +313,44 @@ export async function fetchFusedSimilarImages(
 }
 
 /**
- * Semantic search: find images matching a text query using CLIP embeddings.
- * Supports 50+ languages thanks to the multilingual CLIP model.
+ * Phase 11d — text-image multi-encoder rank-fusion.
  *
- * @param query - The search text (e.g., "blue ocean", "dog playing", "夕焼け")
+ * Calls every enabled text-supporting encoder (CLIP English + SigLIP-2;
+ * DINOv2 is image-only and is implicitly skipped), encodes the query
+ * through each, scores against each encoder's image cache, fuses the
+ * resulting ranked lists via Reciprocal Rank Fusion. Mirrors the
+ * image-image fusion path in `fetchFusedSimilarImages`.
+ *
+ * The list of "enabled" encoders comes from the backend
+ * (settings.json::enabled_encoders) — toggled via the EncoderSection
+ * Settings panel.
+ *
+ * `topN` defaults to 50 to match the previous semantic_search default.
+ */
+export async function fetchFusedSemanticSearch(
+  query: string,
+  topN: number = 50,
+  perEncoderTopK?: number
+): Promise<SimilarImageItem[]> {
+  try {
+    const results: Parameters<typeof mapImageSearchResult>[0][] = await perfInvoke(
+      "get_fused_semantic_search",
+      { query, topN, perEncoderTopK }
+    );
+    return results.map(mapImageSearchResult);
+  } catch (error) {
+    console.error("[Frontend] Error in fetchFusedSemanticSearch:", error);
+    throw new Error(formatApiError(error));
+  }
+}
+
+/**
+ * LEGACY (Phase 4 single-encoder dispatch). Preserved as an internal
+ * fallback so anything that imports `semanticSearch` directly keeps
+ * working. New consumers should use `fetchFusedSemanticSearch` so they
+ * benefit from text-side rank fusion across enabled text encoders.
+ *
+ * @param query - The search text
  * @param topN - Maximum number of results to return (default: 50)
  */
 export async function semanticSearch(
@@ -308,12 +359,6 @@ export async function semanticSearch(
   textEncoderId?: string
 ): Promise<SimilarImageItem[]> {
   try {
-    // Phase 4 — backend dispatches on textEncoderId. Recognised values:
-    //   "siglip2_base"   → SigLIP-2 768-d
-    //   "clip_vit_b_32"  → CLIP English 512-d (default)
-    //   undefined / unknown → CLIP fallback
-    // The frontend pulls this from useUserPreferences().textEncoder so
-    // the picker selection in SettingsDrawer is honoured.
     const results: Parameters<typeof mapImageSearchResult>[0][] = await perfInvoke(
       "semantic_search",
       { query, topN, textEncoderId }

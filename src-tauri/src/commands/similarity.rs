@@ -167,14 +167,18 @@ pub fn get_fused_similar_images(
         .find(|img| img.id == image_id)
         .map(|img| PathBuf::from(&img.path));
 
-    // Encoder set is the same as cross_encoder_comparison —
-    // dinov2_small is the legacy 384-d id, excluded.
-    const FUSION_ENCODERS: &[&str] = &["clip_vit_b_32", "siglip2_base", "dinov2_base"];
+    // Phase 11c — fusion only iterates over user-enabled encoders.
+    // settings.json's `enabled_encoders` is the source of truth;
+    // disabled encoders' embeddings stay in the DB (so re-enabling
+    // is instant) but they don't contribute to fusion. Always at
+    // least one encoder per the IPC validator.
+    let enabled = crate::settings::Settings::load().resolved_enabled_encoders();
+    let fusion_encoders: Vec<&str> = enabled.iter().map(|s| s.as_str()).collect();
 
-    let mut ranked_lists: Vec<RankedList> = Vec::with_capacity(FUSION_ENCODERS.len());
+    let mut ranked_lists: Vec<RankedList> = Vec::with_capacity(fusion_encoders.len());
     let mut per_encoder_diag: Vec<serde_json::Value> = Vec::new();
 
-    for enc in FUSION_ENCODERS {
+    for &enc in &fusion_encoders {
         let enc_started = std::time::Instant::now();
         // Pull this encoder's embedding for the query image.
         let q_emb = db.get_embedding(image_id, enc).ok();
@@ -285,7 +289,7 @@ pub fn get_fused_similar_images(
                 .iter()
                 .map(|r| r.encoder_id.clone())
                 .collect::<Vec<_>>(),
-            "encoders_skipped": FUSION_ENCODERS.len() - ranked_lists.len(),
+            "encoders_skipped": fusion_encoders.len() - ranked_lists.len(),
             "fused_result_count": fused.len(),
             "resolved_count": results.len(),
             "thumbnail_misses": thumb_misses,

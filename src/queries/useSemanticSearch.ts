@@ -1,35 +1,36 @@
 import { useQuery } from "@tanstack/react-query";
-import { semanticSearch } from "../services/images";
+import { fetchFusedSemanticSearch } from "../services/images";
 import { SimilarImageItem } from "../types";
-import { useUserPreferences } from "../hooks/useUserPreferences";
 
 /**
- * React Query hook for semantic search.
+ * Phase 11d — text-image search routes through multi-encoder rank
+ * fusion across every enabled text-supporting encoder.
  *
- * Phase 4 — dispatches through the user's `textEncoder` preference
- * (CLIP English vs SigLIP-2 multilingual-ish). The encoder id flows
- * into the queryKey so a switch in the picker invalidates the cached
- * results — different encoders produce different result orderings,
- * stale cache from the previous encoder would be misleading.
+ * The hook keeps its previous name so existing call sites
+ * (`pages/[...slug].tsx` etc.) don't change shape. The implementation
+ * now calls `get_fused_semantic_search`, which reads
+ * settings.json::enabled_encoders to pick which text encoders
+ * contribute. The user controls that list via the EncoderSection
+ * toggles in the Settings drawer.
  *
- * @param query - The search text
- * @param topN - Maximum number of results (default: 50)
+ * Why no encoder id in the queryKey: the enabled set is process-
+ * global (lives in settings.json on the backend). Toggling an
+ * encoder doesn't dirty React's per-hook cache — but the fused
+ * results WILL differ, so we'd want an invalidation signal. Today
+ * that signal would arrive via app restart or a future
+ * "encoders-changed" event. For now, users may need to retype the
+ * query after toggling encoders to see the new fusion. Acceptable
+ * trade-off; the enabled toggles are not high-frequency mutations.
  */
 export function useSemanticSearch(query: string, topN: number = 50) {
   const trimmedQuery = query.trim();
-  const { prefs } = useUserPreferences();
-  const textEncoderId = prefs.textEncoder;
 
   return useQuery<SimilarImageItem[]>({
-    queryKey: ["semantic-search", trimmedQuery, topN, textEncoderId],
-    queryFn: () => semanticSearch(trimmedQuery, topN, textEncoderId),
-    // Only run the query if there's actual search text
+    queryKey: ["fused-semantic-search", trimmedQuery, topN],
+    queryFn: () => fetchFusedSemanticSearch(trimmedQuery, topN),
     enabled: trimmedQuery.length > 0,
-    // Cache results for 5 minutes
     staleTime: 1000 * 60 * 5,
-    // Keep in cache for 10 minutes
     gcTime: 1000 * 60 * 10,
-    // Don't refetch on window focus for search results
     refetchOnWindowFocus: false,
   });
 }

@@ -561,46 +561,44 @@ fn run_encoder_phase(
     cosine_index: &Arc<std::sync::Mutex<CosineIndex>>,
     cosine_current_encoder: &Arc<std::sync::Mutex<String>>,
 ) -> Result<(), String> {
-    // Encodes through three image encoders sequentially. Order is
-    // dynamic — the user's `priority_image_encoder` setting (if any)
-    // runs FIRST so its embeddings land in the DB ASAP and the cosine
-    // cache hot-populates for it as soon as the phase finishes. The
-    // other two then run in their default order behind it. This
-    // addresses the "I picked DINOv2 but encoding spent 20 minutes on
-    // SigLIP-2 first" UX problem.
+    // Phase 11c + 11e — encode through every USER-ENABLED image
+    // encoder, in parallel.
     //
-    // Default order (no priority set, or priority unrecognised):
-    //   1. CLIP-ViT-B/32 (also written to legacy images.embedding for
-    //      back-compat with semantic_search's existing call site)
-    //   2. SigLIP-2-Base
-    //   3. DINOv2-Base
+    // Each enabled encoder gets its own thread. Each thread opens its
+    // own ImageDatabase (separate writer + reader connections; SQLite
+    // WAL handles concurrent commits) so the encoder loops don't
+    // contend on a single Mutex<Connection>. The R1 batched writes
+    // mean each encoder commits relatively few times even under heavy
+    // load, and SQLite's WAL serialises commits at the file layer
+    // without blocking readers.
     //
-    // Each encoder's results land in the embeddings table keyed by
-    // (image_id, encoder_id), so swapping encoders in Settings later
-    // doesn't require re-encoding.
+    // Why no priority concept anymore: the Phase 5 RRF fusion uses
+    // every enabled encoder, so "which one runs first" no longer maps
+    // to user-visible benefit. The cosine cache hot-populate that
+    // used to be paired with the priority encoder is also retired —
+    // the FusionIndexState lazy-populates per encoder on first fusion
+    // call, and there's no single "active" encoder cache to warm.
     //
-    // Sequential rather than parallel because each encoder is single-
-    // threaded ONNX inference — running them all in parallel would
-    // contend on the same CPU cores. Future optimisation: use rayon's
-    // pool to interleave preprocessing across encoders.
-    let _encode_phase = tracing::info_span!("pipeline.encode_phase").entered();
+    // Why no `_encode_phase` span: each encoder thread opens its own
+    // span via `run_clip_encoder` / `run_trait_encoder`'s tracing
+    // instrumentation, so a parent span here would mostly capture
+    // join wait time, not actual work. Leaving it omitted keeps the
+    // perf report's per-encoder timings clean.
+    //
+    // Oversubscription note: each encoder still uses the shared
+    // `ort_session.rs` builder with `intra_threads(4)` (set for the
+    // M2 4-perf-core cluster). With 3 encoders concurrent that's 12
+    // ORT threads on 8 cores — some oversubscription. The OS
+    // scheduler handles this OK in practice (matmul-bound work
+    // doesn't suffer linearly from oversubscription), but if a
+    // future perf report shows it bites, the fix is to make
+    // `intra_threads` dynamic in `ort_session.rs`: pass
+    // `4 / enabled_count` as a parameter.
 
-    let database = ImageDatabase::new(db_path).map_err(|e| e.to_string())?;
-
-    // Read the priority pick once at phase start; ignore None / empty /
-    // unknown so the default order applies as a safe fallback.
-    let priority = crate::settings::Settings::load()
-        .priority_image_encoder
-        .filter(|s| !s.is_empty())
-        .unwrap_or_default();
-
-    // Default order, then move priority to the front (if recognised).
-    let mut order: Vec<&str> = vec!["clip_vit_b_32", "siglip2_base", "dinov2_base"];
-    if let Some(pos) = order.iter().position(|e| *e == priority.as_str()) {
-        let p = order.remove(pos);
-        order.insert(0, p);
-    }
-    info!("encoder order this run: {order:?} (priority={priority:?})");
+    // Enabled-encoder list from settings. Default = every supported
+    // encoder if the user hasn't picked anything yet.
+    let enabled = crate::settings::Settings::load().resolved_enabled_encoders();
+    info!("encoder phase: enabled = {enabled:?}");
 
     let siglip2_path = paths::models_dir().join(
         crate::similarity_and_semantic_search::encoder_siglip2::SIGLIP2_IMAGE_MODEL_FILENAME,
@@ -609,63 +607,110 @@ fn run_encoder_phase(
         crate::similarity_and_semantic_search::encoder_dinov2::DINOV2_IMAGE_MODEL_FILENAME,
     );
 
-    for encoder_id in order {
-        match encoder_id {
-            "clip_vit_b_32" => {
-                run_clip_encoder(app, &database, image_model_path)?;
-            }
-            "siglip2_base" => {
-                if siglip2_path.exists() {
-                    run_trait_encoder(
-                        app,
-                        &database,
-                        "siglip2_base",
-                        || crate::similarity_and_semantic_search::encoder_siglip2::Siglip2ImageEncoder::new(&siglip2_path),
-                    )?;
-                } else {
-                    warn!("SigLIP-2 image model missing at {}; skipping", siglip2_path.display());
-                    continue; // don't hot-populate for an encoder that didn't run
-                }
-            }
-            "dinov2_base" => {
-                if dinov2_path.exists() {
-                    run_trait_encoder(
-                        app,
-                        &database,
-                        crate::similarity_and_semantic_search::encoder_dinov2::DINOV2_ENCODER_ID,
-                        || crate::similarity_and_semantic_search::encoder_dinov2::Dinov2ImageEncoder::new(&dinov2_path),
-                    )?;
-                } else {
-                    warn!("DINOv2 image model missing at {}; skipping", dinov2_path.display());
-                    continue;
-                }
-            }
-            _ => continue,
-        }
+    // Spawn one thread per enabled encoder. Each thread is independent
+    // (own DB connection, own ORT session, own progress events) so
+    // they don't have to coordinate during the loop.
+    let mut handles: Vec<thread::JoinHandle<Result<(), String>>> = Vec::new();
 
-        // Per-encoder hot-populate of the cosine cache. Only fires for
-        // the priority encoder — the cache holds ONE encoder at a time,
-        // and the user's image-image picker drives which one. As soon
-        // as that encoder's phase finishes, image-image becomes
-        // searchable without waiting for the other encoders.
-        //
-        // Lock order MUST match `CosineIndexState::ensure_loaded_for`
-        // (current_encoder_id first, then index). Reversing the order
-        // here would risk a deadlock against a concurrent search call,
-        // and a write-only-to-index-then-id sequence opens a window
-        // where a search reads the old id but the freshly-populated
-        // cache and silently wipes it by repopulating for the old id.
-        if encoder_id == priority {
-            info!("hot-populating cosine cache for priority encoder '{encoder_id}'");
-            if let (Ok(mut cur), Ok(mut idx)) =
-                (cosine_current_encoder.lock(), cosine_index.lock())
-            {
-                idx.populate_from_db_for_encoder(&database, encoder_id);
-                *cur = encoder_id.to_string();
+    for encoder_id in &enabled {
+        let encoder_id = encoder_id.clone();
+        let app = app.clone();
+        let db_path = db_path.to_string();
+        let image_model_path = image_model_path.to_path_buf();
+        let siglip2_path = siglip2_path.clone();
+        let dinov2_path = dinov2_path.clone();
+
+        handles.push(thread::spawn(move || -> Result<(), String> {
+            // Per-thread DB. Two connections (writer + read-only
+            // secondary) per encoder — at 3 enabled encoders that's
+            // 6 SQLite connections to the same WAL'd file. That's well
+            // within SQLite's healthy concurrency envelope.
+            let database = ImageDatabase::new(&db_path).map_err(|e| e.to_string())?;
+            // Initialise so the read-only secondary opens. Schema-create
+            // is idempotent (`CREATE TABLE IF NOT EXISTS`) so racing
+            // initialise() calls across threads don't corrupt anything;
+            // the first one in the WAL wins, the rest no-op.
+            database.initialize().map_err(|e| e.to_string())?;
+
+            match encoder_id.as_str() {
+                "clip_vit_b_32" => run_clip_encoder(&app, &database, &image_model_path),
+                "siglip2_base" => {
+                    if siglip2_path.exists() {
+                        run_trait_encoder(
+                            &app,
+                            &database,
+                            "siglip2_base",
+                            || crate::similarity_and_semantic_search::encoder_siglip2::Siglip2ImageEncoder::new(&siglip2_path),
+                        )
+                    } else {
+                        warn!(
+                            "SigLIP-2 image model missing at {}; skipping",
+                            siglip2_path.display()
+                        );
+                        Ok(())
+                    }
+                }
+                "dinov2_base" => {
+                    if dinov2_path.exists() {
+                        run_trait_encoder(
+                            &app,
+                            &database,
+                            crate::similarity_and_semantic_search::encoder_dinov2::DINOV2_ENCODER_ID,
+                            || crate::similarity_and_semantic_search::encoder_dinov2::Dinov2ImageEncoder::new(&dinov2_path),
+                        )
+                    } else {
+                        warn!(
+                            "DINOv2 image model missing at {}; skipping",
+                            dinov2_path.display()
+                        );
+                        Ok(())
+                    }
+                }
+                other => {
+                    warn!("encoder phase: ignoring unknown enabled id '{other}'");
+                    Ok(())
+                }
+            }
+        }));
+    }
+
+    // Join every thread. We surface the first error encountered but
+    // wait for the others to finish so a fast-failing CLIP doesn't
+    // leave SigLIP-2 / DINOv2 mid-encode.
+    let mut first_err: Option<String> = None;
+    for h in handles {
+        match h.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                if first_err.is_none() {
+                    first_err = Some(e.clone());
+                }
+                error!("encoder thread failed: {e}");
+            }
+            Err(panic) => {
+                let msg = format!("encoder thread panicked: {panic:?}");
+                if first_err.is_none() {
+                    first_err = Some(msg.clone());
+                }
+                error!("{msg}");
             }
         }
     }
+    if let Some(e) = first_err {
+        return Err(e);
+    }
 
+    // The primary CosineIndexState's cache hot-populate that used to
+    // run here (per priority encoder) is gone — fusion uses
+    // FusionIndexState's lazy per-encoder caches instead. We
+    // intentionally keep `cosine_index` + `cosine_current_encoder` as
+    // function parameters because the legacy single-encoder path
+    // (semantic_search when the user picks a single text encoder, or
+    // get_similar_images when fusion isn't engaged) still reads from
+    // them. Touching them here would race with foreground search
+    // calls; better to let `ensure_loaded_for` lazy-populate on first
+    // search.
+    let _ = (cosine_index, cosine_current_encoder);
     Ok(())
 }
 

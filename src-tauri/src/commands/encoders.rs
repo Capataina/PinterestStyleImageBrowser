@@ -58,68 +58,91 @@ pub fn list_available_encoders() -> Vec<EncoderInfo> {
     ENCODERS.to_vec()
 }
 
-/// Persist the user's image-encoder pick so the indexing pipeline can
-/// run that encoder first and hot-populate the cosine cache for it as
-/// soon as its phase finishes. Without this, the pipeline always runs
-/// CLIP → SigLIP-2 → DINOv2 in fixed order — picking DINOv2 means
-/// waiting for the other two to finish before yours starts.
-///
-/// Stored in `settings.json` under `priority_image_encoder`. The
-/// indexing pipeline reads it at the start of each spawn, so a change
-/// here only takes effect on the next pipeline run (e.g. add_root,
-/// app launch, or watcher rescan).
-///
-/// Validation: the id must match one of the encoders in `ENCODERS`.
-/// Unknown ids return BadInput so the frontend can surface the error
-/// rather than silently writing a value the pipeline will ignore.
-/// Validate `id` against the compiled encoder list. Extracted so the
-/// command body and the unit tests share one definition of "is this a
-/// pickable image encoder" — adding a fourth encoder shouldn't require
-/// touching multiple call sites.
-fn is_known_image_encoder(id: &str) -> bool {
-    ENCODERS.iter().any(|e| e.id == id && e.supports_image)
+/// Validate `id` against the compiled encoder list — used by the
+/// per-encoder enable/disable validation. Adding a 4th encoder
+/// requires only updating the static `ENCODERS` array; this helper
+/// stays as-is.
+fn is_known_encoder(id: &str) -> bool {
+    ENCODERS.iter().any(|e| e.id == id)
 }
 
-/// Pure decision function for the `set_priority_image_encoder` command —
-/// extracted from the command body so it's testable without filesystem
-/// isolation games (`paths::settings_path()` resolves to a process-wide
-/// location, so two parallel cargo tests sharing it would race).
+/// Phase 11c — pure decision function for `set_enabled_encoders`.
 ///
 /// Returns:
-///   - `Err(BadInput)` if `id` isn't a known image encoder,
-///   - `Ok(None)` if the value already matches what's persisted (the
-///     idempotent short-circuit — caller skips the disk write),
-///   - `Ok(Some(id))` if a write is needed; caller persists the value.
+///   - `Err(BadInput)` if any requested id isn't in `ENCODERS`,
+///   - `Err(BadInput)` if the resulting list would be empty (we never
+///     allow zero encoders — that silently bricks every search),
+///   - `Ok(None)` if the requested set already matches what's
+///     persisted (idempotent short-circuit; caller skips the disk
+///     write to avoid settings.json churn),
+///   - `Ok(Some(deduped_sorted))` if a write is needed.
 ///
-/// The on-exit profiling report at t=5.87s showed
-/// `set_priority_image_encoder` firing twice per drawer open. The
-/// frontend `useRef` dedup is the primary fix; this short-circuit is
-/// defence-in-depth so any other caller (current or future) doesn't
-/// produce settings.json churn — every save was paired with an
-/// unnecessary fsync on what was already the persisted value.
-fn decide_priority_write(
-    current: Option<&str>,
-    requested: &str,
-) -> Result<Option<String>, super::ApiError> {
-    if !is_known_image_encoder(requested) {
-        return Err(super::ApiError::BadInput(format!(
-            "Unknown image encoder id '{requested}' — not in the available encoders list"
-        )));
+/// The dedup-and-sort makes equality comparison stable regardless of
+/// frontend ordering — `["clip", "dino"]` and `["dino", "clip"]`
+/// hash-equal under this function so the dedup doesn't fight the
+/// user.
+pub(crate) fn decide_enabled_write(
+    current: Option<&[String]>,
+    requested: &[String],
+) -> Result<Option<Vec<String>>, super::ApiError> {
+    let mut deduped: Vec<String> = Vec::new();
+    for id in requested {
+        if !is_known_encoder(id) {
+            return Err(super::ApiError::BadInput(format!(
+                "Unknown encoder id '{id}' — not in the available encoders list"
+            )));
+        }
+        if !deduped.iter().any(|d| d == id) {
+            deduped.push(id.clone());
+        }
     }
-    if current == Some(requested) {
+    deduped.sort();
+
+    if deduped.is_empty() {
+        return Err(super::ApiError::BadInput(
+            "Cannot disable every encoder — at least one must be enabled".into(),
+        ));
+    }
+
+    let current_normalised: Option<Vec<String>> = current.map(|c| {
+        let mut v = c.to_vec();
+        v.sort();
+        v.dedup();
+        v
+    });
+    if current_normalised.as_deref() == Some(deduped.as_slice()) {
         return Ok(None);
     }
-    Ok(Some(requested.to_string()))
+    Ok(Some(deduped))
 }
 
+/// Read the persisted enabled-encoder list. Returns the resolved list
+/// (falls back to the default set if the user hasn't set a
+/// preference). Frontend uses this to populate the toggle states on
+/// drawer mount.
 #[tauri::command]
-#[tracing::instrument(name = "ipc.set_priority_image_encoder", skip())]
-pub fn set_priority_image_encoder(id: String) -> Result<(), super::ApiError> {
+#[tracing::instrument(name = "ipc.get_enabled_encoders")]
+pub fn get_enabled_encoders() -> Vec<String> {
+    crate::settings::Settings::load().resolved_enabled_encoders()
+}
+
+/// Persist the per-encoder enable/disable list. Frontend calls this
+/// when the user toggles any encoder switch in the Settings drawer.
+///
+/// The new value takes effect immediately for fusion (the next
+/// `get_fused_similar_images` / `get_fused_semantic_search` call
+/// reads from this list) and on the next indexing pipeline run for
+/// encoding (re-enabled encoders only re-encode the rows they don't
+/// already have rows for).
+#[tauri::command]
+#[tracing::instrument(name = "ipc.set_enabled_encoders", skip())]
+pub fn set_enabled_encoders(ids: Vec<String>) -> Result<(), super::ApiError> {
     let mut s = crate::settings::Settings::load();
-    match decide_priority_write(s.priority_image_encoder.as_deref(), &id)? {
-        None => Ok(()), // already at requested value — no disk write
+    let current = s.enabled_encoders.as_deref();
+    match decide_enabled_write(current, &ids)? {
+        None => Ok(()),
         Some(next) => {
-            s.priority_image_encoder = Some(next);
+            s.enabled_encoders = Some(next);
             s.save().map_err(|e| {
                 super::ApiError::Internal(format!("settings save failed: {e}"))
             })?;
@@ -133,11 +156,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decide_write_rejects_unknown_encoder() {
-        // BadInput is the same shape the original command produced —
-        // frontend surfaces this rather than silently writing a value
-        // the indexing pipeline would ignore.
-        let err = decide_priority_write(None, "not_a_real_encoder").unwrap_err();
+    fn decide_enabled_rejects_unknown_id() {
+        let err = decide_enabled_write(None, &["not_a_real_encoder".into()]).unwrap_err();
         match err {
             super::super::ApiError::BadInput(msg) => {
                 assert!(msg.contains("not_a_real_encoder"));
@@ -147,35 +167,50 @@ mod tests {
     }
 
     #[test]
-    fn decide_write_short_circuits_when_value_matches() {
-        // Regression test for the on-exit profiling-report finding at
-        // t=5.87s: `set_priority_image_encoder` fired twice per drawer
-        // open, each call doing a full settings.json round-trip even
-        // though the value never changed. The frontend now dedupes via
-        // useRef, this asserts the backend also no-ops on a same-value
-        // push so any future caller can't reintroduce the churn.
-        let result = decide_priority_write(Some("dinov2_base"), "dinov2_base").unwrap();
+    fn decide_enabled_rejects_empty_list() {
+        // Disabling every encoder would silently break every fusion
+        // call. Reject at the IPC boundary so the user gets a
+        // surface-level error and the toggle bounces back.
+        let err = decide_enabled_write(Some(&["clip_vit_b_32".into()]), &[]).unwrap_err();
+        match err {
+            super::super::ApiError::BadInput(msg) => {
+                assert!(msg.contains("at least one"));
+            }
+            other => panic!("expected BadInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decide_enabled_short_circuits_on_set_equality() {
+        // Same set, different order — must produce no write.
+        let result = decide_enabled_write(
+            Some(&["dinov2_base".into(), "clip_vit_b_32".into()]),
+            &["clip_vit_b_32".into(), "dinov2_base".into()],
+        )
+        .unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn decide_enabled_proceeds_on_set_change() {
+        let result = decide_enabled_write(
+            Some(&["clip_vit_b_32".into()]),
+            &["clip_vit_b_32".into(), "dinov2_base".into()],
+        )
+        .unwrap();
         assert_eq!(
-            result, None,
-            "matching current value must short-circuit (no Some(_)) so the caller skips the disk write"
+            result,
+            Some(vec!["clip_vit_b_32".to_string(), "dinov2_base".to_string()])
         );
     }
 
     #[test]
-    fn decide_write_proceeds_when_value_changes() {
-        // The dedup must not silently drop a genuine encoder change —
-        // that would leave settings.json out of sync with the picker
-        // and the next pipeline run would use the old priority.
-        let result = decide_priority_write(Some("clip_vit_b_32"), "dinov2_base").unwrap();
-        assert_eq!(result, Some("dinov2_base".to_string()));
-    }
-
-    #[test]
-    fn decide_write_proceeds_when_no_prior_value() {
-        // First-ever set: settings.json has no priority_image_encoder
-        // field yet (None), the user picks one in the drawer. Must
-        // produce a write so the pipeline picks it up next run.
-        let result = decide_priority_write(None, "dinov2_base").unwrap();
-        assert_eq!(result, Some("dinov2_base".to_string()));
+    fn decide_enabled_dedupes_input() {
+        // Frontend toggle quirks shouldn't end up persisting
+        // `["clip", "clip"]`.
+        let result =
+            decide_enabled_write(None, &["clip_vit_b_32".into(), "clip_vit_b_32".into()])
+                .unwrap();
+        assert_eq!(result, Some(vec!["clip_vit_b_32".to_string()]));
     }
 }

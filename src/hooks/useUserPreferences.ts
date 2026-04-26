@@ -39,22 +39,18 @@ export interface UserPreferences {
   /** Whether multi-tag filter ANDs (all) or ORs (any). */
   tagFilterMode: TagFilterMode;
   /**
-   * Encoder used for "View Similar" (image→image) queries.
-   * Matches the encoder_id values returned by the backend
-   * `list_available_encoders` command.
-   * Default `dinov2_base` — DINOv2 dominates CLIP for image-image
-   * similarity by 2-5× on benchmarks. (Was `dinov2_small` in older
-   * builds; that ID is dead post pipeline-version 2 and would route
-   * every "View Similar" click to an empty cosine cache.)
+   * LEGACY (deprecated 2026-04-26 with Phase 11c).
+   *
+   * Was the user's primary image encoder back when the picker was a
+   * single-choice dropdown. Phase 5 RRF + Phase 11c per-encoder
+   * toggles obsolete the priority concept: fusion uses every enabled
+   * encoder. Field kept on the type so existing localStorage
+   * deserialises without erroring; the value is ignored — the
+   * Settings drawer reads `enabled_encoders` from the backend
+   * (settings.json) instead.
    */
   imageEncoder: string;
-  /**
-   * Encoder used for text→image semantic search.
-   * Default `clip_vit_b_32` because the SigLIP-2 text encoder
-   * dispatch isn't fully wired yet — picker accepts the choice
-   * but only CLIP path is functional today. SigLIP-2 text
-   * dispatch is the natural next iteration.
-   */
+  /** LEGACY — same shape as `imageEncoder`, ignored. */
   textEncoder: string;
 }
 

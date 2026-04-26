@@ -219,6 +219,44 @@ describe("services/images", () => {
   });
 });
 
+describe("services/fusedSemantic", () => {
+  it("fetchFusedSemanticSearch calls get_fused_semantic_search with query + topN + perEncoderTopK", async () => {
+    // Phase 11d — text-image RRF mirrors the image-image fusion.
+    // Backend reads the enabled-encoder list from settings.json and
+    // fuses across every text-supporting encoder in it.
+    const { fetchFusedSemanticSearch } = await import("./images");
+    mockInvoke.mockResolvedValueOnce([]);
+    await fetchFusedSemanticSearch("cyberpunk", 50);
+    expect(mockInvoke).toHaveBeenCalledWith("get_fused_semantic_search", {
+      query: "cyberpunk",
+      topN: 50,
+      perEncoderTopK: undefined,
+    });
+  });
+
+  it("fetchFusedSemanticSearch defaults topN to 50", async () => {
+    const { fetchFusedSemanticSearch } = await import("./images");
+    mockInvoke.mockResolvedValueOnce([]);
+    await fetchFusedSemanticSearch("street");
+    expect(mockInvoke).toHaveBeenCalledWith("get_fused_semantic_search", {
+      query: "street",
+      topN: 50,
+      perEncoderTopK: undefined,
+    });
+  });
+
+  it("fetchFusedSemanticSearch forwards perEncoderTopK when set", async () => {
+    const { fetchFusedSemanticSearch } = await import("./images");
+    mockInvoke.mockResolvedValueOnce([]);
+    await fetchFusedSemanticSearch("street", 50, 200);
+    expect(mockInvoke).toHaveBeenCalledWith("get_fused_semantic_search", {
+      query: "street",
+      topN: 50,
+      perEncoderTopK: 200,
+    });
+  });
+});
+
 describe("services/fusedSimilar", () => {
   it("fetchFusedSimilarImages calls get_fused_similar_images with imageId + topN + perEncoderTopK", async () => {
     // Phase 5 — replaces the tiered random-sampling system. Backend

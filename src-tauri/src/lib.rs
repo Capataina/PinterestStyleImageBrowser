@@ -227,7 +227,9 @@ pub struct TextEncoderState {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run(db: ImageDatabase, db_path: String) {
-    use commands::encoders::{list_available_encoders, set_priority_image_encoder};
+    use commands::encoders::{
+        get_enabled_encoders, list_available_encoders, set_enabled_encoders,
+    };
     use commands::images::{get_images, get_pipeline_stats};
     use commands::notes::{get_image_notes, set_image_notes};
     use commands::profiling::{
@@ -238,6 +240,7 @@ pub fn run(db: ImageDatabase, db_path: String) {
         add_root, get_scan_root, list_roots, remove_root, set_root_enabled, set_scan_root,
     };
     use commands::semantic::semantic_search;
+    use commands::semantic_fused::get_fused_semantic_search;
     use commands::similarity::{
         get_fused_similar_images, get_similar_images, get_tiered_similar_images,
     };
@@ -453,7 +456,8 @@ pub fn run(db: ImageDatabase, db_path: String) {
             get_images,
             get_pipeline_stats,
             list_available_encoders,
-            set_priority_image_encoder,
+            get_enabled_encoders,
+            set_enabled_encoders,
             get_tags,
             create_tag,
             delete_tag,
@@ -463,6 +467,7 @@ pub fn run(db: ImageDatabase, db_path: String) {
             get_tiered_similar_images,
             get_fused_similar_images,
             semantic_search,
+            get_fused_semantic_search,
             get_scan_root,
             set_scan_root,
             list_roots,

@@ -26,19 +26,69 @@ pub struct Settings {
     #[serde(default)]
     pub scan_root: Option<PathBuf>,
 
-    /// Encoder ID the user has picked for image→image similarity. Read
-    /// by the indexing pipeline so the priority encoder runs FIRST
-    /// (before the others), and so the cosine cache is hot-populated
-    /// for it as soon as that encoder's phase finishes — instead of
-    /// only at the end of all three phases. Frontend writes via the
-    /// `set_priority_image_encoder` Tauri command whenever the user
-    /// changes the picker. None means "no preference, run in default
-    /// order with CLIP first".
+    /// LEGACY (deprecated 2026-04-26 with Phase 11c).
+    ///
+    /// Was the user's "primary" image encoder back when the picker was
+    /// a single-choice dropdown. The Phase 5 RRF fusion + Phase 11c
+    /// per-encoder toggles obsolete the priority concept: when fusion
+    /// uses every enabled encoder, "which one runs first" no longer
+    /// makes user-visible sense.
+    ///
+    /// Field kept on the struct so old settings.json files deserialise
+    /// without erroring, but the value is ignored — the indexing
+    /// pipeline reads `enabled_encoders` instead. Will be removed once
+    /// every install has been bumped past pipeline-version 4.
     #[serde(default)]
     pub priority_image_encoder: Option<String>,
+
+    /// Encoder IDs that are currently enabled. The indexing pipeline
+    /// only encodes for encoders in this list; image-image fusion and
+    /// text-image fusion only fuse over enabled encoders.
+    ///
+    /// `None` means "use the default set" (every supported encoder
+    /// enabled), which gives a sane out-of-box experience for fresh
+    /// installs and for users who had `priority_image_encoder` set
+    /// under the legacy schema.
+    ///
+    /// User mutates via the `set_enabled_encoders` Tauri command from
+    /// the Settings drawer's encoder toggles. Re-enabling an encoder
+    /// that was previously enabled is INSTANT (its embeddings are still
+    /// in the per-encoder embeddings table) — fusion picks it back up
+    /// as soon as the next call lands. Enabling an encoder that has
+    /// never run requires the next indexing pipeline pass to fill in
+    /// its embeddings.
+    #[serde(default)]
+    pub enabled_encoders: Option<Vec<String>>,
+}
+
+/// Default encoder set when `enabled_encoders` is `None` — every
+/// supported encoder enabled. Adding a 4th encoder = appending its id
+/// here.
+pub const DEFAULT_ENABLED_ENCODERS: &[&str] =
+    &["clip_vit_b_32", "siglip2_base", "dinov2_base"];
+
+impl Settings {
+    /// Returns the resolved enabled-encoder list. Falls back to
+    /// `DEFAULT_ENABLED_ENCODERS` when the user hasn't set a preference.
+    /// Filters out empty strings so a corrupt settings.json with
+    /// `"enabled_encoders": [""]` doesn't silently disable everything.
+    pub fn resolved_enabled_encoders(&self) -> Vec<String> {
+        match &self.enabled_encoders {
+            Some(list) if !list.is_empty() => list
+                .iter()
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .collect(),
+            _ => DEFAULT_ENABLED_ENCODERS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+        }
+    }
 }
 
 impl Settings {
+    /// (Inherent impls split — `resolved_enabled_encoders` lives above.)
     /// Load settings from disk. Returns Settings::default() if the file
     /// does not exist or cannot be parsed (corrupt file = treat as
     /// fresh; we don't want a single bad byte to brick the app).
@@ -132,5 +182,44 @@ mod tests {
         let json = r#"{}"#;
         let s: Settings = serde_json::from_str(json).unwrap();
         assert!(s.scan_root.is_none());
+    }
+
+    #[test]
+    fn test_resolved_enabled_encoders_falls_back_to_default() {
+        let s = Settings::default();
+        let r = s.resolved_enabled_encoders();
+        assert_eq!(r, DEFAULT_ENABLED_ENCODERS);
+    }
+
+    #[test]
+    fn test_resolved_enabled_encoders_honours_user_pick() {
+        let s = Settings {
+            enabled_encoders: Some(vec!["clip_vit_b_32".into()]),
+            ..Settings::default()
+        };
+        let r = s.resolved_enabled_encoders();
+        assert_eq!(r, vec!["clip_vit_b_32".to_string()]);
+    }
+
+    #[test]
+    fn test_resolved_enabled_encoders_strips_empty_strings() {
+        let s = Settings {
+            enabled_encoders: Some(vec!["".into(), "siglip2_base".into()]),
+            ..Settings::default()
+        };
+        let r = s.resolved_enabled_encoders();
+        assert_eq!(r, vec!["siglip2_base".to_string()]);
+    }
+
+    #[test]
+    fn test_resolved_enabled_encoders_empty_list_falls_back() {
+        // An explicit empty list is treated as "use the default" —
+        // never as "disable everything," because that would silently
+        // brick the app for any user who managed to clear all toggles.
+        let s = Settings {
+            enabled_encoders: Some(vec![]),
+            ..Settings::default()
+        };
+        assert_eq!(s.resolved_enabled_encoders(), DEFAULT_ENABLED_ENCODERS);
     }
 }

@@ -29,6 +29,7 @@ pub mod notes;
 pub mod profiling;
 pub mod roots;
 pub mod semantic;
+pub mod semantic_fused;
 pub mod similarity;
 pub mod tags;
 
