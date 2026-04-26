@@ -146,19 +146,6 @@ export default function Home() {
   const _queryClient = useQueryClient();
   void _queryClient;
 
-  // Find selected item from URL
-  useEffect(() => {
-    if (images.data) {
-      const pathId = location.pathname.replace(/\//g, "");
-      const item = images.data.find((i) => i.id.toString() === pathId);
-      setSelectedItem(item || null);
-      // Reset inspecting state when selection changes
-      if (!item) {
-        setIsInspecting(false);
-      }
-    }
-  }, [location, images.data]);
-
   // Determine which images to display:
   // Priority: 1) Similar images (when image selected) > 2) Semantic search > 3) All images
   const displayImages = useMemo(() => {
@@ -198,6 +185,39 @@ export default function Home() {
     images.data,
   ]);
 
+  // Find selected item from URL.
+  //
+  // Bug fix (audit finding 3 + companion in `systems/search-routing.md`):
+  // we must look up the id in `displayImages` FIRST, then fall back to
+  // `images.data`. Previously this only walked `images.data`, which
+  // breaks every semantic-search-result click whose id is not in the
+  // currently-loaded catalogue page (the most common case once the user
+  // has applied a tag filter or shuffled the catalogue). The fix
+  // restores the documented intended behaviour — clicking a search
+  // result selects it.
+  //
+  // The cycle (`displayImages` derives from `selectedItem`,
+  // `selectedItem` derives from `displayImages`) is benign — React
+  // resolves it on the next render: first render computes
+  // displayImages from the previous selectedItem, then the effect runs
+  // and updates selectedItem if the URL changed, then displayImages
+  // recomputes against the new selectedItem.
+  useEffect(() => {
+    const pathId = location.pathname.replace(/\//g, "");
+    if (!pathId) {
+      setSelectedItem(null);
+      setIsInspecting(false);
+      return;
+    }
+    const fromDisplay = displayImages?.find((i) => i.id.toString() === pathId);
+    const fromCatalogue = images.data?.find((i) => i.id.toString() === pathId);
+    const item = fromDisplay ?? fromCatalogue ?? null;
+    setSelectedItem(item);
+    if (!item) {
+      setIsInspecting(false);
+    }
+  }, [location, displayImages, images.data]);
+
   // Determine if we're in a loading state
   const isSearchLoading = shouldUseSemanticSearch && semanticSearchResults.isFetching;
 
@@ -220,17 +240,26 @@ export default function Home() {
   };
 
   const handleNavigate = (direction: "prev" | "next") => {
-    if (!images.data || !selectedItem) return;
-    const currentIndex = images.data.findIndex((i) => i.id === selectedItem.id);
+    if (!selectedItem) return;
+    // Companion to the selection-lookup fix above: arrow navigation
+    // must walk the ACTIVE result list, not the global catalogue.
+    // Otherwise pressing "next" on a semantic-search result jumps to
+    // a random catalogue tile that has nothing to do with the search.
+    // displayImages is the active list (similar-images > semantic >
+    // catalogue); fall back to images.data only if displayImages is
+    // empty (initial load).
+    const navList = displayImages ?? images.data;
+    if (!navList || navList.length === 0) return;
+    const currentIndex = navList.findIndex((i) => i.id === selectedItem.id);
     if (currentIndex === -1) return;
 
     let newIndex: number;
     if (direction === "prev") {
-      newIndex = currentIndex > 0 ? currentIndex - 1 : images.data.length - 1;
+      newIndex = currentIndex > 0 ? currentIndex - 1 : navList.length - 1;
     } else {
-      newIndex = currentIndex < images.data.length - 1 ? currentIndex + 1 : 0;
+      newIndex = currentIndex < navList.length - 1 ? currentIndex + 1 : 0;
     }
-    const target = images.data[newIndex];
+    const target = navList[newIndex];
     recordAction("image_navigate", { direction, from: selectedItem.id, to: target.id });
     navigate(`/${target.id}/`);
   };
