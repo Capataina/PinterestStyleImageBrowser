@@ -5,10 +5,15 @@ use image_browser_lib::{db, paths, perf};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 fn main() {
-    // Profiling is opt-in via a single CLI flag. With `cargo tauri dev --
-    // --profile` (or any args after `--`), the launcher forwards `--profile`
-    // straight through to the binary; we pick it up here and stash it in a
-    // process-global so the rest of the app can key off one source of truth.
+    // Profiling is opt-in via a CLI flag OR an env var. Either path
+    // works; the env var exists because Tauri 2's CLI has its own
+    // `--profile <NAME>` flag (for cargo profile selection), which
+    // collides with passing `--profile` through `--` to the binary.
+    //
+    // Recognised forms:
+    //   PROFILING=1 npm run tauri -- dev --release
+    //   npm run tauri -- dev --release -- --profiling
+    //   cargo tauri dev --release -- --profiling
     //
     // Why this pattern (over a runtime toggle):
     //   - The normal app pays zero perf overhead — `PerfLayer` isn't even
@@ -19,7 +24,8 @@ fn main() {
     //     future profiling UI are dead code in normal runs.
     //   - There's a single, named "profiling mode" — much clearer than a
     //     button somewhere that could be left on by accident.
-    let profiling = std::env::args().any(|a| a == "--profile");
+    let profiling = std::env::args().any(|a| a == "--profiling")
+        || std::env::var("PROFILING").map(|v| !v.is_empty() && v != "0").unwrap_or(false);
     perf::set_profiling_enabled(profiling);
 
     // Subscriber stack:
@@ -59,7 +65,7 @@ fn main() {
         match perf::init_session(paths::exports_dir()) {
             Ok(dir) => {
                 tracing::info!(
-                    "profiling mode enabled (--profile); session dir: {}",
+                    "profiling mode enabled (--profiling or PROFILING=1); session dir: {}",
                     dir.display()
                 );
                 perf::spawn_flush_thread();
