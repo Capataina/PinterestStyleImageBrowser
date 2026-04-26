@@ -124,6 +124,124 @@ impl ImageDatabase {
         }
         Ok(out)
     }
+
+    // =================================================================
+    // Per-encoder embeddings (encoder picker, Phase 2)
+    // =================================================================
+    //
+    // The above methods read/write the legacy `images.embedding` column.
+    // The methods below read/write the new `embeddings` table, which is
+    // keyed by (image_id, encoder_id). The legacy column is preserved
+    // for backward compatibility through one release; the indexing
+    // pipeline writes to BOTH for now.
+
+    /// Insert or replace an embedding for a specific encoder.
+    pub fn upsert_embedding(
+        &self,
+        image_id: ID,
+        encoder_id: &str,
+        embedding: &[f32],
+    ) -> rusqlite::Result<()> {
+        let bytes: &[u8] = bytemuck::cast_slice(embedding);
+        self.connection.lock().unwrap().execute(
+            "INSERT OR REPLACE INTO embeddings (image_id, encoder_id, embedding)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![image_id, encoder_id, bytes],
+        )?;
+        Ok(())
+    }
+
+    /// Fetch a specific image's embedding for a specific encoder.
+    pub fn get_embedding(
+        &self,
+        image_id: ID,
+        encoder_id: &str,
+    ) -> rusqlite::Result<Vec<f32>> {
+        let conn = self.connection.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT embedding FROM embeddings
+             WHERE image_id = ?1 AND encoder_id = ?2",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![image_id, encoder_id])?;
+        match rows.next()? {
+            Some(row) => {
+                let bytes: Vec<u8> = row.get(0)?;
+                Ok(bytemuck::cast_slice::<u8, f32>(&bytes).to_vec())
+            }
+            None => Err(rusqlite::Error::QueryReturnedNoRows),
+        }
+    }
+
+    /// Fetch every (image_id, path, embedding) for a specific encoder
+    /// in one SELECT. Used by `CosineIndex::populate_from_db_for_encoder`
+    /// at startup + after re-indexing.
+    pub fn get_all_embeddings_for(
+        &self,
+        encoder_id: &str,
+    ) -> rusqlite::Result<Vec<(ID, String, Vec<f32>)>> {
+        let conn = self.connection.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT i.id, i.path, e.embedding
+             FROM embeddings e
+             JOIN images i ON i.id = e.image_id
+             WHERE e.encoder_id = ?1",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![encoder_id], |row| {
+            Ok((
+                row.get::<_, ID>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        })?;
+
+        let mut out = Vec::new();
+        let f32_size = std::mem::size_of::<f32>();
+        for row in rows {
+            let (id, path, bytes) = row?;
+            if bytes.len() % f32_size != 0 {
+                continue;
+            }
+            let embedding: Vec<f32> = bytemuck::cast_slice::<u8, f32>(&bytes).to_vec();
+            out.push((id, path, embedding));
+        }
+        Ok(out)
+    }
+
+    /// Return image rows that don't yet have an embedding for the given
+    /// encoder. Used by the indexing pipeline to drive the per-encoder
+    /// encode loop.
+    ///
+    /// Returns a Vec of (image_id, path) — the encoder will preprocess
+    /// the path and write the result back via `upsert_embedding`.
+    pub fn get_images_without_embedding_for(
+        &self,
+        encoder_id: &str,
+    ) -> rusqlite::Result<Vec<(ID, String)>> {
+        let conn = self.connection.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT i.id, i.path
+             FROM images i
+             WHERE i.orphaned = 0
+             AND NOT EXISTS (
+                 SELECT 1 FROM embeddings e
+                 WHERE e.image_id = i.id AND e.encoder_id = ?1
+             )",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![encoder_id], |row| {
+            Ok((row.get::<_, ID>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect()
+    }
+
+    /// Count embeddings per encoder. Used by `get_pipeline_stats` to
+    /// surface "X images encoded with SigLIP-2, Y with DINOv2".
+    pub fn count_embeddings_for(&self, encoder_id: &str) -> rusqlite::Result<i64> {
+        let conn = self.connection.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT COUNT(*) FROM embeddings WHERE encoder_id = ?1",
+        )?;
+        stmt.query_row(rusqlite::params![encoder_id], |row| row.get::<_, i64>(0))
+    }
 }
 
 #[cfg(test)]

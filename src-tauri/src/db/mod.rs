@@ -141,6 +141,38 @@ impl ImageDatabase {
             );",
             [],
         )?;
+
+        // Per-encoder embeddings table (Phase 2 of the encoder picker
+        // work). Lets the project hold multiple embeddings per image —
+        // one per encoder model — so the user can search via SigLIP-2,
+        // CLIP, DINOv2, etc., all from the same DB.
+        //
+        // Why a separate table rather than more columns on `images`:
+        // adding a new encoder = inserting rows, not migrating schema.
+        // Storage cost ~2KB per (image × encoder) — negligible.
+        //
+        // The legacy `images.embedding` column is preserved for one
+        // release cycle; the indexing pipeline now also writes the
+        // CLIP embedding to this table with encoder_id="clip_vit_b_32".
+        // A future migration can drop the old column once everyone has
+        // re-indexed.
+        self.connection.lock().unwrap().execute(
+            "CREATE TABLE IF NOT EXISTS embeddings (
+                image_id INTEGER NOT NULL,
+                encoder_id TEXT NOT NULL,
+                embedding BLOB NOT NULL,
+                PRIMARY KEY (image_id, encoder_id),
+                FOREIGN KEY (image_id) REFERENCES images(id) ON DELETE CASCADE
+            );",
+            [],
+        )?;
+        // Helps populate_from_db, which scans by encoder_id, to skip
+        // the table-scan step.
+        self.connection.lock().unwrap().execute(
+            "CREATE INDEX IF NOT EXISTS idx_embeddings_encoder
+             ON embeddings(encoder_id);",
+            [],
+        )?;
         Ok(())
     }
 
