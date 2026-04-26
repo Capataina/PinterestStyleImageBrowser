@@ -69,7 +69,16 @@ impl ClipTextEncoder {
         // poor for transformers (see top-of-file comment). Plain CPU
         // session creates in ~1-2s vs CoreML's 6-15s for the same model.
         info!("text encoder using CPU (CoreML skipped — poor transformer coverage)");
-        let session = Session::builder()?.commit_from_file(model_path)?;
+        // R4 — shared M2-tuned session builder. Particularly important
+        // for the text encoder: the perf-1777212369 baseline showed it
+        // running at 292 ms/call (10 calls, mean) when it should be
+        // 30-80 ms — the gap is largely thread-pool oversubscription
+        // when text + image encoders coexist on the same default
+        // 8-thread pool.
+        let session = super::super::ort_session::build_tuned_session(
+            "clip_text",
+            model_path,
+        )?;
         Ok(session)
     }
 
@@ -100,16 +109,40 @@ impl ClipTextEncoder {
             Ok(s) => s,
             Err(e) => {
                 warn!("text encoder accelerator init failed ({e}); falling back to CPU");
-                Session::builder()?.commit_from_file(model_path)?
+                // R4 — even the fallback path uses the tuned builder.
+                super::super::ort_session::build_tuned_session(
+                    "clip_text_fallback",
+                    model_path,
+                )?
             }
         };
 
-        Ok(ClipTextEncoder {
+        let mut encoder = ClipTextEncoder {
             session,
             tokenizer,
             max_seq_length: CLIP_MAX_SEQ_LENGTH,
             pad_token_id: CLIP_PAD_TOKEN_ID,
-        })
+        };
+
+        // R4 — real-input pre-warm. Running one full encode through
+        // the freshly-built session lets ORT finalise its kernel
+        // selection, memory plan, and (on macOS) any per-platform
+        // runtime work that's deferred until the first inference. Per
+        // the perf-1777212369 baseline the very first text encode took
+        // ~628 ms, vs ~30-80 ms for steady-state — that warmup tax
+        // currently lands on the user's first semantic search rather
+        // than during pipeline pre-warm. Doing it here moves that cost
+        // off the user's interactive path.
+        //
+        // The warmup string must be non-empty and tokenise to at least
+        // one real token so the inference path is genuinely exercised.
+        // We don't care about the result; ignore it.
+        match encoder.encode("warmup") {
+            Ok(_) => info!("text encoder real-input pre-warm complete"),
+            Err(e) => warn!("text encoder pre-warm inference failed: {e}"),
+        }
+
+        Ok(encoder)
     }
 
     /// Borrow the tokenizer for the `tokenizer_output` diagnostic.

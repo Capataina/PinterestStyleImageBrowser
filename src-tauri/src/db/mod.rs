@@ -11,7 +11,7 @@
 //! the `crate::db::ImageDatabase` path because the inherent-impl blocks
 //! in the submodules are merged by the compiler regardless of file.
 
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 mod embeddings;
 pub mod images_query;
@@ -28,12 +28,42 @@ mod test_helpers;
 /// roots, tags). Always SQLite `INTEGER` (i.e. `i64`).
 pub type ID = i64;
 
-/// SQLite-backed image catalogue. Single shared `rusqlite::Connection`
-/// guarded by a `Mutex` — the foreground UI thread and the background
-/// indexing pipeline both call into this struct. WAL journal mode (set
-/// in `initialize`) keeps reads non-blocking under the writer.
+/// SQLite-backed image catalogue.
+///
+/// Two connections per real on-disk database:
+///
+/// - **`connection`** — the writer. Every INSERT/UPDATE/DELETE goes
+///   through this `Mutex<Connection>`. The encoder pipeline holds it
+///   for the duration of each batch transaction (R1 below); foreground
+///   IPC writes (tag mutations, root toggles) take it briefly.
+/// - **`reader`** — a separate read-only connection on the same file,
+///   used by foreground IPC SELECTs (the grid query, semantic search
+///   over the cosine cache, etc.). The two connections do not contend
+///   on the same Mutex, so a foreground `get_images` call no longer
+///   queues behind an in-flight encoder write batch. WAL journal mode
+///   makes the underlying reads consistent without taking a SQLite-
+///   level lock against the writer.
+///
+///   `reader` is `None` for `:memory:` databases (tests) — `:memory:`
+///   is per-connection storage, so a second connection sees an empty
+///   DB. Tests don't have foreground/background contention to worry
+///   about, so the read-helper falls back to the writer in that case.
+///
+/// Performance origin: the on-exit profiling report at perf-1777212369
+/// captured two ~22 s `ipc.get_images` outliers. Subspans (Batch 3
+/// commit) attribute almost all of that wall time to mutex acquisition,
+/// not SQL work — confirming the contention hypothesis. R2 (this) +
+/// R1 (encoder INSERT batching) + R3 (PRAGMAs) collapse it together.
 pub struct ImageDatabase {
     pub(crate) connection: Mutex<rusqlite::Connection>,
+    /// Read-only secondary connection. Set by `initialize()` for real
+    /// on-disk databases; remains empty for `:memory:` (tests).
+    /// `OnceLock` so `initialize()` can populate it through `&self`
+    /// without breaking every existing call site that takes `&self`.
+    pub(crate) reader: OnceLock<Mutex<rusqlite::Connection>>,
+    /// Stored so `initialize()` can open the reader connection lazily
+    /// (after the writer has set WAL mode + created schema).
+    db_path: String,
 }
 
 impl ImageDatabase {
@@ -41,7 +71,49 @@ impl ImageDatabase {
         let connection = rusqlite::Connection::open(db_path)?;
         Ok(ImageDatabase {
             connection: Mutex::new(connection),
+            reader: OnceLock::new(),
+            db_path: db_path.to_string(),
         })
+    }
+
+    /// Foreground-read lock helper. Returns the dedicated read-only
+    /// connection's mutex guard if one exists (real on-disk DB);
+    /// otherwise falls back to the writer connection (for `:memory:`
+    /// tests). Use this from IPC SELECT paths so they don't queue
+    /// behind encoder write transactions.
+    pub(crate) fn read_lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
+        if let Some(r) = self.reader.get() {
+            r.lock().expect("reader mutex poisoned")
+        } else {
+            self.connection.lock().expect("writer mutex poisoned")
+        }
+    }
+
+    /// Manual WAL checkpoint — drains the WAL file back into the main
+    /// DB. Called from the encoder pipeline between batches so the WAL
+    /// doesn't grow unbounded under `wal_autocheckpoint = 0` (set in
+    /// `initialize()`). PASSIVE mode does not block readers or writers
+    /// — it processes whatever pages are clean and returns; a busy
+    /// reader simply means the next checkpoint catches up.
+    ///
+    /// We disable auto-checkpoint because its default cadence (every
+    /// 1000 dirty pages) interleaves with encoder batch commits in a
+    /// way that produces multi-second stalls when the auto-checkpoint
+    /// happens to fire during an active write transaction. By driving
+    /// it from the encoder loop instead, checkpoints land at known
+    /// quiet points (between batches) where they cannot block
+    /// foreground reads.
+    pub fn checkpoint_passive(&self) -> rusqlite::Result<()> {
+        // Some(_) when reader exists → real DB, do checkpoint;
+        // None → :memory:, no-op (no WAL file).
+        if self.reader.get().is_none() {
+            return Ok(());
+        }
+        let conn = self.connection.lock().unwrap();
+        conn.pragma_update(None, "wal_checkpoint", "PASSIVE")?;
+        Ok(())
     }
 
     pub fn initialize(&self) -> rusqlite::Result<()> {
@@ -75,6 +147,25 @@ impl ImageDatabase {
             let conn = self.connection.lock().unwrap();
             conn.pragma_update(None, "journal_mode", "WAL")?;
             conn.pragma_update(None, "synchronous", "NORMAL")?;
+            // R3 — busy_timeout caps how long a momentary lock contention
+            // waits before returning SQLITE_BUSY. 5 s is generous enough
+            // that any real-world contention (encoder batch commit while
+            // foreground IPC arrives) resolves transparently rather than
+            // surfacing as an error to the user. Default of 0 is
+            // unhelpful for a multi-connection workload.
+            conn.pragma_update(None, "busy_timeout", 5000)?;
+            // R3 — disable SQLite's automatic WAL checkpointer. The
+            // default (1000 dirty pages) fires unpredictably mid-write
+            // batch and was the trigger for the perf-1777212369 22 s
+            // stalls. We drive checkpoints ourselves between encoder
+            // batches via `checkpoint_passive()` (called from
+            // indexing.rs::run_clip_encoder + run_trait_encoder).
+            conn.pragma_update(None, "wal_autocheckpoint", 0)?;
+            // R3 — cap WAL file size at 64 MiB. Without this it can
+            // grow unbounded under bursty writes; the cap forces a
+            // truncate at the next quiet checkpoint, keeping disk
+            // usage bounded and reducing the cost of fsync at COMMIT.
+            conn.pragma_update(None, "journal_size_limit", 67_108_864i64)?;
         }
 
         // Foreign-key enforcement is OFF by default in SQLite; turn it
@@ -179,6 +270,44 @@ impl ImageDatabase {
         // table). Bumps when CLIP/DINOv2 pipeline changes invalidate
         // prior embeddings.
         self.migrate_embedding_pipeline_version()?;
+
+        // R2 — open the read-only secondary connection now that WAL
+        // mode + schema are in place on the file. Skip for `:memory:`
+        // (a second connection sees a separate empty DB) and for any
+        // failure path (we just fall back to the writer in read_lock).
+        //
+        // SQLITE_OPEN_READ_ONLY guarantees the reader can never write.
+        // No need for SQLITE_OPEN_NO_MUTEX — rusqlite already wraps
+        // the connection in a Rust Mutex.
+        if !self.db_path.starts_with(":memory:")
+            && !self.db_path.starts_with("file::memory:")
+        {
+            match rusqlite::Connection::open_with_flags(
+                &self.db_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+            ) {
+                Ok(r) => {
+                    // Per-connection PRAGMAs — busy_timeout matters here
+                    // because a foreground read may briefly contend with
+                    // the writer's COMMIT (writer takes WAL_INDEX exclusive
+                    // for the duration of the COMMIT itself; readers wait
+                    // microseconds, but `busy_timeout = 0` would surface
+                    // that wait as SQLITE_BUSY).
+                    let _ = r.pragma_update(None, "busy_timeout", 5000);
+                    // Discard the result of set() — if another initialize()
+                    // somehow got here first, both connections are valid
+                    // readers; using the first-installed one is fine.
+                    let _ = self.reader.set(Mutex::new(r));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "could not open read-only secondary connection ({e}); \
+                         foreground SELECTs will share the writer mutex"
+                    );
+                }
+            }
+        }
 
         Ok(())
     }

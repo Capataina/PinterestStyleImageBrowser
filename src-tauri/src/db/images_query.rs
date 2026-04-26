@@ -110,7 +110,8 @@ impl ImageDatabase {
         filter_tag_ids: Vec<ID>,
         _filter_string: String,
     ) -> rusqlite::Result<Vec<ImageData>> {
-        let conn = self.connection.lock().unwrap();
+        // R2 — foreground SELECT, route through the reader.
+        let conn = self.read_lock();
 
         // Always SELECT the thumbnail columns as NULL aliases so the
         // shared `aggregate_image_rows` helper can read by name. This
@@ -262,10 +263,16 @@ impl ImageDatabase {
         //
         // Each subspan is opened with `info_span!(...).entered()` to
         // match the existing pattern in indexing.rs / watcher.rs.
+        // R2 — route the foreground IPC SELECT through the read-only
+        // secondary connection. The encoder pipeline holds the writer
+        // mutex for the duration of each batch transaction; without
+        // this routing the foreground get_images would queue behind
+        // every batch commit. With the read-only connection, the SELECT
+        // contends only with itself.
         let conn = {
             let _lock_span =
                 tracing::info_span!("get_images.lock_wait").entered();
-            self.connection.lock().unwrap()
+            self.read_lock()
         };
 
         // Common WHERE for root-and-orphan filtering. Used both with
@@ -412,7 +419,8 @@ impl ImageDatabase {
     }
 
     pub fn get_image_id_by_path(&self, path: &str) -> rusqlite::Result<ID> {
-        let conn = self.connection.lock().unwrap();
+        // R2 — foreground lookup, no need to contend with the writer.
+        let conn = self.read_lock();
         let mut stmt = conn.prepare("SELECT id FROM images WHERE path = ?1 LIMIT 1")?;
         let mut rows = stmt.query([path])?;
         if let Some(row) = rows.next()? {
@@ -436,7 +444,11 @@ impl ImageDatabase {
     /// embeddings table if they have), `siglip2_base`, and
     /// `dinov2_base`. Adding new encoders means appending to this list.
     pub fn get_pipeline_stats(&self) -> rusqlite::Result<PipelineStats> {
-        let conn = self.connection.lock().unwrap();
+        // R2 — read-only secondary connection. get_pipeline_stats is
+        // polled at 1Hz by the frontend during indexing, so it's
+        // exactly the kind of foreground SELECT that must not queue
+        // behind encoder write batches.
+        let conn = self.read_lock();
 
         // Base counts: total + thumbnail + legacy-CLIP + orphaned.
         let mut stmt = conn.prepare(

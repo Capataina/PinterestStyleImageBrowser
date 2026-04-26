@@ -95,7 +95,11 @@ impl ImageDatabase {
     /// Empty embeddings are skipped at the SQL level (`length(embedding) > 0`)
     /// so callers don't have to filter them out.
     pub fn get_all_embeddings(&self) -> rusqlite::Result<Vec<(ID, String, Vec<f32>)>> {
-        let conn = self.connection.lock().unwrap();
+        // R2 — read-only secondary. Cosine cache populates here on
+        // first-load and after enabled-root toggles; both are
+        // foreground operations that must not queue behind encoder
+        // writes.
+        let conn = self.read_lock();
         // Mirror the grid filter (`db/images_query.rs:get_images_with_thumbnails`)
         // so disabled / orphaned images are excluded from the cosine
         // cache too. Without this, a user could disable a folder via
@@ -165,6 +169,75 @@ impl ImageDatabase {
         Ok(())
     }
 
+    /// R1 — insert/replace many embeddings under one `BEGIN IMMEDIATE`
+    /// transaction. The encoder pipeline calls this once per batch
+    /// (typically 32 images) instead of one `upsert_embedding` per row,
+    /// which collapses N implicit transactions + N fsyncs into one
+    /// explicit transaction + one fsync.
+    ///
+    /// Why this matters: the perf-1777212369 report showed two ~22 s
+    /// `ipc.get_images` outliers during the SigLIP-2 phase. Subspans
+    /// (Batch 3) attribute the wall time to mutex contention; the
+    /// underlying cause is the writer thread holding the connection
+    /// for hundreds of micro-COMMITs per batch, which means foreground
+    /// reads queue behind the steady drumbeat of writes. One large
+    /// transaction = one mutex acquire + one fsync per batch, so
+    /// foreground reads slip in between batches instead of fighting
+    /// for every individual row's commit window.
+    ///
+    /// Per the [PDQ benchmark](https://www.pdq.com/blog/improving-bulk-insert-speed-in-sqlite-a-comparison-of-transactions/),
+    /// transactions are 10-100x faster than autocommit for bulk inserts.
+    /// Combined with R2 (foreground reads on the secondary connection)
+    /// the writer can run flat-out without affecting UI responsiveness.
+    ///
+    /// `legacy_clip_too`: if true, also writes to the legacy
+    /// `images.embedding` column (CLIP path back-compat). The CLIP
+    /// encoder is the only caller that sets this; SigLIP-2 / DINOv2
+    /// only write to the per-encoder table.
+    pub fn upsert_embeddings_batch(
+        &self,
+        encoder_id: &str,
+        rows: &[(ID, Vec<f32>)],
+        legacy_clip_too: bool,
+    ) -> rusqlite::Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.connection.lock().unwrap();
+        // BEGIN IMMEDIATE rather than the default DEFERRED — DEFERRED
+        // upgrades to a write lock on the first INSERT, which means
+        // any reader that races us between BEGIN and the first INSERT
+        // could win and hold us up. IMMEDIATE takes the write lock
+        // up-front, eliminating that race window.
+        let tx = conn.transaction_with_behavior(
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR REPLACE INTO embeddings (image_id, encoder_id, embedding)
+                 VALUES (?1, ?2, ?3)",
+            )?;
+            let mut legacy_stmt = if legacy_clip_too {
+                Some(
+                    tx.prepare(
+                        "UPDATE images SET embedding = ?1 WHERE id = ?2",
+                    )?,
+                )
+            } else {
+                None
+            };
+            for (image_id, embedding) in rows {
+                let bytes: &[u8] = bytemuck::cast_slice(embedding);
+                stmt.execute(rusqlite::params![image_id, encoder_id, bytes])?;
+                if let Some(s) = legacy_stmt.as_mut() {
+                    s.execute(rusqlite::params![bytes, image_id])?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Fetch a specific image's embedding for a specific encoder.
     pub fn get_embedding(
         &self,
@@ -193,7 +266,12 @@ impl ImageDatabase {
         &self,
         encoder_id: &str,
     ) -> rusqlite::Result<Vec<(ID, String, Vec<f32>)>> {
-        let conn = self.connection.lock().unwrap();
+        // R2 — read-only secondary. This is the per-encoder cosine
+        // cache populate path; it runs both at search-time (encoder
+        // switch) and from the indexing pipeline (priority hot-populate).
+        // Reading via the secondary connection means a search does not
+        // wait for an in-flight encoder write batch to commit.
+        let conn = self.read_lock();
         // Same disabled/orphaned filter as `get_all_embeddings` — the
         // cosine cache must not return images whose root the user has
         // toggled off (or whose file disappeared from disk). The JOIN
@@ -259,7 +337,9 @@ impl ImageDatabase {
     /// Count embeddings per encoder. Used by `get_pipeline_stats` to
     /// surface "X images encoded with SigLIP-2, Y with DINOv2".
     pub fn count_embeddings_for(&self, encoder_id: &str) -> rusqlite::Result<i64> {
-        let conn = self.connection.lock().unwrap();
+        // R2 — count is read-only, used by get_pipeline_stats which
+        // is foreground-polled.
+        let conn = self.read_lock();
         let mut stmt = conn.prepare(
             "SELECT COUNT(*) FROM embeddings WHERE encoder_id = ?1",
         )?;

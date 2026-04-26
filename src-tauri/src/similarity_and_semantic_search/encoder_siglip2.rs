@@ -104,7 +104,11 @@ impl Siglip2ImageEncoder {
     pub fn new(model_path: &Path) -> Result<Self, Box<dyn Error>> {
         info!("=== Initialising SigLIP-2 image encoder ===");
         info!("model: {}", model_path.display());
-        let session = Session::builder()?.commit_from_file(model_path)?;
+        // R4 — shared M2-tuned session builder.
+        let session = super::ort_session::build_tuned_session(
+            "siglip2_image",
+            model_path,
+        )?;
         Ok(Self { session })
     }
 
@@ -209,7 +213,11 @@ impl Siglip2TextEncoder {
 
         let tokenizer = Tokenizer::from_file(tokenizer_path)
             .map_err(|e| format!("SigLIP-2 tokenizer load failed: {e}"))?;
-        let session = Session::builder()?.commit_from_file(model_path)?;
+        // R4 — shared M2-tuned session builder.
+        let session = super::ort_session::build_tuned_session(
+            "siglip2_text",
+            model_path,
+        )?;
 
         Ok(Self {
             session,

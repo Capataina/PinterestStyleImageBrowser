@@ -713,18 +713,35 @@ fn run_clip_encoder(
                         sample_emitted = true;
                     }
                 }
-                for (image, embedding) in chunk.iter().zip(embeddings.iter()) {
-                    // Legacy column (semantic_search still reads this).
-                    if let Err(e) = database.update_image_embedding(image.id, embedding.clone()) {
-                        failed_paths.push(format!("{}: db legacy write — {e}", image.path));
-                        continue;
+                // R1 — single-transaction batch write of every row in
+                // this chunk. Replaces the previous per-row
+                // update_image_embedding + upsert_embedding pair (each
+                // its own implicit transaction → fsync) with one
+                // BEGIN IMMEDIATE … COMMIT round-trip. legacy_clip_too
+                // = true so the CLIP path keeps writing the legacy
+                // images.embedding column for back-compat with
+                // semantic_search.
+                let batch_rows: Vec<(crate::db::ID, Vec<f32>)> = chunk
+                    .iter()
+                    .zip(embeddings.iter())
+                    .map(|(image, emb)| (image.id, emb.clone()))
+                    .collect();
+                let row_count = batch_rows.len();
+                match database.upsert_embeddings_batch(
+                    "clip_vit_b_32",
+                    &batch_rows,
+                    true,
+                ) {
+                    Ok(()) => succeeded += row_count,
+                    Err(e) => {
+                        // Whole batch failed at the DB level — record
+                        // every row as a write failure rather than
+                        // pretending some succeeded.
+                        let err_str = e.to_string();
+                        for image in chunk.iter() {
+                            failed_paths.push(format!("{}: db batch — {err_str}", image.path));
+                        }
                     }
-                    // New per-encoder table.
-                    if let Err(e) = database.upsert_embedding(image.id, "clip_vit_b_32", embedding) {
-                        failed_paths.push(format!("{}: db per-encoder write — {e}", image.path));
-                        continue;
-                    }
-                    succeeded += 1;
                 }
             }
             Err(e) => {
@@ -738,6 +755,11 @@ fn run_clip_encoder(
         }
         processed += chunk.len();
         emit(app, Phase::Encode, processed, total, Some("Encoding (CLIP)".into()));
+        // R3 — drain the WAL between batches so it can't grow without
+        // bound under wal_autocheckpoint=0. PASSIVE never blocks
+        // foreground readers; it just folds whatever pages are clean
+        // back into the main DB.
+        let _ = database.checkpoint_passive();
     }
 
     // Emit a per-encoder run summary so the report shows
@@ -804,12 +826,28 @@ where
                         sample_emitted = true;
                     }
                 }
-                for ((id, path), embedding) in chunk.iter().zip(embeddings.iter()) {
-                    if let Err(e) = database.upsert_embedding(*id, encoder_id, embedding) {
-                        failed_paths.push(format!("{}: db write — {e}", path));
-                        continue;
+                // R1 — same BEGIN IMMEDIATE batch write as the CLIP
+                // path. legacy_clip_too = false because only CLIP
+                // double-writes to the legacy column.
+                let batch_rows: Vec<(crate::db::ID, Vec<f32>)> = chunk
+                    .iter()
+                    .zip(embeddings.iter())
+                    .map(|((id, _), emb)| (*id, emb.clone()))
+                    .collect();
+                let row_count = batch_rows.len();
+                match database.upsert_embeddings_batch(
+                    encoder_id,
+                    &batch_rows,
+                    false,
+                ) {
+                    Ok(()) => succeeded += row_count,
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        for (_, path) in chunk.iter() {
+                            failed_paths
+                                .push(format!("{path}: db batch — {err_str}"));
+                        }
                     }
-                    succeeded += 1;
                 }
             }
             Err(e) => {
@@ -821,6 +859,8 @@ where
         }
         processed += chunk.len();
         emit(app, Phase::Encode, processed, total, Some(label.clone()));
+        // R3 — drain WAL between batches under wal_autocheckpoint=0.
+        let _ = database.checkpoint_passive();
     }
 
     // Per-encoder run summary diagnostic — same shape as the CLIP

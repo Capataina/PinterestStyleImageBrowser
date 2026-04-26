@@ -82,7 +82,8 @@ impl Dinov2ImageEncoder {
         info!("=== Initialising DINOv2-Base image encoder ===");
         info!("model: {}", model_path.display());
 
-        let session = match Session::builder()?.commit_from_file(model_path) {
+        // R4 — shared M2-tuned session builder (Level3 + intra=4).
+        let session = match super::ort_session::build_tuned_session("dinov2", model_path) {
             Ok(s) => s,
             Err(e) => {
                 warn!("DINOv2 image session init failed ({e}); cannot load encoder");

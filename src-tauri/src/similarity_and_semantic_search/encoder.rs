@@ -55,7 +55,11 @@ impl ClipImageEncoder {
                 warn!(
                     "accelerator initialization failed ({e}); falling back to CPU"
                 );
-                let session = Session::builder()?.commit_from_file(model_path)?;
+                // R4 — fall through to the shared tuned builder.
+                let session = super::ort_session::build_tuned_session(
+                    "clip_image_fallback",
+                    model_path,
+                )?;
                 Ok(ClipImageEncoder { session })
             }
         }
@@ -66,14 +70,22 @@ impl ClipImageEncoder {
         // macOS: CPU-only because CoreML's runtime inference errors on
         // CLIP's image graph despite accepting the partition at compile
         // time. See top-of-file comment for the full diagnosis.
+        // R4 — use the shared M2-tuned builder so this CPU path gets
+        // Level3 + intra=4 instead of ORT's default 8-thread auto-pool.
         info!("image encoder using CPU (CoreML disabled — see encoder.rs header)");
-        let session = Session::builder()?.commit_from_file(model_path)?;
+        let session = super::ort_session::build_tuned_session(
+            "clip_image",
+            model_path,
+        )?;
         Ok(session)
     }
 
     #[cfg(not(target_os = "macos"))]
     fn build_session_with_accel(model_path: &Path) -> Result<Session, Box<dyn Error>> {
         info!("trying CUDA execution provider");
+        // CUDA path: keep the existing builder + EP setup. R4's
+        // M2-specific intra_threads(4) tuning is irrelevant when CUDA
+        // is doing the work, and Level3 is on by default for GPU EPs.
         let session = Session::builder()?
             .with_execution_providers([CUDAExecutionProvider::default().build()])?
             .commit_from_file(model_path)?;
