@@ -1,6 +1,7 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { ImageData, ImageItem, SimilarImageItem } from "../types";
+import { perfInvoke } from "./perf";
 
 // Default dimensions if backend doesn't provide them (fallback)
 const DEFAULT_WIDTH = 800;
@@ -20,7 +21,7 @@ export async function fetchImages(
   shuffleSeed: number = 0,
 ): Promise<ImageItem[]> {
   try {
-    const imagesDB: ImageData[] = await invoke("get_images", {
+    const imagesDB: ImageData[] = await perfInvoke("get_images", {
       filterTagIds,
       filterString,
       matchAllTags,
@@ -229,7 +230,7 @@ export async function fetchSimilarImages(imageId: number, topN: number = 8) {
     // finding: dimensions used to be fetched frontend-side via
     // N parallel `getImageSize` DOM image loads — gone now,
     // a single IPC round-trip carries the full payload.
-    const results: Parameters<typeof mapImageSearchResult>[0][] = await invoke(
+    const results: Parameters<typeof mapImageSearchResult>[0][] = await perfInvoke(
       "get_similar_images",
       { imageId, topN }
     );
@@ -242,7 +243,7 @@ export async function fetchSimilarImages(imageId: number, topN: number = 8) {
 
 export async function fetchTieredSimilarImages(imageId: number) {
   try {
-    const results: Parameters<typeof mapImageSearchResult>[0][] = await invoke(
+    const results: Parameters<typeof mapImageSearchResult>[0][] = await perfInvoke(
       "get_tiered_similar_images",
       { imageId }
     );
@@ -265,7 +266,7 @@ export async function semanticSearch(
   topN: number = 50
 ): Promise<SimilarImageItem[]> {
   try {
-    const results: Parameters<typeof mapImageSearchResult>[0][] = await invoke(
+    const results: Parameters<typeof mapImageSearchResult>[0][] = await perfInvoke(
       "semantic_search",
       { query, topN }
     );

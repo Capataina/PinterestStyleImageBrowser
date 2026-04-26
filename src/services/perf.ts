@@ -71,6 +71,77 @@ export function recordAction(action: string, payload: Record<string, unknown> = 
   invoke("record_user_action", { action, payload }).catch(() => {});
 }
 
+/**
+ * Timed IPC wrapper. Drop-in replacement for `invoke<T>(cmd, args)`:
+ * times the round-trip with performance.now() and records it as a
+ * user-action breadcrumb (kind="ipc_call") so the on-exit report can
+ * correlate frontend-observed IPC latency with the backend span that
+ * served the call.
+ *
+ * Why this exists separately from backend instrumentation: the
+ * backend's `#[tracing::instrument]` only measures the time spent
+ * inside the Rust handler. The frontend's perceived latency includes
+ * IPC serialisation, the Tauri runtime hop, response deserialisation,
+ * and any await scheduling — the gap between this and the backend
+ * span tells you whether the IPC layer itself is a bottleneck.
+ *
+ * No-op overhead when profiling is off: just calls invoke directly.
+ *
+ * Returns the same Promise<T> as raw invoke; errors propagate
+ * unchanged (and are still recorded with `ok: false`).
+ */
+export async function perfInvoke<T>(
+  cmd: string,
+  args?: Record<string, unknown>,
+): Promise<T> {
+  if (!profilingCache) {
+    return invoke<T>(cmd, args);
+  }
+  const start = performance.now();
+  try {
+    const result = await invoke<T>(cmd, args);
+    const duration_ms = performance.now() - start;
+    recordAction("ipc_call", { command: cmd, duration_ms, ok: true });
+    return result;
+  } catch (e) {
+    const duration_ms = performance.now() - start;
+    recordAction("ipc_call", {
+      command: cmd,
+      duration_ms,
+      ok: false,
+      error: String(e),
+    });
+    throw e;
+  }
+}
+
+/**
+ * Callback for React.Profiler — records every render of a wrapped
+ * component subtree as an action breadcrumb. Wire it into JSX as:
+ *
+ *   <Profiler id="MyComponent" onRender={onRenderProfiler}>
+ *     <MyComponent ... />
+ *   </Profiler>
+ *
+ * No-op when profiling is off (recordAction short-circuits).
+ *
+ * The 5ms threshold filters out trivial renders that would otherwise
+ * dominate the timeline — the report cares about renders that might
+ * cause perceptible jank, not the every-keystroke noise.
+ */
+export function onRenderProfiler(
+  id: string,
+  phase: "mount" | "update" | "nested-update",
+  actualDuration: number,
+): void {
+  if (actualDuration < 5) return;
+  recordAction("render", {
+    component: id,
+    phase,
+    duration_ms: Math.round(actualDuration * 100) / 100,
+  });
+}
+
 export async function resetPerfStats(): Promise<void> {
   await invoke("reset_perf_stats");
 }

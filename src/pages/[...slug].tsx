@@ -1,4 +1,4 @@
-import { useEffect, useState, useMemo } from "react";
+import { useEffect, useState, useMemo, Profiler } from "react";
 import Masonry from "../components/Masonry";
 import {
   useImages,
@@ -17,7 +17,7 @@ import { PinterestModal } from "@/components/PinterestModal";
 import { IndexingStatusPill } from "@/components/IndexingStatusPill";
 import { SettingsDrawer } from "@/components/settings";
 import { PerfOverlay } from "@/components/PerfOverlay";
-import { isProfilingEnabled, recordAction } from "@/services/perf";
+import { isProfilingEnabled, recordAction, onRenderProfiler } from "@/services/perf";
 import { useQueryClient } from "@tanstack/react-query";
 import { FolderOpen, Settings as SettingsIcon } from "lucide-react";
 import { pickScanFolder, setScanRoot } from "@/services/images";
@@ -474,18 +474,26 @@ export default function Home() {
           )}
         </AnimatePresence>
 
-        {/* Masonry Grid — column count and animation level driven by user prefs */}
-        <Masonry
-          items={displayImages}
-          selectedItem={selectedItem}
-          columnGap={16}
-          verticalGap={16}
-          minItemWidth={236}
-          columnCountOverride={prefs.columnCount}
-          tileScale={prefs.tileScale}
-          animationLevel={prefs.animationLevel}
-          onItemClick={handleImageClick}
-        />
+        {/* Masonry Grid — column count and animation level driven by user prefs.
+            Wrapped in React.Profiler so the profiling system can correlate
+            slow grid renders with backend spans + user actions. The profiler
+            callback is a no-op when profiling is off (recordAction
+            short-circuits on the cached flag), so this is zero-cost in
+            normal use. Renders < 5ms are filtered out at the callback to
+            avoid noise from every-keystroke re-renders. */}
+        <Profiler id="Masonry" onRender={onRenderProfiler}>
+          <Masonry
+            items={displayImages}
+            selectedItem={selectedItem}
+            columnGap={16}
+            verticalGap={16}
+            minItemWidth={236}
+            columnCountOverride={prefs.columnCount}
+            tileScale={prefs.tileScale}
+            animationLevel={prefs.animationLevel}
+            onItemClick={handleImageClick}
+          />
+        </Profiler>
       </div>
     </main>
   );
