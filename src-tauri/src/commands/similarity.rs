@@ -1,7 +1,7 @@
 use tauri::State;
 use tracing::{debug, info, warn};
 
-use crate::commands::{resolve_image_id_for_cosine_path, ImageSearchResult};
+use crate::commands::{resolve_image_id_for_cosine_path, ApiError, ImageSearchResult};
 use crate::db::ImageDatabase;
 use crate::CosineIndexState;
 
@@ -11,7 +11,7 @@ pub fn get_tiered_similar_images(
     db: State<'_, ImageDatabase>,
     cosine_state: State<'_, CosineIndexState>,
     image_id: i64,
-) -> Result<Vec<ImageSearchResult>, String> {
+) -> Result<Vec<ImageSearchResult>, ApiError> {
     use ndarray::Array1;
     use std::path::PathBuf;
 
@@ -20,10 +20,7 @@ pub fn get_tiered_similar_images(
         image_id
     );
 
-    let mut index = cosine_state
-        .index
-        .lock()
-        .map_err(|e| format!("Failed to lock cosine index: {e}"))?;
+    let mut index = cosine_state.index.lock()?;
 
     if index.cached_images.is_empty() {
         debug!("Cache is empty, populating from database...");
@@ -34,18 +31,14 @@ pub fn get_tiered_similar_images(
     // was called twice: once for the exclude-path lookup and once
     // again later for flexible match). One LEFT-JOIN-aggregate query
     // covers both purposes.
-    let all_images = db
-        .get_all_images()
-        .map_err(|e| format!("Failed to get images: {e}"))?;
+    let all_images = db.get_all_images()?;
 
     let exclude_path = all_images
         .iter()
         .find(|img| img.id == image_id)
         .map(|img| PathBuf::from(&img.path));
 
-    let embedding = db
-        .get_image_embedding(image_id)
-        .map_err(|e| format!("Failed to fetch embedding: {e}"))?;
+    let embedding = db.get_image_embedding(image_id)?;
 
     let query = Array1::from_vec(embedding);
     let raw_results = index.get_tiered_similar_images(&query, exclude_path.as_ref());
@@ -95,7 +88,7 @@ pub fn get_similar_images(
     cosine_state: State<'_, CosineIndexState>,
     image_id: i64,
     top_n: usize,
-) -> Result<Vec<ImageSearchResult>, String> {
+) -> Result<Vec<ImageSearchResult>, ApiError> {
     use ndarray::Array1;
     use std::path::PathBuf;
 
@@ -104,10 +97,7 @@ pub fn get_similar_images(
         image_id, top_n
     );
 
-    let mut index = cosine_state
-        .index
-        .lock()
-        .map_err(|e| format!("Failed to lock cosine index: {e}"))?;
+    let mut index = cosine_state.index.lock()?;
 
     debug!(
         "Cache state - cached_images count: {}",
@@ -130,9 +120,7 @@ pub fn get_similar_images(
     // get_all_images failure on the second call previously degraded
     // results to "no flexible match" without the user knowing why.
     debug!("Looking up image path for image_id: {}", image_id);
-    let all_images = db
-        .get_all_images()
-        .map_err(|e| format!("Failed to get images: {e}"))?;
+    let all_images = db.get_all_images()?;
     debug!("Total images in database: {}", all_images.len());
 
     let exclude_path = all_images.iter().find(|img| img.id == image_id).map(|img| {
@@ -144,9 +132,7 @@ pub fn get_similar_images(
     }
 
     debug!("Fetching embedding for image_id: {}", image_id);
-    let embedding = db
-        .get_image_embedding(image_id)
-        .map_err(|e| format!("Failed to fetch embedding: {e}"))?;
+    let embedding = db.get_image_embedding(image_id)?;
     debug!("Retrieved embedding - length: {}", embedding.len());
 
     let query = Array1::from_vec(embedding);

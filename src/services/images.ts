@@ -2,6 +2,7 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { ImageData, ImageItem, SimilarImageItem } from "../types";
 import { perfInvoke } from "./perf";
+import { formatApiError } from "./apiError";
 
 // Default dimensions if backend doesn't provide them (fallback)
 const DEFAULT_WIDTH = 800;
@@ -52,7 +53,7 @@ export async function fetchImages(
     // by id; we re-order here as the user prefers.
     return applySortMode(images, sortMode, shuffleSeed);
   } catch (error) {
-    throw new Error(`Failed to fetch images: ${error}`);
+    throw new Error(formatApiError(error));
   }
 }
 
@@ -121,8 +122,8 @@ export async function assignTagToImage(
       tagId,
     });
   } catch (error) {
-    console.error(`Failed to assign tag: ${error}`);
-    throw new Error(`Failed to assign tag: ${error}`);
+    console.error(`Failed to assign tag:`, error);
+    throw new Error(formatApiError(error));
   }
 }
 
@@ -136,8 +137,8 @@ export async function removeTagFromImage(
       tagId,
     });
   } catch (error) {
-    console.error(`Failed to remove tag: ${error}`);
-    throw new Error(`Failed to remove tag: ${error}`);
+    console.error(`Failed to remove tag:`, error);
+    throw new Error(formatApiError(error));
   }
 }
 
@@ -172,7 +173,7 @@ export async function getScanRoot(): Promise<string | null> {
   try {
     return (await invoke<string | null>("get_scan_root")) ?? null;
   } catch (error) {
-    throw new Error(`Failed to read scan root: ${error}`);
+    throw new Error(formatApiError(error));
   }
 }
 
@@ -187,7 +188,7 @@ export async function setScanRoot(path: string): Promise<void> {
   try {
     await invoke("set_scan_root", { path });
   } catch (error) {
-    throw new Error(`Failed to set scan root: ${error}`);
+    throw new Error(formatApiError(error));
   }
 }
 
@@ -237,7 +238,7 @@ export async function fetchSimilarImages(imageId: number, topN: number = 8) {
     return results.map(mapImageSearchResult);
   } catch (error) {
     console.error("[Frontend] Error in fetchSimilarImages:", error);
-    throw new Error(`Failed to fetch similar images: ${error}`);
+    throw new Error(formatApiError(error));
   }
 }
 
@@ -250,7 +251,7 @@ export async function fetchTieredSimilarImages(imageId: number) {
     return results.map(mapImageSearchResult);
   } catch (error) {
     console.error("[Frontend] Error in fetchTieredSimilarImages:", error);
-    throw new Error(`Failed to fetch tiered similar images: ${error}`);
+    throw new Error(formatApiError(error));
   }
 }
 
@@ -273,6 +274,6 @@ export async function semanticSearch(
     return results.map(mapImageSearchResult);
   } catch (error) {
     console.error("[Frontend] Error in semanticSearch:", error);
-    throw new Error(`Semantic search failed: ${error}`);
+    throw new Error(formatApiError(error));
   }
 }

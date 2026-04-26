@@ -1,5 +1,6 @@
 use tauri::State;
 
+use crate::commands::ApiError;
 use crate::db::ImageDatabase;
 
 /// Read the free-text annotation for an image. Returns "" if there
@@ -9,10 +10,8 @@ use crate::db::ImageDatabase;
 pub fn get_image_notes(
     db: State<'_, ImageDatabase>,
     image_id: i64,
-) -> Result<String, String> {
-    db.get_image_notes(image_id)
-        .map(|opt| opt.unwrap_or_default())
-        .map_err(|e| e.to_string())
+) -> Result<String, ApiError> {
+    Ok(db.get_image_notes(image_id)?.unwrap_or_default())
 }
 
 /// Write an annotation for an image. Empty / whitespace-only string
@@ -22,7 +21,6 @@ pub fn set_image_notes(
     db: State<'_, ImageDatabase>,
     image_id: i64,
     notes: String,
-) -> Result<(), String> {
-    db.set_image_notes(image_id, &notes)
-        .map_err(|e| e.to_string())
+) -> Result<(), ApiError> {
+    Ok(db.set_image_notes(image_id, &notes)?)
 }

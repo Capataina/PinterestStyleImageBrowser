@@ -3,6 +3,7 @@ use std::sync::Arc;
 use tauri::{AppHandle, State};
 use tracing::{info, warn};
 
+use crate::commands::ApiError;
 use crate::db::ImageDatabase;
 use crate::indexing::{self, IndexingState};
 use crate::paths;
@@ -13,7 +14,7 @@ use crate::CosineIndexState;
 /// Read the currently-configured scan root from settings.json, if any.
 /// Returns Ok(None) when no root has been picked yet (first-launch state).
 #[tauri::command]
-pub fn get_scan_root() -> Result<Option<String>, String> {
+pub fn get_scan_root() -> Result<Option<String>, ApiError> {
     Ok(settings::Settings::load()
         .scan_root
         .map(|p| p.to_string_lossy().into_owned()))
@@ -32,23 +33,20 @@ pub fn set_scan_root(
     cosine_state: State<'_, CosineIndexState>,
     indexing_state: State<'_, Arc<IndexingState>>,
     path: String,
-) -> Result<(), String> {
+) -> Result<(), ApiError> {
     let scan_root = PathBuf::from(&path);
     if !scan_root.is_dir() {
-        return Err(format!("Not a directory: {path}"));
+        return Err(ApiError::BadInput(format!("Not a directory: {path}")));
     }
 
     // Remove existing roots (CASCADE deletes their images), wipe any
     // orphan rows (NULL root_id from older DBs), then add the new one.
-    let existing = db.list_roots().map_err(|e| e.to_string())?;
+    let existing = db.list_roots()?;
     for r in existing {
-        db.remove_root(r.id).map_err(|e| e.to_string())?;
+        db.remove_root(r.id)?;
     }
-    db.wipe_images_for_new_root()
-        .map_err(|e| format!("Failed to wipe legacy NULL-root_id rows: {e}"))?;
-
-    db.add_root(path.clone())
-        .map_err(|e| format!("Failed to add root: {e}"))?;
+    db.wipe_images_for_new_root()?;
+    db.add_root(path.clone())?;
 
     if let Ok(mut idx) = cosine_state.index.lock() {
         idx.cached_images.clear();
@@ -60,7 +58,7 @@ pub fn set_scan_root(
         cosine_state.db_path.clone(),
         cosine_state.index.clone(),
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     info!("set_scan_root replaced roots + spawned indexing.");
     Ok(())
@@ -69,8 +67,8 @@ pub fn set_scan_root(
 /// Multi-folder management — list configured roots.
 #[tauri::command]
 #[tracing::instrument(name = "ipc.list_roots", skip(db))]
-pub fn list_roots(db: State<'_, ImageDatabase>) -> Result<Vec<Root>, String> {
-    db.list_roots().map_err(|e| e.to_string())
+pub fn list_roots(db: State<'_, ImageDatabase>) -> Result<Vec<Root>, ApiError> {
+    Ok(db.list_roots()?)
 }
 
 /// Add a root and trigger an incremental re-index. Returns the new
@@ -83,14 +81,12 @@ pub fn add_root(
     cosine_state: State<'_, CosineIndexState>,
     indexing_state: State<'_, Arc<IndexingState>>,
     path: String,
-) -> Result<Root, String> {
+) -> Result<Root, ApiError> {
     let scan_root = PathBuf::from(&path);
     if !scan_root.is_dir() {
-        return Err(format!("Not a directory: {path}"));
+        return Err(ApiError::BadInput(format!("Not a directory: {path}")));
     }
-    let root = db
-        .add_root(path)
-        .map_err(|e| format!("Failed to add root: {e}"))?;
+    let root = db.add_root(path)?;
 
     indexing::try_spawn_pipeline(
         app.clone(),
@@ -98,7 +94,7 @@ pub fn add_root(
         cosine_state.db_path.clone(),
         cosine_state.index.clone(),
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     info!("add_root persisted ({}) and spawned re-index.", root.path);
     Ok(root)
@@ -113,8 +109,8 @@ pub fn remove_root(
     db: State<'_, ImageDatabase>,
     cosine_state: State<'_, CosineIndexState>,
     id: i64,
-) -> Result<(), String> {
-    db.remove_root(id).map_err(|e| e.to_string())?;
+) -> Result<(), ApiError> {
+    db.remove_root(id)?;
     // Clean the per-root thumbnail subfolder. Best-effort — if the
     // remove fails (permissions, file locked) we log and move on; the
     // user can manually clean the directory.
@@ -147,8 +143,8 @@ pub fn set_root_enabled(
     cosine_state: State<'_, CosineIndexState>,
     id: i64,
     enabled: bool,
-) -> Result<(), String> {
-    db.set_root_enabled(id, enabled).map_err(|e| e.to_string())?;
+) -> Result<(), ApiError> {
+    db.set_root_enabled(id, enabled)?;
     // Cosine cache may include images from the toggled root; clear so
     // the next similarity query rebuilds with the right active set.
     if let Ok(mut idx) = cosine_state.index.lock() {

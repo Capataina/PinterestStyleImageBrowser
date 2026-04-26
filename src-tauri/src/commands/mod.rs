@@ -22,6 +22,7 @@ use crate::db::{ImageDatabase, ID};
 use crate::image_struct::ImageData;
 use crate::paths;
 
+pub mod error;
 pub mod images;
 pub mod notes;
 pub mod profiling;
@@ -29,6 +30,8 @@ pub mod roots;
 pub mod semantic;
 pub mod similarity;
 pub mod tags;
+
+pub use error::ApiError;
 
 pub use images::*;
 pub use notes::*;

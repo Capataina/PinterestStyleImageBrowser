@@ -1,7 +1,7 @@
 use tauri::State;
 use tracing::{debug, info};
 
-use crate::commands::{resolve_image_id_for_cosine_path, ImageSearchResult};
+use crate::commands::{resolve_image_id_for_cosine_path, ApiError, ImageSearchResult};
 use crate::db::ImageDatabase;
 use crate::paths;
 use crate::similarity_and_semantic_search::encoder_text::TextEncoder;
@@ -16,7 +16,7 @@ pub fn semantic_search(
     text_encoder_state: State<'_, TextEncoderState>,
     query: String,
     top_n: usize,
-) -> Result<Vec<ImageSearchResult>, String> {
+) -> Result<Vec<ImageSearchResult>, ApiError> {
     use ndarray::Array1;
 
     info!(
@@ -31,10 +31,7 @@ pub fn semantic_search(
     }
 
     // Lazy-load text encoder if not initialized
-    let mut encoder_lock = text_encoder_state
-        .encoder
-        .lock()
-        .map_err(|e| format!("Failed to lock text encoder: {e}"))?;
+    let mut encoder_lock = text_encoder_state.encoder.lock()?;
 
     if encoder_lock.is_none() {
         info!("Initializing text encoder...");
@@ -42,21 +39,23 @@ pub fn semantic_search(
         let model_path = models_dir.join("model_text.onnx");
         let tokenizer_path = models_dir.join("tokenizer.json");
 
+        // Typed errors for the model-missing case so the frontend can
+        // trigger a re-download dialog rather than showing a generic
+        // toast (audit ApiError finding — discriminating the kind lets
+        // the UI branch on the cause).
         if !model_path.exists() {
-            return Err(format!(
-                "Text model not found at: {}",
-                model_path.display()
+            return Err(ApiError::TextModelMissing(
+                model_path.display().to_string(),
             ));
         }
         if !tokenizer_path.exists() {
-            return Err(format!(
-                "Tokenizer not found at: {}",
-                tokenizer_path.display()
+            return Err(ApiError::TokenizerMissing(
+                tokenizer_path.display().to_string(),
             ));
         }
 
         let encoder = TextEncoder::new(&model_path, &tokenizer_path)
-            .map_err(|e| format!("Failed to initialize text encoder: {e}"))?;
+            .map_err(|e| ApiError::Encoder(format!("text encoder init failed: {e}")))?;
 
         *encoder_lock = Some(encoder);
         info!("Text encoder initialized successfully");
@@ -68,17 +67,14 @@ pub fn semantic_search(
     debug!("Encoding query: '{}'", query);
     let text_embedding = encoder
         .encode(query)
-        .map_err(|e| format!("Failed to encode query: {e}"))?;
+        .map_err(|e| ApiError::Encoder(format!("encode query: {e}")))?;
     debug!(
         "Text embedding generated - length: {}",
         text_embedding.len()
     );
 
     // Ensure cosine index is populated
-    let mut index = cosine_state
-        .index
-        .lock()
-        .map_err(|e| format!("Failed to lock cosine index: {e}"))?;
+    let mut index = cosine_state.index.lock()?;
 
     if index.cached_images.is_empty() {
         debug!("Populating cosine index from database...");
