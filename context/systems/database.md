@@ -12,7 +12,7 @@ The module was previously a 1.6k-line `db.rs`; it is now split into focused subm
 
 - **Owns:** the schema (5 tables), the WAL+NORMAL+FK pragma block, the embedding-BLOB encoding/decoding via `bytemuck::cast_slice` (replaces 3 unsafe blocks), the per-table CRUD, the AND/OR tag filter SQL branch, the orphan-mark chunked UPDATE, the legacy migration helper, the pipeline-stats single-SELECT.
 - **Does not own:** path normalisation (lives in `paths::strip_windows_extended_prefix`), thumbnail generation (lives in `thumbnail-pipeline`), embedding generation (lives in `clip-image-encoder`), root id resolution from cosine paths (lives in `commands::resolve_image_id_for_cosine_path`).
-- **Public API surface (preserved across the split):** `ImageDatabase::new`, `initialize`, `default_database_path`, `add_image`, `get_images`, `get_all_images`, `get_images_with_thumbnails`, `get_images_without_embeddings`, `get_images_without_thumbnails`, `get_image_id_by_path`, `get_paths_to_root_ids`, `get_pipeline_stats`, `update_image_embedding`, `get_image_embedding`, `get_all_embeddings`, `update_image_thumbnail`, `get_image_thumbnail_info`, `create_tag`, `delete_tag`, `get_tags`, `add_tag_to_image`, `remove_tag_from_image`, `list_roots`, `add_root`, `remove_root`, `set_root_enabled`, `migrate_legacy_scan_root`, `wipe_images_for_new_root`, `get_root_id_by_path`, `mark_orphaned`, `get_image_notes`, `set_image_notes`. Plus type alias `pub type ID = i64`.
+- **Public API surface:** `ImageDatabase::new`, `initialize`, `default_database_path`, `read_lock` (R2 — read-only secondary connection helper for foreground SELECTs), `checkpoint_passive` (R3 — manual WAL drain between encoder batches), `add_image`, `get_images`, `get_all_images`, `get_images_with_thumbnails`, `get_images_without_embeddings`, `get_images_without_thumbnails`, `get_image_id_by_path`, `get_paths_to_root_ids`, `get_pipeline_stats`, `update_image_embedding`, `get_image_embedding`, `get_all_embeddings`, `upsert_embedding`, `upsert_embeddings_batch` (R1 — BEGIN IMMEDIATE batch INSERT helper), `get_embedding`, `get_all_embeddings_for`, `get_images_without_embedding_for`, `count_embeddings_for`, `update_image_thumbnail`, `get_image_thumbnail_info`, `create_tag`, `delete_tag`, `get_tags`, `add_tag_to_image`, `remove_tag_from_image`, `list_roots`, `add_root`, `remove_root`, `set_root_enabled`, `migrate_legacy_scan_root`, `wipe_images_for_new_root`, `get_root_id_by_path`, `mark_orphaned`, `get_image_notes`, `set_image_notes`. Plus type alias `pub type ID = i64`.
 
 ## Current Implemented Reality
 
@@ -57,7 +57,7 @@ CREATE TABLE images (
     id              INTEGER PRIMARY KEY,
     path            TEXT NOT NULL UNIQUE,
     embedding       BLOB,                    -- raw little-endian f32 sequence; length = 512 * 4 bytes typically
-    thumbnail_path  TEXT,                    -- absolute path under Library/thumbnails/...
+    thumbnail_path  TEXT,                    -- absolute path under <app_data_dir>/thumbnails/...
     width           INTEGER,
     height          INTEGER,
     root_id         INTEGER REFERENCES roots(id) ON DELETE CASCADE,  -- Phase 6 multi-folder
@@ -368,8 +368,8 @@ pub fn set_image_notes(&self, image_id: ID, notes: &str) -> rusqlite::Result<()>
 
 ## Implemented Outputs / Artifacts
 
-- The on-disk `Library/images.db` (+ `images.db-wal` + `images.db-shm` files when WAL is active). All gitignored.
-- The `default_database_path()` helper returns the platform-correct path via `paths::database_path()` — `<repo>/Library/images.db` in dev, `~/Library/Application Support/com.ataca.image-browser/images.db` in release.
+- The on-disk `<app_data_dir>/images.db` (+ `images.db-wal` + `images.db-shm` files when WAL is active). All gitignored.
+- The `default_database_path()` helper returns the platform-correct path via `paths::database_path()` — on macOS `~/Library/Application Support/com.ataca.image-browser/images.db`. Same path in dev and release as of 2026-04-26; override via `IMAGE_BROWSER_DATA_DIR` env var.
 - 50+ unit tests across the submodule `tests` blocks: schema idempotency, AND/OR tag semantics, multi-folder filter, NULL-root_id legacy rows, orphan detection (incl. 1200-id chunking stress test), notes round-trip, embedding BLOB round-trip (incl. large + empty), pipeline stats correctness across each stage.
 
 ## Known Issues / Active Risks

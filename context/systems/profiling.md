@@ -4,13 +4,13 @@
 
 ## Scope / Purpose
 
-Opt-in performance diagnostics. When the binary is launched with `--profile`, every meaningful operation (Tauri commands, indexing phases, model downloads, watcher events, cosine retrievals, DB methods) emits `tracing` spans that are aggregated by an in-process `PerfLayer`, written to a JSONL timeline on disk, correlated with user-action breadcrumbs from the frontend, and rendered into a markdown report on app exit. The frontend mirrors the flag with a `<PerfOverlay>` panel (cmd+shift+P) and a `perfInvoke` wrapper that emits per-IPC start/end events.
+Opt-in performance diagnostics. When the binary is launched with the `--profiling` CLI flag (named `--profiling`, NOT `--profile`, because Tauri 2's CLI has its own `--profile <NAME>` for cargo profile selection — they collide) OR with the `PROFILING=1` env var set, every meaningful operation (Tauri commands, indexing phases, model downloads, watcher events, cosine retrievals, DB methods) emits `tracing` spans that are aggregated by an in-process `PerfLayer`, written to a JSONL timeline on disk, correlated with user-action breadcrumbs from the frontend, and rendered into a markdown report on app exit. The frontend mirrors the flag with a `<PerfOverlay>` panel (cmd+shift+P) and a `perfInvoke` wrapper that emits per-IPC start/end events.
 
-When `--profile` is absent, every code path described here is dormant. The PerfLayer never registers, the overlay never mounts, action breadcrumbs never call into the backend, and the on-exit renderer is a no-op. The only cost is a single `tracing` dispatch per instrumented call (the env filter passes the spans, but no aggregator builds them), which is in the few-hundred-nanosecond range — invisible for everything except the absolute hottest microsecond-level paths.
+When `--profiling` is absent, every code path described here is dormant. The PerfLayer never registers, the overlay never mounts, action breadcrumbs never call into the backend, and the on-exit renderer is a no-op. The only cost is a single `tracing` dispatch per instrumented call (the env filter passes the spans, but no aggregator builds them), which is in the few-hundred-nanosecond range — invisible for everything except the absolute hottest microsecond-level paths.
 
 ## Boundaries / Ownership
 
-- **Owns:** `--profile` flag parsing (`main.rs`), `PROFILING_ENABLED` and `PERF_STATS` `OnceLock`s, the `PerfLayer` `tracing-subscriber::Layer` impl, `SpanStats` aggregation (count/sum/min/max/recent ringbuffer for percentile estimation), the `RawEvent` log + JSONL flush thread, `record_user_action` IPC + correlation window, the on-exit `report.md`/`raw.json` renderer, the frontend `<PerfOverlay>` UI, `services/perf.ts` wrappers, the `perfInvoke` IPC wrapper, the `cmd+shift+P` shortcut, the Library/exports/perf-<unix_ts>/ session directory layout.
+- **Owns:** `--profiling` flag parsing (`main.rs`), `PROFILING_ENABLED` and `PERF_STATS` `OnceLock`s, the `PerfLayer` `tracing-subscriber::Layer` impl, `SpanStats` aggregation (count/sum/min/max/recent ringbuffer for percentile estimation), the `RawEvent` log + JSONL flush thread, `record_user_action` IPC + correlation window, the on-exit `report.md`/`raw.json` renderer, the frontend `<PerfOverlay>` UI, `services/perf.ts` wrappers, the `perfInvoke` IPC wrapper, the `cmd+shift+P` shortcut, the <app_data_dir>/exports/perf-<unix_ts>/ session directory layout.
 - **Does not own:** the spans themselves (every system has its own `#[tracing::instrument]`), the underlying `tracing-subscriber` registry (provided by main.rs), the JSON schema for any specific span (those live with their owning systems).
 - **Public API (Rust):** `perf::is_profiling_enabled()`, `perf::set_profiling_enabled(bool)`, `perf::PerfLayer::new()`, `perf::session_dir() -> Option<PathBuf>`, `perf::init_session(exports_dir)`, `perf::spawn_flush_thread()`, `perf::flush_to_file(path)`, `perf::snapshot() -> PerfSnapshot`, `perf::reset()`, `perf::record_user_action(action, payload)`, `perf_report::render_session_report(session_dir)`.
 - **Public API (Tauri commands):** `is_profiling_enabled`, `get_perf_snapshot`, `reset_perf_stats`, `export_perf_snapshot`, `record_user_action`.
@@ -22,7 +22,8 @@ When `--profile` is absent, every code path described here is dormant. The PerfL
 
 ```
 main.rs:
-  let profiling = std::env::args().any(|a| a == "--profile");
+  let profiling = std::env::args().any(|a| a == "--profiling")
+      || std::env::var("PROFILING").map(|v| !v.is_empty() && v != "0").unwrap_or(false);
   perf::set_profiling_enabled(profiling);
 
   // Build subscriber stack with envfilter
@@ -32,7 +33,7 @@ main.rs:
 
   if profiling {
       let _ = registry.with(perf::PerfLayer::new()).try_init();
-      perf::init_session(paths::exports_dir())?;  // creates Library/exports/perf-{ts}/
+      perf::init_session(paths::exports_dir())?;  // creates <app_data_dir>/exports/perf-{ts}/
       perf::spawn_flush_thread();                 // every 5s drains RawEvent log to timeline.jsonl
   } else {
       let _ = registry.try_init();                // no PerfLayer, no session dir
@@ -59,7 +60,7 @@ Stored in a process-global `OnceLock<Mutex<HashMap<String, SpanStats>>>`. Each s
 
 ### Timeline log + JSONL flush
 
-Every span close also pushes a `RawEvent` onto an in-memory log; a background thread spawned via `perf::spawn_flush_thread()` drains the log every 5 seconds and appends the events to `Library/exports/perf-{unix_ts}/timeline.jsonl`. User-action breadcrumbs from the frontend (`record_user_action` IPC) write to the same log so on-exit correlation can attribute span events to the user action that triggered them.
+Every span close also pushes a `RawEvent` onto an in-memory log; a background thread spawned via `perf::spawn_flush_thread()` drains the log every 5 seconds and appends the events to `<app_data_dir>/exports/perf-{unix_ts}/timeline.jsonl`. User-action breadcrumbs from the frontend (`record_user_action` IPC) write to the same log so on-exit correlation can attribute span events to the user action that triggered them.
 
 The 500 ms `CORRELATION_WINDOW_MS` in `perf_report.rs` is the threshold for "this span event was caused by this user action" — anything later than that, the user has already stopped attributing the lag.
 
@@ -98,10 +99,10 @@ The 500 ms `CORRELATION_WINDOW_MS` in `perf_report.rs` is the threshold for "thi
 
 - Polls `getPerfSnapshot()` periodically and renders sortable per-span aggregates (count, mean, p50, p95, min, max).
 - Listens to `cmd+shift+P` to toggle visibility.
-- Has an "Export snapshot" button that calls `exportPerfSnapshot` (writes a one-off `Library/exports/perf-<unix_ts>.json` for ad-hoc capture without app-exit).
+- Has an "Export snapshot" button that calls `exportPerfSnapshot` (writes a one-off `<app_data_dir>/exports/perf-<unix_ts>.json` for ad-hoc capture without app-exit).
 - Has a "Reset" button that calls `reset_perf_stats` for clean-slate measurement of a specific scenario.
 
-When `--profile` is absent, `isProfilingEnabled()` resolves false → `<PerfOverlay>` returns `null` → no DOM, no polling, no shortcut handler effect.
+When `--profiling` is absent, `isProfilingEnabled()` resolves false → `<PerfOverlay>` returns `null` → no DOM, no polling, no shortcut handler effect.
 
 ### `perfInvoke` IPC wrapper
 
@@ -135,7 +136,7 @@ Each call hits `record_user_action` on the backend, which appends a `RawEvent` t
 
 Spans answer "how long did it take?". A second category of profiling output answers "what was the system actually doing inside that span?" — embedding L2 norms, tokenizer outputs, score distributions, encoder run summaries, cross-encoder rankings. These are **diagnostics**, not spans.
 
-The `record_diagnostic(name: &str, payload: serde_json::Value)` API in `perf.rs` writes a `RawEvent::Diagnostic { ts_ms, diagnostic, payload }` to the same in-memory log as spans and user-action breadcrumbs. The on-exit `perf_report.rs` renders them in a dedicated `## Diagnostics` section grouped by name. When `--profile` is absent, `record_diagnostic` is a no-op.
+The `record_diagnostic(name: &str, payload: serde_json::Value)` API in `perf.rs` writes a `RawEvent::Diagnostic { ts_ms, diagnostic, payload }` to the same in-memory log as spans and user-action breadcrumbs. The on-exit `perf_report.rs` renders them in a dedicated `## Diagnostics` section grouped by name. When `--profiling` is absent, `record_diagnostic` is a no-op.
 
 The full diagnostic catalogue (current as of 2026-04-26):
 
@@ -177,19 +178,19 @@ The system relies on every relevant code path being instrumented. Current covera
 | `db/*` | TODO: not yet instrumented per-method (DB calls are typically fast enough that aggregate IPC spans suffice; per-method spans would be a follow-up) |
 | Frontend | `<Profiler id="masonry">` around the Masonry tree via `onRenderProfiler` callback |
 
-All instruments are info-level so they only fire under `--profile` (the env filter is `warn,image_browser_lib=info,image_browser=info`).
+All instruments are info-level so they only fire under `--profiling` (the env filter is `warn,image_browser_lib=info,image_browser=info`).
 
 ## Key Interfaces / Data Flow
 
 ### Profiling-enabled launch
 
 ```
-$ cargo tauri dev -- --profile
+$ cargo tauri dev -- --profiling   # or: PROFILING=1 cargo tauri dev   # or: npm run tauri -- dev --release -- --profiling
    │
-main.rs: parse --profile
+main.rs: parse --profiling
        │ set PROFILING_ENABLED to true
        │ build PerfLayer + register with subscriber
-       │ paths::exports_dir() → Library/exports/perf-{ts}/
+       │ paths::exports_dir() → <app_data_dir>/exports/perf-{ts}/
        │ perf::init_session(...) creates the dir, opens timeline.jsonl handle
        │ perf::spawn_flush_thread() starts a 5s loop that drains RawEvent log → file
        ▼
@@ -238,14 +239,14 @@ The percentiles are computed on demand from the recent-samples ringbuffer in `sn
 
 ## Implemented Outputs / Artifacts
 
-- `--profile` CLI flag handled in `main.rs`
+- `--profiling` CLI flag handled in `main.rs`
 - `perf.rs` (PerfLayer + OnceLocks + flush thread + RawEvent log)
 - `perf_report.rs` (on-exit markdown renderer + raw.json + correlation logic)
 - `commands/profiling.rs` (5 IPC commands)
 - `src/components/PerfOverlay.tsx` (frontend overlay UI)
 - `src/services/perf.ts` (wrappers + perfInvoke + onRenderProfiler)
 - `<Profiler id="masonry">` integration in `pages/[...slug].tsx` (commit `ee8c5d6`)
-- Per-session directory `Library/exports/perf-{unix_ts}/` containing `timeline.jsonl`, `report.md`, `raw.json`
+- Per-session directory `<app_data_dir>/exports/perf-{unix_ts}/` containing `timeline.jsonl`, `report.md`, `raw.json`
 - Master plan `context/plans/perf-diagnostics.md` (the original spec, much of which is now shipped)
 
 ## Known Issues / Active Risks
@@ -253,10 +254,10 @@ The percentiles are computed on demand from the recent-samples ringbuffer in `sn
 | Risk | Triggered by | Downstream impact |
 |------|--------------|-------------------|
 | Per-span memory grows linearly with distinct span names | Many short-lived spans with unique names (e.g., one per file path in a hypothetical future instrument) | The HashMap size grows; the recent-samples cap is per-span so many spans × 1.6 KB. Currently bounded by ~50 known span names. |
-| Tracing dispatch overhead is non-zero even without `--profile` | Hot loops with span instrumentation | Few hundred ns per call. Becomes measurable in absolute hot paths (cosine inner loop) but those don't have `#[instrument]` for this reason. |
+| Tracing dispatch overhead is non-zero even without `--profiling` | Hot loops with span instrumentation | Few hundred ns per call. Becomes measurable in absolute hot paths (cosine inner loop) but those don't have `#[instrument]` for this reason. |
 | 5s JSONL flush could lose the last 5s of events on crash | Process killed (not Exit) before flush | timeline.jsonl is missing the tail. Snapshot in raw.json is always current via in-memory aggregate. Acceptable trade-off — 5s vs per-event flush which would dominate IO. |
 | Long sessions create big `timeline.jsonl` | A multi-hour profiling session | File grows ~1 MB per few thousand events. No automatic rotation. The renderer can handle it; the user can manually delete old session dirs. |
-| `perf::init_session` failure is non-fatal | Disk full, permissions error in `Library/exports/` | Logs warn; aggregates still work in memory; on-exit renderer returns Err but doesn't crash. The user gets an in-app PerfOverlay with snapshot data but no on-disk artefacts. |
+| `perf::init_session` failure is non-fatal | Disk full, permissions error in `<app_data_dir>/exports/` | Logs warn; aggregates still work in memory; on-exit renderer returns Err but doesn't crash. The user gets an in-app PerfOverlay with snapshot data but no on-disk artefacts. |
 | User-action correlation is heuristic, not causal | Action fires; another action fires within 500 ms; spans correlate to whichever action was first | False attributions for rapid-fire interactions. Not a correctness issue — it's documentation. |
 | Exit hook only fires for window-close, not for `cargo tauri dev` SIGTERM | `Ctrl+C` in the dev terminal | The on-exit renderer doesn't run; user must close the window cleanly. Snapshot is still written on demand via `exportPerfSnapshot` button. |
 | Profiling-enabled AND code panic could leave perfreport partial | Panic during `render_session_report` | Stderr message reports the failure; partial files may exist. Profile data was still in `timeline.jsonl` for manual analysis. |

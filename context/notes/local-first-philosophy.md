@@ -6,13 +6,13 @@ Image Browser is local-first by construction. Every piece of computation, persis
 
 Concrete manifestations:
 
-- SQLite file lives in `Library/images.db` (in-repo dev folder, platform app-data dir in release).
-- CLIP embeddings are generated locally via ONNX Runtime; the models are auto-downloaded on first launch (Phase 4b).
-- Thumbnails are cached on local disk under `Library/thumbnails/root_<id>/`.
+- SQLite file lives in `<app_data_dir>/images.db` — on macOS that's `~/Library/Application Support/com.ataca.image-browser/images.db`. Same path in dev and release; override via `IMAGE_BROWSER_DATA_DIR` env var.
+- Embeddings are generated locally via ONNX Runtime across three encoders (CLIP, SigLIP-2, DINOv2); models are auto-downloaded on first launch.
+- Thumbnails are cached locally under `<app_data_dir>/thumbnails/root_<id>/`.
 - The Tauri config disables CSP (`csp: null`) and grants asset-protocol scope to the entire filesystem (`scope: ["**"]`) — fine for a single-user local tool, dangerous for any multi-user deployment. Documented as a hardening target in `enhancements/recommendations/08-tauri-csp-asset-scope-hardening.md`.
 - Original images are never modified, copied, or uploaded.
 - Filesystem watcher (`notify-debouncer-mini`) monitors the user's library locally; no cloud sync.
-- Profiling (`--profile` mode) writes diagnostics to `Library/exports/perf-<ts>/` — never sent anywhere.
+- Profiling (`--profiling` flag or `PROFILING=1` env var) writes diagnostics to `<app_data_dir>/exports/perf-<ts>/` — never sent anywhere.
 
 ## Rationale
 
@@ -44,7 +44,7 @@ If the project ever pivots to multi-user or hosted-inference, this principle wou
 
 ## Cross-references
 
-- `systems/paths-and-state.md` § Library/ layout (where everything lives)
+- `systems/paths-and-state.md` § App-data layout (where everything lives)
 - `systems/model-download.md` (the one network operation)
 - `enhancements/recommendations/07-encrypted-vector-search-mvp.md` (a stronger version of local-first via FHE)
 - `enhancements/recommendations/08-tauri-csp-asset-scope-hardening.md` (the security flip-side)

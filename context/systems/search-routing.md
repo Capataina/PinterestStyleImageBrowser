@@ -119,12 +119,12 @@ useEffect(() => {
 useEffect(() => {
     isProfilingEnabled().then(on => {
         setProfiling(on);
-        if (on) setPerfOpen(true);   // auto-open if launched with --profile
+        if (on) setPerfOpen(true);   // auto-open if launched with --profiling
     });
 }, []);
 ```
 
-When `--profile` is set, the overlay auto-opens at mount so the user doesn't have to discover the cmd+shift+P shortcut. Without the flag, every profiling-related code path is dead.
+When `--profiling` is set, the overlay auto-opens at mount so the user doesn't have to discover the cmd+shift+P shortcut. Without the flag, every profiling-related code path is dead.
 
 `recordAction` is called at user-action sites (settings open/close, semantic-query started, similar-clicked, tag-mutated). When profiling is off, the IPC call is a no-op on the backend. When on, it appends to the timeline and the on-exit report correlates the next 500 ms of span activity to the action.
 
@@ -222,7 +222,7 @@ None.
 - **The selection lookup MUST resolve against `displayImages`, not `images.data`.** Fixing this was the audit Known Issues finding `9d04f69`. The bug was subtle: most clicks were on grid tiles whose ids ARE in `images.data`, so the bug only manifested for semantic-search results — exactly the case that's hardest to test and most painful when broken.
 - **Default `sortMode` is `"added"`, not `"shuffle"`.** Pre-Phase-9 the backend shuffled on every `get_images_with_thumbnails` call; combined with progressive thumbnail loading this caused the visible "entire app refreshes" UX. The frontend now applies sort modes deterministically via the seed pattern, and stable order is the default.
 - **`#` prefix branches to tag autocomplete.** This is opinionated UX — the user might want to search for a literal `#` in image content. The trade-off: tag autocomplete is the much more common operation; literal `#` search is undocumented. A future "use literal `#`" escape (perhaps `\#` or quoted) is possible if the need arises.
-- **Profiling overlay auto-opens with `--profile`.** A user who launched with the flag wanted to see the diagnostics; making them discover cmd+shift+P would be hostile.
+- **Profiling overlay auto-opens with `--profiling`.** A user who launched with the flag wanted to see the diagnostics; making them discover cmd+shift+P would be hostile.
 - **Action breadcrumbs are fire-and-forget.** Awaiting the `record_user_action` IPC would block every user-action handler by ~1 ms. Fire-and-forget keeps the UI responsive at the cost of losing the breadcrumb if the IPC fails (rare).
 - **The 300 ms semantic-search debounce was empirical.** Shorter debounces fired too many full-vector-search runs during typing; longer made the search feel laggy. 300 ms is a comfortable sweet spot.
 

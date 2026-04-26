@@ -102,7 +102,7 @@ indexing.rs::run_trait_encoder("dinov2_base", make_encoder=Dinov2ImageEncoder::n
 
 ## Implemented Outputs / Artifacts
 
-- `Library/models/dinov2_base_image.onnx` (~347 MB) loaded at construction.
+- `<app_data_dir>/models/dinov2_base_image.onnx` (~347 MB) loaded at construction.
 - 768-d L2-normalised `f32` embedding per image.
 - One storage destination: `embeddings(image_id, encoder_id="dinov2_base", embedding)` row.
 - Encoder is recreated per indexing-pipeline run.

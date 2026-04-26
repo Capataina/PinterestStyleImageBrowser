@@ -2,7 +2,7 @@
 
 ## Header
 
-- **Status:** proposed expansion backlog
+- **Status (updated 2026-04-26):** Phase 4 (1 Hz RSS/CPU sampler via sysinfo) and Phase 5 (stall analysis + resource trends report sections) SHIPPED in commit `1761e4e`. Phases 1 (causal trace substrate with span_id/parent_id), 2 (full DB decomposition beyond the get_images subspans already shipped), 3 (frontend invalidation tracing), and 6 (perfdump/perfdiff CLIs + scenario runner) remain proposed; the Tier-1+2+11+12 perf wins lowered the urgency by collapsing the cases the missing diagnostics would have helped diagnose. Revisit when a future perf report shows attribution gaps that the shipped stall-analysis section can't answer.
 - **Date:** 2026-04-26
 - **Related plan:** `context/plans/perf-diagnostics.md`
 - **Related diagnosis:** `context/plans/performance-analysis.md`
@@ -64,7 +64,7 @@ Known current gaps:
 |---|---|
 | Causality over count | Prefer data that explains why a stall happened over more top-level span totals. |
 | Low-cardinality metadata only | Capture fields such as `encoder_id`, `phase`, `row_count`; avoid full paths, raw query strings, and arbitrary IDs in aggregate keys. |
-| Profiling must stay opt-in | `--profile` remains the activation boundary. Normal app runs should not pay for diagnostics. |
+| Profiling must stay opt-in | `--profiling` remains the activation boundary. Normal app runs should not pay for diagnostics. |
 | Measure wait separately from work | Lock waits, queue waits, IPC waits, SQL execution, and UI rendering are different bottlenecks. |
 | Keep raw data machine-readable | Every human report section should be derivable from JSONL/JSON artefacts. |
 | Avoid self-distortion | High-frequency probes need sampling, caps, or thresholds so the profiler does not become the bottleneck. |
@@ -233,7 +233,7 @@ React Profiler tells us commit duration. Browser main-thread diagnostics tell us
 
 | Addition | Purpose | Implementation notes |
 |---|---|---|
-| Process RSS | Detect memory pressure and model footprint. | Sample every 1s under `--profile`. |
+| Process RSS | Detect memory pressure and model footprint. | Sample every 1s under `--profiling`. |
 | JS heap size | Detect frontend memory growth. | Browser support varies; emit capability diagnostic. |
 | CPU usage percent | Detect saturation. | Platform-specific implementation. |
 | Thread count | Detect worker leaks or thread explosion. | Platform-specific or process introspection. |

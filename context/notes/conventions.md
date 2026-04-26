@@ -18,7 +18,7 @@ Levels: `info` for spans + state transitions, `debug` for per-result detail (e.g
 
 The previous `[Backend] ...` `println!` convention is gone. New code should not introduce new `println!`-shaped logging.
 
-The profiling system (`systems/profiling.md`) consumes these spans via `PerfLayer` — adding `#[tracing::instrument]` to a new function automatically gives it perf attribution under `--profile`.
+The profiling system (`systems/profiling.md`) consumes these spans via `PerfLayer` — adding `#[tracing::instrument]` to a new function automatically gives it perf attribution under `--profiling`.
 
 ## Domain diagnostics via `record_diagnostic`
 
@@ -47,7 +47,7 @@ Conventions:
 - **Diagnostic name** is `snake_case` with no prefix — they are first-class artifacts in the perf report's `## Diagnostics` section.
 - **Always include an `encoder_id` field** when the diagnostic is per-encoder so the report can group across all three.
 - **Include an `interpretation` field** with a short human-readable verdict (`"OK"` / `"WARNING — ..."` / `"BROKEN — ..."`). The detailed numbers are for follow-up; the interpretation is what someone reading the report scans first to decide whether to dig deeper.
-- **No-op when `--profile` absent** — the function returns early without building the JSON. Cheap to call from any code path.
+- **No-op when `--profiling` absent** — the function returns early without building the JSON. Cheap to call from any code path.
 - **Emit at the call site, not via tracing** — diagnostics are richer than fields-on-a-span and fire selectively (per-search, per-cache-load, once-per-session). Use `#[tracing::instrument]` for timing; use `record_diagnostic` for content.
 
 The full diagnostic catalogue lives in `systems/profiling.md` § Domain diagnostics.
@@ -127,7 +127,7 @@ Every file the backend reads or writes goes through a helper in `src-tauri/src/p
 
 | Helper | Returns |
 |--------|---------|
-| `paths::app_data_dir()` | Root of all app-managed state (Library/ in dev, platform app-data in release) |
+| `paths::app_data_dir()` | Root of all app-managed state. Always the platform default (`dirs::data_dir()/com.ataca.image-browser/` — on macOS that's `~/Library/Application Support/com.ataca.image-browser/`). Override via `IMAGE_BROWSER_DATA_DIR` env var. **No dev/release split** as of 2026-04-26. |
 | `paths::database_path()` | `app_data_dir / "images.db"` |
 | `paths::thumbnails_dir()` | `app_data_dir / "thumbnails"` |
 | `paths::thumbnails_dir_for_root(id)` | `thumbnails / "root_<id>"` (Phase 9 reorg) |
@@ -195,7 +195,7 @@ Reason: setup runs early during app launch when error handling is awkward (no IP
 | `info!` | State transitions (pre-warm started, root added, watcher started, populate complete) |
 | `debug!` | Per-result detail (top-5 semantic-search results) |
 
-The default env filter is `warn,image_browser_lib=info,image_browser=info`. Without `--profile`, `debug!` lines don't fire.
+The default env filter is `warn,image_browser_lib=info,image_browser=info`. Without `--profiling`, `debug!` lines don't fire.
 
 ## File-organisation conventions
 

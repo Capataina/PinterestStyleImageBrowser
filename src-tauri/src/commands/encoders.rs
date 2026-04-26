@@ -81,7 +81,11 @@ fn is_known_encoder(id: &str) -> bool {
 /// frontend ordering — `["clip", "dino"]` and `["dino", "clip"]`
 /// hash-equal under this function so the dedup doesn't fight the
 /// user.
-pub(crate) fn decide_enabled_write(
+// `pub` (not `pub(crate)`) so audit-generated diagnostic tests under
+// `src-tauri/tests/` can reference the validator directly. The function
+// is otherwise an implementation detail of `set_enabled_encoders` —
+// callers should still go through the IPC.
+pub fn decide_enabled_write(
     current: Option<&[String]>,
     requested: &[String],
 ) -> Result<Option<Vec<String>>, super::ApiError> {

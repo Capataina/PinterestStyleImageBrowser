@@ -4,30 +4,36 @@
 
 ## Scope / Purpose
 
-Single source of truth for every disk path the app uses. Centralises the dev-vs-release branching, ensures every state file ends up under one logical root, and provides the small handful of helpers (`paths::*_dir()`) that every other system reads. Also owns the legacy `Settings` struct that records the pre-multi-folder `scan_root` field for the one-shot migration path.
+Single source of truth for every disk path the app uses. Provides the small handful of helpers (`paths::*_dir()`) that every other system reads. Also owns the `Settings` struct that persists user-managed knobs (`scan_root`, `priority_image_encoder` legacy field, `enabled_encoders` Phase 11c).
 
 This is a small but load-bearing module: every system that reads or writes state goes through here. A bug in `paths::app_data_dir()` would put state files in the wrong place silently.
 
 ## Boundaries / Ownership
 
-- **Owns:** `paths::app_data_dir()` (the dev/release branching), `paths::database_path()`, `paths::thumbnails_dir()`, `paths::thumbnails_dir_for_root(id)`, `paths::models_dir()`, `paths::settings_path()`, `paths::cosine_cache_path()`, `paths::exports_dir()`, `paths::strip_windows_extended_prefix(&str) -> Cow<'_, str>`, the `Settings { scan_root: Option<PathBuf> }` struct + its load/save methods.
-- **Does not own:** the file contents themselves (each owning system writes its own format), `Library/` itself (the directory is created on first call to `app_data_dir`), the bundle-id (just stores a constant for the release fallback).
+- **Owns:** `paths::app_data_dir()`, `paths::database_path()`, `paths::thumbnails_dir()`, `paths::thumbnails_dir_for_root(id)`, `paths::models_dir()`, `paths::settings_path()`, `paths::cosine_cache_path()`, `paths::exports_dir()`, `paths::strip_windows_extended_prefix(&str) -> Cow<'_, str>`, the `Settings` struct + its load/save methods + `resolved_enabled_encoders()` helper.
+- **Does not own:** the file contents themselves (each owning system writes its own format), the app-data directory itself (created on first call to `app_data_dir`), the bundle-id (just stores a constant for the platform-default fallback).
 - **Public API (paths):** see Owns above.
-- **Public API (settings):** `Settings::default()`, `Settings::load() -> Self`, `Settings::save(&self) -> io::Result<()>`.
+- **Public API (settings):** `Settings::default()`, `Settings::load() -> Self`, `Settings::save(&self) -> io::Result<()>`, `Settings::resolved_enabled_encoders() -> Vec<String>`.
 
 ## Current Implemented Reality
 
-### Library/ layout
+### App-data layout
+
+Every state file lives under one root, the platform's standard app-data directory. Same layout in dev and release — there is **no `cfg(debug_assertions)` branching anymore**. (See "What changed" below for why.)
 
 ```
-<repo>/Library/                       # in dev (debug_assertions)
+<app_data_dir>/                       # platform-standard, see paths.rs:81 for resolution
   images.db                           # SQLite (WAL adds .db-wal + .db-shm)
-  settings.json                       # legacy single-folder scan_root field (one-shot migration)
+  settings.json                       # scan_root + enabled_encoders + (legacy) priority_image_encoder
   cosine_cache.bin                    # bincode-encoded Vec<(PathBuf, Vec<f32>)>
   models/
-    model_image.onnx                  # downloaded from HuggingFace
-    model_text.onnx                   # downloaded from HuggingFace
-    tokenizer.json                    # downloaded from HuggingFace
+    clip_vision.onnx                  # CLIP image (~352 MB)
+    clip_text.onnx                    # CLIP text (~254 MB)
+    clip_tokenizer.json               # CLIP BPE
+    dinov2_base_image.onnx            # DINOv2 base (~347 MB)
+    siglip2_vision.onnx               # SigLIP-2 image (~372 MB)
+    siglip2_text.onnx                 # SigLIP-2 text (~1.13 GB)
+    siglip2_tokenizer.json            # Gemma SentencePiece
   thumbnails/
     root_<id>/                        # one subfolder per root (Phase 9)
       thumb_<image_id>.jpg
@@ -40,39 +46,19 @@ This is a small but load-bearing module: every system that reads or writes state
     perf-<unix_ts>.json               # one-off snapshot from "Export" button
 ```
 
-In release builds, `app_data_dir()` returns `dirs::data_dir()/com.ataca.image-browser/` — on macOS that's `~/Library/Application Support/com.ataca.image-browser/`. The structure under it is identical.
+Where `<app_data_dir>` resolves to (in order):
+1. `$IMAGE_BROWSER_DATA_DIR` if set and non-empty (env-var override for testing / multi-instance / CI fixtures)
+2. `dirs::data_dir()/com.ataca.image-browser/` — the platform default:
+   - **macOS:** `~/Library/Application Support/com.ataca.image-browser/`
+   - **Linux:** `$XDG_DATA_HOME/com.ataca.image-browser/` (typically `~/.local/share/...`)
+   - **Windows:** `%APPDATA%/com.ataca.image-browser/`
+3. `./app-data/com.ataca.image-browser/` if `dirs::data_dir()` returns `None` (rare — only on stripped-down environments where the standard data dir can't be resolved). Logged at warn level.
 
-### Dev vs release branching
+### Why the dev-vs-release split was removed
 
-```rust
-pub fn app_data_dir() -> PathBuf {
-    #[cfg(debug_assertions)]
-    {
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");  // src-tauri/
-        let repo_root = std::path::Path::new(manifest_dir).parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("."));
-        let dir = repo_root.join("Library");
-        let _ = ensure_dir(&dir);
-        return dir;
-    }
+An earlier version of this module branched on `cfg(debug_assertions)`: dev builds wrote to `<repo>/Library/`, release used the platform default. The split was removed because dev and release builds diverged on every code change, forcing the user to re-download all 2.5 GB of models whenever they switched build modes. Now both share state — the comment in `paths.rs::app_data_dir` explicitly cites this as the trigger for reverting.
 
-    #[cfg(not(debug_assertions))]
-    {
-        let base = dirs::data_dir().unwrap_or_else(|| {
-            warn!("dirs::data_dir() returned None; falling back to ./app-data");
-            PathBuf::from("./app-data")
-        });
-        let dir = base.join(BUNDLE_ID);
-        let _ = ensure_dir(&dir);
-        dir
-    }
-}
-```
-
-`CARGO_MANIFEST_DIR` is captured at compile time by the `env!` macro and points at `src-tauri/` (where `Cargo.toml` lives). Stepping up one directory lands at the repo root, where `Library/` lives.
-
-The dev path is project-local because the user wants `Library/` visible alongside the rest of the repo (easy to inspect, easy to wipe — `rm -rf Library` resets everything; trivial to share a debugging snapshot). The release path falls back to the platform's app-data directory because there is no project folder once the binary is bundled and shipped.
+The user can still sandbox a session via `IMAGE_BROWSER_DATA_DIR=/some/tmp/path` if they want isolation (the env-var override is the supported alternative to the old dev-path branching).
 
 ### Per-root thumbnail subdirs
 
@@ -90,33 +76,58 @@ Phase 9 reorganisation: `remove_root` can `rm -rf` the per-root subfolder cleanl
 
 ```rust
 pub fn strip_windows_extended_prefix(path_str: &str) -> Cow<'_, str> {
-    if path_str.starts_with("\\\\?\\") {
-        Cow::Owned(path_str[4..].to_string())
-    } else {
-        Cow::Borrowed(path_str)
+    match path_str.strip_prefix("\\\\?\\") {
+        Some(stripped) => Cow::Owned(stripped.to_string()),
+        None => Cow::Borrowed(path_str),
     }
 }
 ```
 
-Used by `commands::resolve_image_id_for_cosine_path` to map cosine-result paths back to DB ids when the canonical form drifts (Windows-extended-prefix vs not). The `Cow` return means non-Windows paths pay zero allocation for the common case where the prefix isn't present.
+Used by `commands::resolve_image_id_for_cosine_path` to map cosine-result paths back to DB ids when the canonical form drifts (Windows-extended-prefix vs not). The `Cow` return means non-Windows paths pay zero allocation for the common case where the prefix isn't present. Switched from manual slice indexing to `strip_prefix` in Phase 6 (clippy gate).
 
-This was extracted from a previously-triplicated inline closure (audit Pattern Extraction finding). The previous notes warned "don't add a fourth normalisation closure" — that warning is satisfied: the only normalisation site is now this helper.
+### Per-root thumbnail subdirs
 
-### Legacy `Settings` struct
+```rust
+pub fn thumbnails_dir_for_root(root_id: i64) -> PathBuf {
+    let p = thumbnails_dir().join(format!("root_{root_id}"));
+    let _ = ensure_dir(&p);
+    p
+}
+```
+
+Phase 9 reorganisation: `remove_root` can `rm -rf` the per-root subfolder cleanly, instead of per-row file deletion. Legacy `root_id = NULL` rows continue writing to the flat `thumbnails_dir()` path.
+
+### `Settings` struct (current shape)
 
 ```rust
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default)]
     pub scan_root: Option<PathBuf>,
+
+    /// LEGACY (Phase 11c) — was the user's "primary" image encoder
+    /// when the picker was a single-choice dropdown. Now obsolete:
+    /// fusion uses every enabled encoder. Kept on the struct so old
+    /// settings.json files deserialise without erroring.
+    #[serde(default)]
+    pub priority_image_encoder: Option<String>,
+
+    /// Phase 11c — encoder ids the user has enabled. The indexing
+    /// pipeline only encodes for these; image-image and text-image
+    /// fusion only fuse over these. None = use the default set
+    /// (every supported encoder enabled).
+    #[serde(default)]
+    pub enabled_encoders: Option<Vec<String>>,
 }
 ```
 
-The struct is intentionally minimal. The `#[serde(default)]` attribute means newer binaries reading an older `settings.json` (without the field) deserialise cleanly to `None`; older binaries reading a newer `settings.json` (with extra fields) just ignore the unknown ones. Persisted atomically via write-to-`.tmp` + rename.
+The `#[serde(default)]` on each field means newer binaries reading an older `settings.json` deserialise cleanly to defaults; older binaries reading a newer `settings.json` just ignore the unknown fields. Persisted atomically via write-to-`.tmp` + rename.
 
-The `scan_root` field exists exclusively for the one-shot legacy migration path in `lib.rs::run::setup`. Once the migration runs, the field is cleared so it doesn't re-trigger on next launch.
+`Settings::resolved_enabled_encoders()` returns the user's pick when set, falling back to `DEFAULT_ENABLED_ENCODERS = ["clip_vit_b_32", "siglip2_base", "dinov2_base"]` when None or empty. Empty-list is treated as "use default" not "disable all" — the IPC validator (`commands::encoders::decide_enabled_write`) also rejects empty mutations, so the empty-set guard is belt-and-braces.
 
-User preferences (theme, columns, sortMode, etc.) live in the **frontend** localStorage, not in this struct — the `useUserPreferences` hook owns them. There is no current need for them to round-trip the backend.
+The `scan_root` field is the historical pre-multi-folder migration target. The `lib.rs::run::setup` callback consumes it once on first launch under the multi-folder schema, then clears it so the migration doesn't re-trigger.
+
+Frontend `useUserPreferences` (theme, columns, sortMode, animation, similar/semantic result counts, tagFilterMode, legacy imageEncoder/textEncoder ids) lives separately in `localStorage`. The two stores don't overlap: backend Settings governs persistent per-install behaviour the indexing pipeline cares about; frontend prefs govern UI taste the backend doesn't see.
 
 ## Key Interfaces / Data Flow
 
@@ -124,18 +135,22 @@ User preferences (theme, columns, sortMode, etc.) live in the **frontend** local
 
 | Caller | Function | Purpose |
 |--------|----------|---------|
-| `db::ImageDatabase::default_database_path` | `database_path()` | Open the SQLite file |
+| `db::ImageDatabase::default_database_path` | `database_path()` | Open the SQLite file (writer + read-only secondary R2) |
 | `lib.rs::run::setup` | `Settings::load()` | Check for legacy scan_root |
 | `lib.rs::run::setup` | `Settings::save()` | Clear scan_root after legacy migration |
 | `indexing.rs::run_pipeline_inner` | `models_dir().join(...)` | Verify model files exist |
+| `indexing.rs::run_pipeline_inner` | `Settings::load().resolved_enabled_encoders()` | Pick which encoders to spawn parallel threads for (Phase 11c) |
 | `indexing.rs::run_pipeline_inner` | `thumbnails_dir()` | Pass to ThumbnailGenerator::new |
 | `indexing.rs::run_pipeline_inner` | `cosine_cache_path()` (indirectly via `cosine.save_to_disk`) | Persist cosine cache |
 | `model_download.rs::download_models_if_missing` | `models_dir()` | Where to write downloads |
-| `commands::semantic::semantic_search` | `models_dir()` | Lazy-init text encoder |
+| `commands::semantic::semantic_search` (legacy) | `models_dir()` | Lazy-init text encoder for the single-encoder fallback path |
+| `commands::semantic_fused::get_fused_semantic_search` | `models_dir()` + `Settings::load()` | Lazy-init enabled text encoders for RRF fusion (Phase 11d) |
+| `commands::similarity::get_fused_similar_images` | `Settings::load().resolved_enabled_encoders()` | Iterate over enabled encoders for image-image RRF fusion (Phase 5) |
+| `commands::encoders::{get,set}_enabled_encoders` | `Settings::{load,save}` | Per-encoder toggle persistence |
 | `commands::roots::remove_root` | `thumbnails_dir_for_root(id)` | rm -rf the per-root subfolder |
 | `commands::profiling::export_perf_snapshot` | `exports_dir()` | Write one-off perf snapshots |
 | `commands::resolve_image_id_for_cosine_path` | `strip_windows_extended_prefix(...)` | Path lookup fallback |
-| `main.rs` | `paths::exports_dir()` (via `perf::init_session`) | Initialize profiling session dir |
+| `main.rs` | `paths::exports_dir()` (via `perf::init_session`) | Initialize profiling session dir (only when `--profiling` flag or `PROFILING=1` env var is set) |
 
 ### Write sites
 

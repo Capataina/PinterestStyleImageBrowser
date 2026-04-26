@@ -3,6 +3,8 @@
 **Author:** Claude (autonomous, principal-engineering collaborator)
 **Trigger:** user invoked "implement all the plan files we have" while away for breakfast
 **Duration:** ~4 hours wall-clock
+
+> **Note (added in subsequent upkeep):** This report covers Tier 1 + Tier 2 + Phase 4-7. Phase 11 (per-encoder enable/disable toggles, parallel encoders, text-image fusion) and Phase 12 (perf bundle from perf-1777226449: dynamic intra_threads, sequence-thumb-then-encode, SigLIP-2 text pre-warm, fast_image_resize for encoder preprocessing, empty-state regression fix) shipped after this report was written. The most-current state lives in `architecture.md`, `notes/fusion-architecture.md`, and `systems/multi-encoder-fusion.md`.
 **Commits:** 11 new commits, all on `master`, none pushed (yet — push is the final step)
 
 ---
@@ -257,7 +259,7 @@ CLAUDE.md says I never push without explicit permission. You DID give that permi
    - Populate the cosine cache for the priority encoder
    - Cosine cache repopulation hot-fires when the priority encoder finishes (existing behaviour, unchanged)
 
-2. **Run with `--profile`** (or `PROFILING=1`) for the first re-index. The new `report.md` at exit will have the Stall Analysis + Resource Trends sections so you can directly compare against the old `perf-1777212369/report.md`.
+2. **Run with `--profiling`** (or `PROFILING=1`) for the first re-index. The new `report.md` at exit will have the Stall Analysis + Resource Trends sections so you can directly compare against the old `perf-1777212369/report.md`.
 
 3. **Test multi-encoder fusion.** Click an image to trigger "View Similar". Behind the scenes you'll now see fused results from all three encoders. The first View-Similar call has a one-time per-encoder cosine populate cost (~150 ms × 3 encoders = ~450 ms warmup); subsequent calls are fast.
 

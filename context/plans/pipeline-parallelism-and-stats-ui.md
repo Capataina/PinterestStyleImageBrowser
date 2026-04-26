@@ -148,7 +148,7 @@ frontend:
 
 ## Debugging / Verification
 
-- Run with `--profile` to confirm the workers actually overlap in the perf report (their spans should interleave, not be sequential as today).
+- Run with `--profiling` to confirm the workers actually overlap in the perf report (their spans should interleave, not be sequential as today).
 - Verify `cargo test` still passes — single-flight tests + serialisation tests should be unaffected; new tests cover the worker-coordination state machine.
 - Verify `Phase::Ready` only emits after both workers finish (not after either one alone).
 - Verify no double-encode: the `WHERE embedding IS NULL` filter should prevent re-encoding work the previous run completed.

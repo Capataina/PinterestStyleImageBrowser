@@ -2,7 +2,7 @@
 
 ## Header
 
-- **Status:** Tier 1 + Tier 2 + Phase 4 + Phase 5 + Phase 6 + Phase 7 SHIPPED on 2026-04-26. R5 (FP16) deferred. App-support wiped — next launch re-encodes everything under the new pipeline.
+- **Status (updated 2026-04-26 after Phase 11 + Phase 12):** Tier 1 + Tier 2 + Phase 4 + Phase 5 + Phase 6 + Phase 7 + Phase 11 (per-encoder enable/disable toggles + parallel encoders + text-image fusion) + Phase 12 (perf bundle from perf-1777226449: dynamic intra_threads, sequence-thumb-then-encode, SigLIP-2 text pre-warm, fast_image_resize for encoder preprocess) all SHIPPED. R5 (FP16) still deferred — needs golden-set retrieval-quality validation before flipping. R10–R16 (Tier 3 + 4) remain candidates if a future perf report shows the need; the Tier 1+2+11+12 work has likely already addressed the cases that motivated them.
 - **Date:** 2026-04-26
 - **Trigger:** lag during the 1842-image splash-arts indexing pass (two 22-second `get_images` UI freezes), plus mean SigLIP-2 encode at 252 ms/image and CLIP-text at 292 ms/call
 - **Source materials this plan synthesises:**
@@ -64,7 +64,7 @@ These are from Agents D and E during this session. Three coherent batches; each 
 - 4 new cargo tests + 1 new vitest test for the StrictMode-remount scenario
 - Tests: 56 vitest + 114 cargo, all green
 
-**Diagnosed in passing:** the 3× `cosine.populate_for_encoder` per session is *not* a bug. Breakdown: 1 real (priority hot-populate) + 2 diagnostic-only (cross-encoder comparison, gated behind `--profile`). The duplicate `set_priority_image_encoder` did not propagate into `invalidate()`. Closed without code change.
+**Diagnosed in passing:** the 3× `cosine.populate_for_encoder` per session is *not* a bug. Breakdown: 1 real (priority hot-populate) + 2 diagnostic-only (cross-encoder comparison, gated behind `--profiling`). The duplicate `set_priority_image_encoder` did not propagate into `invalidate()`. Closed without code change.
 
 ### Batch 2 — Frontend invalidation policy + Masonry virtualisation
 

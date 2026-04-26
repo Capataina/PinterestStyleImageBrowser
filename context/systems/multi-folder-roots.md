@@ -66,15 +66,15 @@ Disabling a root is instant — the row stays, the SQL filter excludes its image
 
 Pre-Phase-9 layout was flat:
 ```
-Library/thumbnails/thumb_42.jpg
-Library/thumbnails/thumb_43.jpg
+<app_data_dir>/thumbnails/thumb_42.jpg
+<app_data_dir>/thumbnails/thumb_43.jpg
 ...
 ```
 
 Post-Phase-9 layout is per-root:
 ```
-Library/thumbnails/root_1/thumb_42.jpg
-Library/thumbnails/root_2/thumb_99.jpg
+<app_data_dir>/thumbnails/root_1/thumb_42.jpg
+<app_data_dir>/thumbnails/root_2/thumb_99.jpg
 ```
 
 The reorg means `remove_root` can `rm -rf` the root's subfolder in one filesystem call, instead of per-row file deletion. Old `root_id = NULL` images still write to the flat layout via `paths::thumbnails_dir()` directly.
@@ -192,7 +192,7 @@ Frontend:
 
 - 4 root-management Tauri commands + 1 legacy `set_scan_root` that wraps them + 1 `get_scan_root` for backwards-compat with the empty-state UI
 - 1 system table (`roots`) + 1 column on `images` (`root_id`)
-- 1 thumbnail subdirectory per root, `Library/thumbnails/root_<id>/`
+- 1 thumbnail subdirectory per root, `<app_data_dir>/thumbnails/root_<id>/`
 - The Settings drawer's Folders section
 - `useRoots` query hook + `useAddRoot` / `useRemoveRoot` / `useSetRootEnabled` mutations
 - 11 unit tests in `db/roots.rs` covering add/remove/list/enable/migration semantics

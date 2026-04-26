@@ -133,26 +133,28 @@ indexing.rs::run_trait_encoder("siglip2_base", make_encoder=Siglip2ImageEncoder:
         warn "SigLIP-2 image model missing"
 ```
 
-### Text branch (semantic search path — when user picks SigLIP-2 in Settings)
+### Text branch (semantic search path)
 
 ```
-commands::semantic::semantic_search:
-    // Today's wiring still hardcodes ClipTextEncoder for the text branch — 
-    // SigLIP-2 text dispatch is "accepts the choice but only CLIP path is functional today",
-    // per the encoder picker's experimental warning. Wiring the runtime dispatch is the 
-    // remaining piece for SigLIP-2 to be the active text-to-image encoder.
+commands::semantic_fused::get_fused_semantic_search:
+    // Phase 11d — text-image RRF fusion. For each enabled text-supporting
+    // encoder (CLIP + SigLIP-2; DINOv2 is image-only, implicitly skipped),
+    // encode the query, score against the matching image-side cosine cache,
+    // then fuse via RRF.
     
-    encoder.encode(query) → Vec<f32> length 768   (when wired)
-    └─► fed to cosine.get_similar_images_sorted (against the SigLIP-2 image-cache namespace)
+    Siglip2TextEncoder::new(...) → encoder.encode(query) → Vec<f32> length 768
+    └─► one of N ranked lists fed into cosine::rrf::reciprocal_rank_fusion
 ```
 
-The runtime currently dispatches all text-to-image queries through `ClipTextEncoder` even when the user selects SigLIP-2 in the picker. The `encoder_siglip2.rs::Siglip2TextEncoder` is fully implemented; what's missing is `commands::semantic::semantic_search` reading the `textEncoder` user preference and constructing the right encoder. Documented as a near-term gap in `commands::encoders.rs` (the "experimental" warning shown next to the SigLIP-2 picker option).
+As of Phase 4 (commit `0f45344`) and then Phase 11d (text-image RRF fusion, commit `44ff366`), the text dispatch is wired. The legacy single-encoder `commands::semantic::semantic_search` IPC is still around as a fallback that takes a `text_encoder_id` parameter, but the frontend now routes `useSemanticSearch` through `get_fused_semantic_search` so every query naturally fuses across whatever text-capable encoders the user has enabled in Settings.
+
+The SigLIP-2 text encoder is also pre-warmed during indexing (Phase 12d) — `indexing.rs` constructs it eagerly, and `Siglip2TextEncoder::new` runs `encode("warmup")` internally to pay ORT's first-inference initialisation cost off the user's interactive path.
 
 ## Implemented Outputs / Artifacts
 
-- `Library/models/siglip2_vision.onnx` (~372 MB) loaded at image-encoder construction.
-- `Library/models/siglip2_text.onnx` (~1.13 GB — large because the Gemma 256k vocab embedding matrix is huge) loaded at text-encoder construction.
-- `Library/models/siglip2_tokenizer.json` (~34 MB) parsed at text-encoder construction.
+- `<app_data_dir>/models/siglip2_vision.onnx` (~372 MB) loaded at image-encoder construction.
+- `<app_data_dir>/models/siglip2_text.onnx` (~1.13 GB — large because the Gemma 256k vocab embedding matrix is huge) loaded at text-encoder construction.
+- `<app_data_dir>/models/siglip2_tokenizer.json` (~34 MB) parsed at text-encoder construction.
 - 768-d L2-normalised `f32` embeddings (image: per encode call; text: per query when wired).
 - One storage destination per image: `embeddings(image_id, encoder_id="siglip2_base", embedding)` row.
 

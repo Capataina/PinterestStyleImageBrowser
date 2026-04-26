@@ -15,7 +15,7 @@ This document is the structural map. Subsystem-level reality lives in `systems/`
 | Frontend bundler | Vite 7 + `vite-plugin-pages` (file-based routing) | `vite.config.ts`, `package.json` |
 | Backend source | 28 Rust files in `src-tauri/src/` (added `ort_session.rs`, `cosine/rrf.rs`) | filesystem |
 | Frontend source | 33 TypeScript files in `src/` (incl. settings/ subcomponents) | filesystem |
-| Persistence | Single SQLite file `Library/images.db`, **WAL journal mode**, **two connections per real DB** (writer + read-only secondary), 5 tables. | `src-tauri/src/db/mod.rs` |
+| Persistence | Single SQLite file `<app_data_dir>/images.db`, **WAL journal mode**, **two connections per real DB** (writer + read-only secondary), 5 tables. App-data dir resolves to the platform default (`~/Library/Application Support/com.ataca.image-browser/` on macOS) — **no dev-vs-release split**, overridable via `IMAGE_BROWSER_DATA_DIR` env var. | `src-tauri/src/db/mod.rs`, `paths.rs` |
 | SQLite PRAGMAs | `journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=5000`, `wal_autocheckpoint=0` (manual via `checkpoint_passive` between encoder batches), `journal_size_limit=64 MiB`, `foreign_keys=ON`. | `db/mod.rs::initialize` |
 | ML runtime | `ort = 2.0.0-rc.10` with shared M2-tuned `Session` builder (`Level3 + intra_threads(4) + inter_threads(1)`). CPU on macOS for all three encoder families (CoreML produces runtime inference errors for these graphs); CUDA on non-macOS with CPU fallback. | `Cargo.toml`, `similarity_and_semantic_search/ort_session.rs` |
 | Image encoders | **CLIP ViT-B/32** (OpenAI English, separate `vision_model.onnx`, 512-d), **DINOv2-Base** (Meta self-supervised, 768-d, image-only), **SigLIP-2 Base 256** (Google sigmoid loss, 768-d shared text+image space). Picker UI in Settings selects per direction. | `similarity_and_semantic_search/encoder*.rs` |
@@ -26,9 +26,9 @@ This document is the structural map. Subsystem-level reality lives in `systems/`
 | Thumbnail pipeline | JPEG sources go through `jpeg-decoder::Decoder::scale()` for native scaled IDCT (1/8, 1/4, 1/2 factor), then `fast_image_resize 6.x` (NEON-optimised Lanczos3) for the final downsample. Falls back to `image-rs` for non-JPEG and any decode error. | `thumbnail/generator.rs` |
 | Tauri commands | **26**, grouped by concern under `commands/` (images, tags, notes, roots, similarity, semantic, profiling, encoders) — added `get_fused_similar_images` for RRF dispatch. | `lib.rs::run` invoke_handler |
 | Typed errors | `ApiError` discriminated union; mirrored on the frontend in `services/apiError.ts`. | `commands/error.rs` |
-| Profiling + diagnostics | Opt-in via `--profile` CLI flag. PerfLayer (span timing) + `record_diagnostic` (12 named diagnostics + the new `system_sample` from the 1Hz RSS/CPU sampler). On-exit report includes Stall Analysis + Resource Trends sections. Off by default — zero overhead. | `main.rs`, `perf.rs`, `perf_report.rs`, `cosine/diagnostics.rs` |
-| User state | `<repo>/Library/` in dev (`debug_assertions`); platform app-data dir in release. | `src-tauri/src/paths.rs` |
-| Models on disk | `Library/models/{clip_vision.onnx, clip_text.onnx, clip_tokenizer.json, dinov2_base_image.onnx, siglip2_vision.onnx, siglip2_text.onnx, siglip2_tokenizer.json}` (~2.5 GB total — all FP32, no quantization). Per-encoder fail-soft download. | `src-tauri/src/model_download.rs` |
+| Profiling + diagnostics | Opt-in via the `--profiling` CLI flag (NOT `--profile` — that name collides with Tauri's own cargo-profile flag, see `main.rs::main` comment) OR the `PROFILING=1` env var. PerfLayer (span timing) + `record_diagnostic` (12 named diagnostics + the `system_sample` from the 1Hz RSS/CPU sampler). On-exit report includes Stall Analysis + Resource Trends sections. Off by default — zero overhead. | `main.rs`, `perf.rs`, `perf_report.rs`, `cosine/diagnostics.rs` |
+| User state | Platform app-data dir; same path in dev and release. On macOS: `~/Library/Application Support/com.ataca.image-browser/`. Override via `IMAGE_BROWSER_DATA_DIR` env var. | `src-tauri/src/paths.rs` |
+| Models on disk | `<app_data_dir>/models/{clip_vision.onnx, clip_text.onnx, clip_tokenizer.json, dinov2_base_image.onnx, siglip2_vision.onnx, siglip2_text.onnx, siglip2_tokenizer.json}` (~2.5 GB total — all FP32, no quantization). Per-encoder fail-soft download. | `src-tauri/src/model_download.rs` |
 | Filesystem watcher | `notify-debouncer-mini`, 5s debounce, recursive on every enabled root | `src-tauri/src/watcher.rs` |
 | Embedding-pipeline migration | `meta(key, value)` table tracks `embedding_pipeline_version`. Bumping the const wipes legacy embeddings + per-encoder rows on first launch under the new code. **Currently version 3** (bumped 2026-04-26 with R6+R7+R8 — the resize backend swap + scaled JPEG decode change preprocessed RGB buffers, and R8 stops writing the legacy `images.embedding` column). | `db/schema_migrations.rs::migrate_embedding_pipeline_version` |
 
@@ -43,8 +43,9 @@ PinterestStyleImageBrowser/
 ├── vitest.config.ts            # JSDOM env, src/test/setup.ts
 ├── components.json             # shadcn-ui registry config
 ├── public/                     # Static assets served by Vite
-├── Library/                    # User state (gitignored): images.db, settings.json, cosine_cache.bin,
-│                               # models/, thumbnails/root_<id>/, exports/perf-<unix_ts>/
+│                               # User state lives OUTSIDE the repo at the platform's app-data
+│                               # dir — on macOS `~/Library/Application Support/com.ataca.image-browser/`.
+│                               # No `Library/` directory in the repo anymore. See systems/paths-and-state.md.
 ├── scripts/                    # Dev tooling (LoL splash downloader for test corpus)
 ├── src/                        # Frontend (React)
 │   ├── App.tsx                 # BrowserRouter + QueryClientProvider + Pages routes
@@ -97,7 +98,7 @@ PinterestStyleImageBrowser/
     │                           # jpeg-decoder 0.3 (R7 scaled IDCT), sysinfo 0.32 (Phase 7 RSS/CPU sampler)
     ├── tauri.conf.json         # csp: null, assetProtocol scope ["**"]
     └── src/
-        ├── main.rs             # `--profile` parsing, tracing subscriber + opt-in PerfLayer, DB open + initialize, hands to lib::run
+        ├── main.rs             # `--profiling` parsing, tracing subscriber + opt-in PerfLayer, DB open + initialize, hands to lib::run
         ├── lib.rs              # State types (CosineIndexState, TextEncoderState{clip+siglip2}, FusionIndexState), run(): tauri::Builder.manage(...)
         │                       # .setup(legacy migrate + spawn pipeline + start watcher).invoke_handler![26 commands].run() with on-Exit perf report hook
         ├── commands/           # Tauri command handlers, grouped by concern (audit modularisation)
@@ -160,7 +161,7 @@ PinterestStyleImageBrowser/
         ├── watcher.rs          # notify-debouncer-mini start; rescan trigger via try_spawn_pipeline (single-flight coalesces bursts)
         ├── model_download.rs   # First-launch HuggingFace download (image, text, tokenizer); HEAD preflight + chunked GET + progress callback
         ├── settings.rs         # `Settings { scan_root: Option<PathBuf> }` — legacy single-folder pre-Phase-6
-        ├── paths.rs            # Library/ layout helpers; dev branches on debug_assertions to <repo>/Library/, release uses dirs::data_dir()
+        ├── paths.rs            # app-data layout helpers (always platform default; IMAGE_BROWSER_DATA_DIR env var overrides). No dev/release split.
         ├── perf.rs             # PerfLayer (tracing-subscriber Layer), per-span aggregate stats, RawEvent log, JSONL flush thread
         ├── perf_report.rs      # On-exit markdown report renderer + raw.json
         ├── image_struct.rs     # ImageData (id, path, tags, thumbnail_path?, w?, h?, notes?, orphaned)
@@ -176,7 +177,7 @@ PinterestStyleImageBrowser/
                  │                                                │
    Browser ──►   pages/[...slug].tsx  (search-routing, hotkeys)    │
                        │   │   │                                   │
-                       │   │   └─► PerfOverlay (--profile only)    │
+                       │   │   └─► PerfOverlay (--profiling only)    │
                        │   │                                       │
                        ▼   ▼                                       │
                  Masonry / SearchBar / PinterestModal /            │
@@ -214,12 +215,12 @@ PinterestStyleImageBrowser/
                   │                indexing pipeline (single-    │ │
                   │                flight coalesces)             │ │
                   │                                             │  │
-                  │  perf.rs (only mounted on --profile):       │  │
+                  │  perf.rs (only mounted on --profiling):       │  │
                   │     PerfLayer aggregates spans               │ │
                   │     + JSONL timeline + on-exit report.md    │  │
                   └─────────────────────────────────────────────┘  │
                                                                    │
-                  ─── disk: <repo>/Library/ in dev ────────────────┘
+                  ─── disk: <app_data_dir>/ ────────────────────────┘
                        images.db (WAL), settings.json,
                        cosine_cache.bin, models/*.onnx,
                        thumbnails/root_<id>/thumb_<id>.jpg,
@@ -235,8 +236,8 @@ PinterestStyleImageBrowser/
 | `watcher` | `notify-debouncer-mini` recursive watch on every enabled root; 5s debounce → re-spawn pipeline | `src-tauri/src/watcher.rs` | `systems/watcher.md` |
 | `multi-folder-roots` | `roots` table CRUD, enabled toggle, `set_scan_root` vs `add_root` semantics, `migrate_legacy_scan_root`, per-root thumbnail directories | `src-tauri/src/db/roots.rs`, `commands/roots.rs`, `paths::thumbnails_dir_for_root` | `systems/multi-folder-roots.md` |
 | `model-download` | First-launch HuggingFace fetch for `model_image.onnx`, `model_text.onnx`, `tokenizer.json`; HEAD preflight + chunked GET + per-byte progress | `src-tauri/src/model_download.rs` | `systems/model-download.md` |
-| `paths-and-state` | `Library/` directory layout, dev-vs-release branching, settings.json, cosine_cache.bin, exports/, `strip_windows_extended_prefix` | `src-tauri/src/paths.rs`, `settings.rs` | `systems/paths-and-state.md` |
-| `profiling` | `--profile` flag, `PerfLayer` span aggregation, RawEvent log, JSONL flush, on-exit `report.md` renderer, frontend `<PerfOverlay>` + `perfInvoke` + action breadcrumbs | `src-tauri/src/perf.rs`, `perf_report.rs`, `src/components/PerfOverlay.tsx`, `src/services/perf.ts` | `systems/profiling.md` |
+| `paths-and-state` | `<app_data_dir>/` directory layout (no dev/release split — same path everywhere, env-var overridable), settings.json (scan_root + enabled_encoders + legacy priority_image_encoder), cosine_cache.bin, exports/, `strip_windows_extended_prefix` | `src-tauri/src/paths.rs`, `settings.rs` | `systems/paths-and-state.md` |
+| `profiling` | `--profiling` flag, `PerfLayer` span aggregation, RawEvent log, JSONL flush, on-exit `report.md` renderer, frontend `<PerfOverlay>` + `perfInvoke` + action breadcrumbs | `src-tauri/src/perf.rs`, `perf_report.rs`, `src/components/PerfOverlay.tsx`, `src/services/perf.ts` | `systems/profiling.md` |
 | `filesystem-scanner` | Recursive image discovery, 7-extension whitelist (read by indexing) | `src-tauri/src/filesystem.rs` | `systems/filesystem-scanner.md` |
 | `thumbnail-pipeline` | Aspect-preserving 400×400 cached thumbnails on disk; per-root subfolder layout; rayon-parallel | `src-tauri/src/thumbnail/generator.rs` | `systems/thumbnail-pipeline.md` |
 | `clip-image-encoder` | OpenAI CLIP ViT-B/32 separate `vision_model.onnx`; bicubic-shortest-edge-224 + center-crop, CLIP-native mean/std, 512-d L2-normalised, batched | `src-tauri/src/similarity_and_semantic_search/encoder.rs` | `systems/clip-image-encoder.md` |
@@ -254,7 +255,7 @@ PinterestStyleImageBrowser/
 
 ```
         main.rs (binary entry)
-            │ parse --profile, init tracing + opt-in PerfLayer,
+            │ parse --profiling, init tracing + opt-in PerfLayer,
             │ open SQLite + initialize (WAL/NORMAL/foreign_keys)
             ▼
     db ◄─────────────────────────────────────────────────┐
@@ -269,7 +270,7 @@ PinterestStyleImageBrowser/
    model-download► (called by indexing)                   │
    paths ─────────► (called by everything reading state)  │
    settings ──────► (called by lib.rs setup for legacy migration)
-   perf ──────────► (mounted only when --profile set)     │
+   perf ──────────► (mounted only when --profiling set)     │
    indexing ──────► spawns thread, calls every encoder/   │
                     thumbnail/db/cosine module in order,  │
                     holds Arc<Mutex<CosineIndex>> + Arc<  │
@@ -293,7 +294,7 @@ Key directional rules observed in code:
 - **`cosine::populate_from_db` now takes `&ImageDatabase`** (audit finding `ae0006d`/`5c2b0f6`) and uses the single-SELECT `get_all_embeddings` — no second connection, no per-row lookup.
 - **`Arc<Mutex<CosineIndex>>` is intentionally cloned across thread boundaries** — the indexing thread (background) and the Tauri-managed `CosineIndexState` (foreground commands) both hold clones pointing at the same in-memory cache. This is what lets a finished pipeline-encode immediately make new embeddings available to the next semantic search.
 - **`indexing.rs` and `watcher.rs` are coupled through `IndexingState` (single-flight AtomicBool)** — rapid filesystem events that try to spawn a second pipeline get `Err(AlreadyRunning)` back and silently coalesce.
-- **`profiling` is not in the normal data path.** When `--profile` is absent, `PerfLayer` never registers, all `#[tracing::instrument]` overhead reduces to one tracing dispatch per call (the env filter passes the spans but no aggregator builds them), the frontend `PerfOverlay` never mounts, and `record_user_action` is a no-op. All profiling-related code paths stay cold.
+- **`profiling` is not in the normal data path.** When `--profiling` is absent, `PerfLayer` never registers, all `#[tracing::instrument]` overhead reduces to one tracing dispatch per call (the env filter passes the spans but no aggregator builds them), the frontend `PerfOverlay` never mounts, and `record_user_action` is a no-op. All profiling-related code paths stay cold.
 - **`commands` returns `Result<T, ApiError>`** for every handler. The frontend deserialises `{ kind, details }` and branches on kind in `formatApiError`. Strings on the wire still parse via the legacy fallback.
 - **Frontend services never call `invoke()` directly** — they wrap it in functions that translate Tauri JSON into UI types. Hooks call services; components call hooks.
 
@@ -302,8 +303,8 @@ Key directional rules observed in code:
 ### Startup pipeline (`main.rs` → `lib.rs::run` → `indexing.rs::run_pipeline_inner`)
 
 ```
-1. Parse --profile flag                            main.rs:22
-2. Init tracing subscriber (PerfLayer only on --profile) main.rs:48-79
+1. Parse --profiling flag                            main.rs:22
+2. Init tracing subscriber (PerfLayer only on --profiling) main.rs:48-79
 3. Open SQLite handle + initialize                 main.rs:89-91, db/mod.rs:47-145
    • PRAGMA journal_mode=WAL
    • PRAGMA synchronous=NORMAL
@@ -452,15 +453,15 @@ This table satisfies the inter-system relationship mapping obligation. With 19 s
 | 11 | multi-folder-roots | database | `roots` table; `images.root_id INTEGER REFERENCES roots(id) ON DELETE CASCADE`; `PRAGMA foreign_keys=ON` was the explicit fix that made CASCADE actually fire | Disabling FK pragma silently turns CASCADE into a no-op — orphan image rows accumulate. |
 | 12 | tauri-commands | ApiError + frontend apiError.ts | Wire format pinned by `#[serde(tag="kind", content="details")]`. Frontend `ApiError` discriminated union mirrors the kinds; `formatApiError(unknown)` covers ApiError + legacy strings + Error instances | Adding a backend variant without updating the TS union triggers no runtime error — the default case in `formatApiError` handles unknown kinds gracefully. |
 | 13 | tauri-commands | cosine-similarity + clip-text-encoder | `commands::similarity` and `commands::semantic` lock `CosineIndexState.index` (Mutex) and `TextEncoderState.encoder` (Mutex<Option<...>>) via `?` (uses `From<PoisonError>` impl) | Mutex poison surfaces as `ApiError::Cosine`; user can retry — the next call relocks fresh. |
-| 14 | profiling | every instrumented system | `tracing::info_span!` and `#[tracing::instrument]` on commands, indexing phases, model_download, watcher events, cosine retrievals. Spans collected by `PerfLayer` only when `--profile` is set. | Without `--profile`, span construction still happens (env filter passes) but the aggregator never registers — overhead is one tracing dispatch per call, no allocation. |
+| 14 | profiling | every instrumented system | `tracing::info_span!` and `#[tracing::instrument]` on commands, indexing phases, model_download, watcher events, cosine retrievals. Spans collected by `PerfLayer` only when `--profiling` is set. | Without `--profiling`, span construction still happens (env filter passes) but the aggregator never registers — overhead is one tracing dispatch per call, no allocation. |
 | 15 | profiling | frontend overlay + perfInvoke | `is_profiling_enabled` command resolved at mount; `<PerfOverlay>` mounts only if true; `recordAction` calls into `record_user_action` which appends to the timeline only when profiling is on; `perfInvoke` wraps Tauri `invoke` with a `React.Profiler`-style start/end emit | Without profiling, all React profiling-related state is dead — `useState(profiling)` is `false` and every gated branch short-circuits. |
 | 16 | search-routing | tauri-commands | `pages/[...slug].tsx` invokes `get_images`, `get_tiered_similar_images`, `semantic_search` and chooses outputs by priority (similar > semantic > tag > all). Selection lookup now uses `displayImages` not `images.data` (audit fix `9d04f69`) | If a backend command's JSON shape changes without a TS update, the priority union silently falls back to whichever branch did succeed. |
 | 17 | masonry-layout | search-routing + database | Masonry receives `displayImages: ImageItem[]` from routing, plus `selectedItem` for hero promotion. Tile dimensions now come from the DB row (audit `fb23bdb` — was DOM-Image round-trip). | If `width/height` are NULL (legacy un-thumbnailed rows), Masonry falls back to a default aspect ratio. |
 | 18 | tag-system | database | Tags use `tags` and `images_tags` tables; `add_tag_to_image` is `INSERT OR IGNORE` (Phase 6 hardening). `delete_tag` is now wired through `commands::tags::delete_tag` (audit Phase 6). AND/OR controlled by `match_all_tags: bool` parameter on `get_images_with_thumbnails`. | A typo'd tag now has a UI delete affordance; before this commit it accumulated forever. |
 | 19 | frontend-state | search-routing + tag-system + masonry + indexing | `queryClient.ts` sets `staleTime: Infinity` — caches never auto-stale. `useIndexingProgress` fires `invalidateQueries(["images"])` on `Phase::Ready`. Tag mutations use `invalidateQueries` after success. | A stale cache after a tag mutation would show wrong tags; `onSuccess` invalidation handles this. Cross-cache-key staleness still possible if a future feature mutates state without invalidating. |
-| 20 | paths-and-state | database + thumbnail + cosine + model-download + perf + settings | `paths::*_dir()` helpers are the single source for every disk path. Dev branches on `cfg(debug_assertions)` to `<repo>/Library/`; release falls back to `dirs::data_dir()/com.ataca.image-browser/`. | If `paths::app_data_dir()` returns the wrong directory (e.g., a future macOS sandbox change), every state file goes to the wrong place. The dev build's `unwrap_or_else(PathBuf::from("."))` makes silent failures more likely. |
+| 20 | paths-and-state | database + thumbnail + cosine + model-download + perf + settings | `paths::*_dir()` helpers are the single source for every disk path. Always resolves to the platform default (`dirs::data_dir()/com.ataca.image-browser/`); the dev/release branching that used to point at `<repo>/Library/` was removed because dev and release diverged on every code change, forcing 2.5 GB of model re-downloads on each switch. `IMAGE_BROWSER_DATA_DIR` env var overrides for testing/multi-instance. | If `paths::app_data_dir()` returns the wrong directory (e.g., a future macOS sandbox change), every state file goes to the wrong place. The fallback `./app-data/` path makes silent failures more likely on environments where `dirs::data_dir()` returns `None`. |
 | 21 | settings (legacy) | multi-folder-roots | One-shot: lib.rs setup callback reads `settings.json::scan_root`; if present, calls `db.migrate_legacy_scan_root(path)` and clears the field so it doesn't re-migrate | If the user manually edits settings.json after migration, the legacy field could re-trigger; `migrate_legacy_scan_root` is idempotent (existing path → no-op). |
-| 22 | profiling | every encoder + indexing + cosine + commands | `record_diagnostic(name, payload)` writes a `RawEvent::Diagnostic` to the perf log. 17 call sites across `commands/` (4), `indexing.rs` (3 — 2 in encoder loops, 1 in run summaries), `lib.rs` (2 — startup_state + cosine_math_sanity), `cosine/index.rs` (4 — cache_populated + 3 quality stats). When `--profile` is absent, every call is a no-op. | If `record_diagnostic` panicked, every encoder/cosine/command site would propagate. The body uses no `?` operators and no allocs that can panic, so the no-op-when-disabled fast path is hot. |
+| 22 | profiling | every encoder + indexing + cosine + commands | `record_diagnostic(name, payload)` writes a `RawEvent::Diagnostic` to the perf log. 17 call sites across `commands/` (4), `indexing.rs` (3 — 2 in encoder loops, 1 in run summaries), `lib.rs` (2 — startup_state + cosine_math_sanity), `cosine/index.rs` (4 — cache_populated + 3 quality stats). When `--profiling` is absent, every call is a no-op. | If `record_diagnostic` panicked, every encoder/cosine/command site would propagate. The body uses no `?` operators and no allocs that can panic, so the no-op-when-disabled fast path is hot. |
 | 23 | cosine-similarity diagnostics | profiling | The 4 stateless helpers in `cosine/diagnostics.rs` (`embedding_stats`, `pairwise_distance_distribution`, `self_similarity_check`, `score_distribution_stats`) compute domain-specific stats and return `serde_json::Value` payloads. They are called from `cosine/index.rs::populate_from_db_for_encoder` and from `commands::similarity` / `commands::semantic` to enrich the `search_query` diagnostic. | If a helper panics on a malformed cache (NaN-only embeddings, empty cache), the encoder's populate pass would still succeed but the diagnostic payload would be missing. Today the helpers handle empty cases with explicit early returns. |
 | 24 | embedding-pipeline migration | every encoder + cosine cache | `db/schema_migrations.rs::migrate_embedding_pipeline_version` runs once after the embeddings table is created. When `meta.embedding_pipeline_version < CURRENT_PIPELINE_VERSION`, wipes legacy CLIP + dinov2_small embeddings so the next indexing pass re-encodes under the new pipelines. SigLIP-2 rows aren't wiped (no prior data). | If the version constant is bumped without code-side preprocessing changes, embeddings are wiped and re-encoded with no quality change — wasteful but not broken. Bump must be paired with a real pipeline change. |
 | 25 | tauri-commands | encoders.rs | `list_available_encoders` Tauri command serves the static `ENCODERS: &[EncoderInfo]` list (3 entries: clip_vit_b_32, siglip2_base, dinov2_base) to the frontend EncoderSection picker. Each entry carries id, display_name, description, dim, supports_text, supports_image. | EncoderInfo struct is mirrored as a TS interface in `EncoderSection.tsx`. Adding a backend entry without updating the picker UI's option-rendering logic surfaces as the option being available but with empty rationale text. |
@@ -494,7 +495,7 @@ The **TextEncoder Mutex<Option<...>>** serialises every concurrent semantic sear
 
 | State | Owner | Sharing pattern | Risk |
 |-------|-------|-----------------|------|
-| `Library/images.db` | `ImageDatabase` instance held by Tauri State (foreground) + a second `ImageDatabase` constructed inside the indexing thread (background) | Two connections to the same WAL'd file. WAL mode means foreground reads don't block background writes. | Without WAL the indexing pipeline would block UI reads for the duration of every batch encode. |
+| `<app_data_dir>/images.db` | `ImageDatabase` with TWO connections per real DB (Phase 11/12-era R2): the writer (`Mutex<Connection>`) used by every encoder thread + foreground writes (tag mutations, root toggles), and the read-only secondary (`OnceLock<Mutex<Connection>>`) used by foreground SELECTs via `read_lock()`. WAL journal mode lets both coexist without per-row locking. | Without R2, foreground `get_images` queues behind in-flight encoder write batches — the perf-1777212369 22 s freeze. Without WAL the indexing pipeline would block every UI read for the duration of every batch encode. |
 | `CosineIndex.cached_images` | `CosineIndexState.index: Arc<Mutex<CosineIndex>>` | Cloned across boundary: indexing thread + Tauri-managed state hold the same Arc. | The cache is invalidated on `set_scan_root` / `add_root` / `remove_root` / `set_root_enabled` (`commands::roots`) by clearing `cached_images` directly. Without that, root changes would leak old embeddings into queries. |
 | `TextEncoder` | `TextEncoderState.encoder: Mutex<Option<TextEncoder>>` | Pre-warmed by indexing thread; lazy fallback in `commands::semantic`. | Heavy resource (ONNX session). Once loaded, lives until process exit. |
 | `IndexingState.is_running` | `Arc<IndexingState>` (`AtomicBool`) | Tauri-managed + every command that triggers an index + watcher closure. RAII guard ensures the bool clears even if the pipeline panics. | If a command spawns a pipeline without the AtomicBool dance, two could run concurrently (would still be safe due to idempotent ops, but wasteful). |
@@ -518,7 +519,7 @@ For a future session asking "where do I learn about X?":
 | Improve semantic search quality | `systems/clip-text-encoder.md` → `systems/siglip2-encoder.md` → `systems/cosine-similarity.md` → `notes/preprocessing-spatial-coverage.md` (open architectural concern about CLIP/DINOv2 center-crop dropping edge content) |
 | Add or modify an encoder | The relevant `systems/{clip-image,clip-text,dinov2,siglip2}-encoder.md` → `systems/model-download.md` (URL/filename) → `commands/encoders.rs` (picker entry) → `db/schema_migrations.rs` (bump `CURRENT_PIPELINE_VERSION` if preprocessing changes invalidate prior data) |
 | Read or extend the diagnostic system | `systems/profiling.md` § Domain diagnostics → `notes/conventions.md` § Domain diagnostics via `record_diagnostic` |
-| Profile a performance regression | `systems/profiling.md` (run with `--profile`, read `Library/exports/perf-<unix_ts>/report.md`) |
+| Profile a performance regression | `systems/profiling.md` (run with `--profiling` flag or `PROFILING=1`, read `<app_data_dir>/exports/perf-<unix_ts>/report.md`) |
 | Wire a new frontend pref | `systems/frontend-state.md` → `src/hooks/useUserPreferences.ts` → relevant `settings/*Section.tsx` |
 
 ## Structural Notes / Current Reality
@@ -528,8 +529,8 @@ For a future session asking "where do I learn about X?":
 - **Three encoder families are live.** CLIP ViT-B/32 (OpenAI English, 512-d, both branches), DINOv2-Base (Meta self-supervised, 768-d, image-only), SigLIP-2 Base 256 (Google sigmoid loss, 768-d shared image+text — but text-branch picker dispatch is partially wired). Each has its own preprocessing pipeline matching its training-time stats; mixing preprocessing across encoders silently degrades embedding quality with no error signal.
 - **The `models/` directory is now auto-populated.** First launch downloads ~2.5 GB from HuggingFace with live progress; the Indexing pill renders MB/MB. Per-file fail-soft: a single 401/404 doesn't abort the batch.
 - **Embedding-pipeline migration v2 wipes legacy CLIP + dinov2_small embeddings on first launch under the current code** — the next indexing pass re-encodes everything cleanly. Bump the version constant for any future preprocessing change that invalidates prior data.
-- **The diagnostic system is the primary signal for encoder/search quality issues** — 12 named diagnostics including embedding L2-norm distribution, pairwise distance histogram, self-similarity sanity check, score distribution stats, tokenizer output, encoder run summary, preprocessing sample, cross-encoder comparison, cosine math sanity. All are no-ops without `--profile`. See `systems/profiling.md` § Domain diagnostics.
-- **User state lives under `<repo>/Library/` in dev**, NOT in the platform app data dir. Release builds fall back to `~/Library/Application Support/com.ataca.image-browser/` on macOS via `dirs::data_dir()`. This is for project-local visibility — see `systems/paths-and-state.md`.
+- **The diagnostic system is the primary signal for encoder/search quality issues** — 12 named diagnostics including embedding L2-norm distribution, pairwise distance histogram, self-similarity sanity check, score distribution stats, tokenizer output, encoder run summary, preprocessing sample, cross-encoder comparison, cosine math sanity. All are no-ops without `--profiling`. See `systems/profiling.md` § Domain diagnostics.
+- **User state lives under the platform's app-data dir** (on macOS `~/Library/Application Support/com.ataca.image-browser/`). The previous dev-vs-release branching that pointed at `<repo>/Library/` for debug builds was removed: dev and release builds compile differently but share state, so a build-mode switch no longer forces a 2.5 GB model re-download. Override via `IMAGE_BROWSER_DATA_DIR` env var. See `systems/paths-and-state.md`.
 - **WAL is on.** Two SQLite connections coexist (foreground via `ImageDatabase`, background via the indexing thread's `ImageDatabase::new(db_path)`). Reads never block writes.
 - **Three Tauri-managed `Mutex` singletons + two Arcs** serialise backend operations:
   - `Mutex<rusqlite::Connection>` inside `ImageDatabase` (per connection)
@@ -539,7 +540,7 @@ For a future session asking "where do I learn about X?":
   - `Arc<Mutex<Option<WatcherHandle>>>` for the watcher slot
 - **CoreML is enabled for the image encoder on macOS** but explicitly disabled for the text encoder — transformer ops are poorly supported by CoreML and produced runtime inference errors. CUDA is target-gated on non-macOS builds; both fall back to CPU.
 - **The `assetProtocol` security scope is `["**"]`** with `csp: null`. Fine for a single-user local tool that only ever loads its own bundled HTML; flagged as a hardening target in `enhancements/recommendations/08-tauri-csp-asset-scope-hardening.md`.
-- **Profiling is opt-in via `--profile`.** When absent, every profiling code path (PerfLayer, PerfOverlay mount, action breadcrumbs, cmd+shift+P shortcut, on-exit report) is dormant.
+- **Profiling is opt-in via `--profiling`.** When absent, every profiling code path (PerfLayer, PerfOverlay mount, action breadcrumbs, cmd+shift+P shortcut, on-exit report) is dormant.
 - **Filesystem watcher does not currently rebuild on `add_root` / `remove_root`.** New roots aren't watched until the next launch. Documented gap, low priority because the indexing pipeline that those commands trigger covers the immediate rescan.
 
 ## Coverage

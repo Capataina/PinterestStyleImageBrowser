@@ -147,8 +147,8 @@ commands::semantic::semantic_search:
 
 ## Implemented Outputs / Artifacts
 
-- `Library/models/clip_text.onnx` (~254 MB) loaded at first construction.
-- `Library/models/clip_tokenizer.json` (~2 MB) parsed at first construction.
+- `<app_data_dir>/models/clip_text.onnx` (~254 MB) loaded at first construction.
+- `<app_data_dir>/models/clip_tokenizer.json` (~2 MB) parsed at first construction.
 - `Vec<f32>` length 512 per `encode(query)` call (L2-normalised).
 - Encoder unit tests in `encoder.rs`.
 

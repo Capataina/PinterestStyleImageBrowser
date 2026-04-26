@@ -118,7 +118,7 @@ The encode phase is gated on the model file existing. If it doesn't (first launc
 
 ## Implemented Outputs / Artifacts
 
-- `Library/models/clip_vision.onnx` (~352 MB) loaded at construction.
+- `<app_data_dir>/models/clip_vision.onnx` (~352 MB) loaded at construction.
 - 512-d L2-normalised `f32` embedding per image.
 - Two storage destinations per embedding:
   - Legacy `images.embedding` BLOB (kept for backward-compat with semantic_search reader)

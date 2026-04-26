@@ -4,7 +4,7 @@
 
 ## Scope / Purpose
 
-First-launch download manager for the eight ONNX / tokenizer files across three encoder families (CLIP, DINOv2, SigLIP-2). Pulls each file from its corresponding HuggingFace URL and writes them into `Library/models/`. Skips files that already exist on disk. Supports a per-byte progress callback so the indexing pipeline's status pill can render a determinate bar across the ~2.5 GB of total downloads instead of a "Checking models..." flash followed by a multi-minute silent stretch.
+First-launch download manager for the eight ONNX / tokenizer files across three encoder families (CLIP, DINOv2, SigLIP-2). Pulls each file from its corresponding HuggingFace URL and writes them into `<app_data_dir>/models/`. Skips files that already exist on disk. Supports a per-byte progress callback so the indexing pipeline's status pill can render a determinate bar across the ~2.5 GB of total downloads instead of a "Checking models..." flash followed by a multi-minute silent stretch.
 
 Per-encoder URL constants live in their respective encoder modules (`encoder_dinov2.rs`, `encoder_siglip2.rs`) — `model_download.rs` owns only the CLIP constants. The download function imports the per-encoder constants and treats all eight files uniformly.
 
@@ -99,13 +99,13 @@ The pipeline continues even if the download fails. The thumbnail and (no-op) enc
 
 | Destination | What |
 |-------------|------|
-| `Library/models/clip_vision.onnx` | ~352 MB |
-| `Library/models/clip_text.onnx` | ~254 MB |
-| `Library/models/clip_tokenizer.json` | ~2 MB |
-| `Library/models/dinov2_base_image.onnx` | ~347 MB |
-| `Library/models/siglip2_vision.onnx` | ~372 MB |
-| `Library/models/siglip2_text.onnx` | ~1.13 GB |
-| `Library/models/siglip2_tokenizer.json` | ~34 MB |
+| `<app_data_dir>/models/clip_vision.onnx` | ~352 MB |
+| `<app_data_dir>/models/clip_text.onnx` | ~254 MB |
+| `<app_data_dir>/models/clip_tokenizer.json` | ~2 MB |
+| `<app_data_dir>/models/dinov2_base_image.onnx` | ~347 MB |
+| `<app_data_dir>/models/siglip2_vision.onnx` | ~372 MB |
+| `<app_data_dir>/models/siglip2_text.onnx` | ~1.13 GB |
+| `<app_data_dir>/models/siglip2_tokenizer.json` | ~34 MB |
 | `progress(processed_bytes, total_bytes, current_filename)` callback | One call after HEAD preflight, then one per chunk for each file |
 
 The download function is now per-file fail-soft (see commit `e7a5a76` and the 2026-04-26 changes): a single 401/404/timeout no longer aborts the batch — each file's failure is logged with its URL so the user can identify which one needs a corrected URL. The aggregate counter still advances by the failed file's declared size so the progress bar doesn't stall mid-flight.
@@ -116,7 +116,7 @@ The download function is now per-file fail-soft (see commit `e7a5a76` and the 20
 
 ## Implemented Outputs / Artifacts
 
-- Three ONNX/tokenizer files in `Library/models/` after first successful run
+- Three ONNX/tokenizer files in `<app_data_dir>/models/` after first successful run
 - Tracing spans `model_download.all`, `model_download.head`, `model_download.file` visible in profile reports
 - The `Phase::ModelDownload` events emitted by the wrapping indexing pipeline carry both the running byte count and the filename string
 
@@ -139,7 +139,7 @@ None.
 ## Planned / Missing / Likely Changes
 
 - **Resumable downloads via HTTP Range headers.** Honour the `.part` file length, send `Range: bytes=N-` to resume, fall back to full download if the server doesn't support Range. Materially changes the UX for users on slower or flakier connections.
-- **Configurable model URLs.** A user might want to point at a self-hosted mirror or a quantised variant. Today the URLs are hardcoded. A `Library/models/manifest.json` could opt into custom sources.
+- **Configurable model URLs.** A user might want to point at a self-hosted mirror or a quantised variant. Today the URLs are hardcoded. A `<app_data_dir>/models/manifest.json` could opt into custom sources.
 - **Retry with exponential backoff** for transient errors (5xx, connection reset, DNS hiccup).
 - **Checksum verification.** HuggingFace publishes sha256 sums in the file metadata; verify after download to detect corruption / MITM.
 - **Quantised model variants.** The `enhancements/recommendations/06-int8-quantisation-encoders.md` document discusses int8 ONNX exports that would shrink the download by ~4× and speed up inference. Would change the URLs.
@@ -150,7 +150,7 @@ None.
 - **HEAD preflight specifically because the UI needs determinate progress.** The original "Checking models..." flash followed by a silent multi-minute wait was the worst possible first-launch UX. The HEAD probes add a fraction of a second to the start of the download phase but make the bar meaningful immediately.
 - **`.part` extension over a hidden tmpfile** because the user might inspect the directory mid-download and a clearly-named `.part` file communicates "this is in progress" better than a `.tmp_random_suffix` file.
 - **Single HEAD per file rather than a manifest JSON.** A manifest would let one HTTP fetch return all three sizes; HuggingFace doesn't expose one for this set, and three HEADs is cheap. If a future feature needs N models the trade-off would flip.
-- **The indexing pipeline owns the calling site, not commands.** A "force re-download" Tauri command was considered but not added — if the user wants to force re-download they can `rm -f Library/models/*` and restart, which is rare enough that an explicit command isn't justified yet. Adding one is trivial when the need arises.
+- **The indexing pipeline owns the calling site, not commands.** A "force re-download" Tauri command was considered but not added — if the user wants to force re-download they can `rm -f <app_data_dir>/models/*` and restart, which is rare enough that an explicit command isn't justified yet. Adding one is trivial when the need arises.
 
 ## Obsolete / No Longer Relevant
 

@@ -4,7 +4,7 @@
 
 ## Scope / Purpose
 
-Generates and caches small JPEG thumbnails for every image in the database. Stores them on disk under `Library/thumbnails/root_<id>/thumb_<image_id>.jpg` (per-root subdirectory layout, Phase 9 reorg) and writes the thumbnail path plus original dimensions back to the `images` table for fast frontend layout. The grid does not load full-resolution images — only thumbnails. The full image is loaded only when the modal opens.
+Generates and caches small JPEG thumbnails for every image in the database. Stores them on disk under `<app_data_dir>/thumbnails/root_<id>/thumb_<image_id>.jpg` (per-root subdirectory layout, Phase 9 reorg) and writes the thumbnail path plus original dimensions back to the `images` table for fast frontend layout. The grid does not load full-resolution images — only thumbnails. The full image is loaded only when the modal opens.
 
 Runs in parallel via rayon during the indexing pipeline's Phase::Thumbnail. Single-SELECT path-to-root resolution (audit fix `0bdb5f4`) replaced the previous per-image DB query.
 
@@ -19,7 +19,7 @@ Runs in parallel via rayon during the indexing pipeline's Phase::Thumbnail. Sing
 ### Per-root subfolder layout (Phase 9)
 
 ```
-Library/thumbnails/
+<app_data_dir>/thumbnails/
   root_1/thumb_42.jpg
   root_2/thumb_99.jpg
   root_3/thumb_12.jpg
@@ -134,7 +134,7 @@ Frontend later receives the thumbnail path via `ImageData::thumbnail_path` in `g
 
 ## Implemented Outputs / Artifacts
 
-- One JPEG per image at `Library/thumbnails/root_<id>/thumb_<image_id>.jpg` (or flat for legacy NULL-root_id rows).
+- One JPEG per image at `<app_data_dir>/thumbnails/root_<id>/thumb_<image_id>.jpg` (or flat for legacy NULL-root_id rows).
 - DB row updated with `thumbnail_path`, `width`, `height` (the dimensions are the *original* image's, not the thumbnail's — used by Masonry for aspect-preserving layout).
 - Tracing span `pipeline.thumbnail_phase` for perf attribution.
 - Throttled `indexing-progress` events every ~25 thumbnails.

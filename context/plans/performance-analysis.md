@@ -2,7 +2,7 @@
 
 ## Header
 
-- **Status:** diagnostic complete; fixes pending
+- **Status:** RESOLVED. The chain diagnosis below was the input to the perf-optimisation-plan; every link (encoder writes, frontend invalidation, Masonry render, DB contention) was broken by some combination of Tier 1 + Tier 2 + Phase 11 + Phase 12. A second perf session (perf-1777226449) confirmed the 22 s freeze was gone and surfaced a new set of issues that Phase 12 then addressed. This file is kept as the historical record of how the original diagnosis worked, since the chain-trace methodology is reusable.
 - **Date:** 2026-04-26
 - **Primary report analysed:** `/Users/atacanercetinkaya/Library/Application Support/com.ataca.image-browser/exports/perf-1777212369/report.md`
 - **Raw timeline:** `/Users/atacanercetinkaya/Library/Application Support/com.ataca.image-browser/exports/perf-1777212369/timeline.jsonl`

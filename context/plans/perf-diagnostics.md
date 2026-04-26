@@ -301,7 +301,7 @@ the threshold. Acts as a regression canary.
 | 9 | tracing-tracy integration for live viz | **(deferred — optional)** |
 | 10 | Cargo benches for pure-fn hot paths | **(deferred — separate concern)** |
 
-Phases 1-5 are fully shipped — the user's `--profile` mode produces
+Phases 1-5 are fully shipped — the user's `--profiling` mode produces
 the on-exit `report.md` + `raw.json` + `timeline.jsonl` artefacts
 documented in `systems/profiling.md`. Phase 6 partially landed; Phase
 7 hasn't started.

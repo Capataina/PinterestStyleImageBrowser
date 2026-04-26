@@ -98,7 +98,7 @@ Phase::Encode (runs each available encoder family in sequence)
 
 (cosine repopulate — NOT a separately-named phase; happens between Encode and Ready)
     ──► cosine.populate_from_db(&database)
-    ──► cosine.save_to_disk()       ← writes Library/cosine_cache.bin
+    ──► cosine.save_to_disk()       ← writes <app_data_dir>/cosine_cache.bin
 
 Phase::Ready (db.get_all_images().len() in the message)
 ```
@@ -127,7 +127,7 @@ if let Ok(mut idx) = cosine_index.lock() {
 }
 ```
 
-If `Library/cosine_cache.bin` is fresher than `Library/images.db` (compared via mtime), the populated `cached_images` vec is loaded directly from disk via bincode. The user can run similarity / semantic queries within milliseconds of app launch even before the rest of the pipeline finishes. If the cache is stale, the explicit populate_from_db at the end of the pipeline rebuilds it.
+If `<app_data_dir>/cosine_cache.bin` is fresher than `<app_data_dir>/images.db` (compared via mtime), the populated `cached_images` vec is loaded directly from disk via bincode. The user can run similarity / semantic queries within milliseconds of app launch even before the rest of the pipeline finishes. If the cache is stale, the explicit populate_from_db at the end of the pipeline rebuilds it.
 
 ### Pre-warm text encoder
 
@@ -176,9 +176,9 @@ The progress callback is the only `Phase::ModelDownload` event source. If models
 | `app.emit("indexing-progress", &payload)` | Per-phase progress payloads — see below |
 | Database `images` table | INSERT OR IGNORE per scanned path; UPDATE thumbnail_path/width/height; UPDATE embedding |
 | Database `images` table (orphan column) | UPDATE orphaned = 0/1 per `mark_orphaned` |
-| Filesystem `Library/thumbnails/root_<id>/thumb_<id>.jpg` | One JPEG per image |
-| Filesystem `Library/models/*.onnx`, `tokenizer.json` | Downloaded if missing |
-| Filesystem `Library/cosine_cache.bin` | Written via `cosine.save_to_disk()` after every successful encode pass |
+| Filesystem `<app_data_dir>/thumbnails/root_<id>/thumb_<id>.jpg` | One JPEG per image |
+| Filesystem `<app_data_dir>/models/*.onnx`, `tokenizer.json` | Downloaded if missing |
+| Filesystem `<app_data_dir>/cosine_cache.bin` | Written via `cosine.save_to_disk()` after every successful encode pass |
 | `CosineIndexState.index` (Arc<Mutex<...>>) | Populated via `cosine.populate_from_db(&database)` |
 | `TextEncoderState.encoder` | Pre-warmed if model files exist |
 

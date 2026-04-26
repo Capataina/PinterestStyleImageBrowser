@@ -4,7 +4,7 @@
 
 ## Scope / Purpose
 
-In-memory similarity index over the database's CLIP embeddings. Provides three retrieval modes: random-sampled top-N (diversity), strictly-sorted top-N (semantic search), and Pinterest-style tiered sampling (visual similarity). Constructed empty at app startup and populated either from the persistent on-disk cache (`Library/cosine_cache.bin`) at indexing-pipeline start or via a single-SELECT `populate_from_db(&ImageDatabase)` after every encode pass.
+In-memory similarity index over the database's CLIP embeddings. Provides three retrieval modes: random-sampled top-N (diversity), strictly-sorted top-N (semantic search), and Pinterest-style tiered sampling (visual similarity). Constructed empty at app startup and populated either from the persistent on-disk cache (`<app_data_dir>/cosine_cache.bin`) at indexing-pipeline start or via a single-SELECT `populate_from_db(&ImageDatabase)` after every encode pass.
 
 The module was previously a single `cosine_similarity.rs` of 860 lines. After the audit Modularisation finding it lives in `src-tauri/src/similarity_and_semantic_search/cosine/` with the original file kept as a 9-line `pub use cosine::*;` shim so every existing import path continues to resolve unchanged.
 
@@ -156,7 +156,7 @@ pub fn score_cmp_desc(a: &(usize, f32), b: &(usize, f32)) -> Ordering {
 ### Persistent disk cache (Phase 5)
 
 ```rust
-pub fn save_to_disk(&self)  // → Library/cosine_cache.bin
+pub fn save_to_disk(&self)  // → <app_data_dir>/cosine_cache.bin
 pub fn load_from_disk_if_fresh(&mut self, db_path: &Path)
 ```
 
@@ -184,7 +184,7 @@ pub struct CosineIndexState {
 | Source | Provides |
 |--------|----------|
 | `db.get_all_embeddings()` | (id, path, Vec<f32>) per non-null embedding |
-| `Library/cosine_cache.bin` (via bincode) | Cached `Vec<(PathBuf, Vec<f32>)>` from previous session |
+| `<app_data_dir>/cosine_cache.bin` (via bincode) | Cached `Vec<(PathBuf, Vec<f32>)>` from previous session |
 | `commands::similarity` and `commands::semantic` | `Array1<f32>` query embedding + top_n |
 | `indexing.rs::run_pipeline_inner` Phase 0 + final | populate_from_db + save_to_disk calls |
 | `commands::roots::*` | `cached_images.clear()` for cache invalidation |
@@ -194,14 +194,14 @@ pub struct CosineIndexState {
 | Destination | What |
 |-------------|------|
 | `commands::*` (similarity + semantic) | `Vec<(PathBuf, f32)>` — caller resolves paths to DB ids via `resolve_image_id_for_cosine_path` |
-| `Library/cosine_cache.bin` | Bincode-encoded vec |
+| `<app_data_dir>/cosine_cache.bin` | Bincode-encoded vec |
 | Tracing spans `cosine.*` | Per-method timings for the perf report |
 
 ### State
 
 - `cached_images: Vec<(PathBuf, Array1<f32>)>` — the index itself (~2 KB per 512-d embedding × N images = ~2 MB at 1000 images, ~20 MB at 10k)
 - `scratch: Vec<(usize, f32)>` — reusable per-query buffer (~12 bytes per cached image)
-- `Library/cosine_cache.bin` on disk — ~2 KB per embedding; loaded eagerly at indexing pipeline start
+- `<app_data_dir>/cosine_cache.bin` on disk — ~2 KB per embedding; loaded eagerly at indexing pipeline start
 
 ## Implemented Outputs / Artifacts
 

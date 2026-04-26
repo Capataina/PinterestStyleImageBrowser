@@ -220,7 +220,7 @@ All commands are sync (`fn` not `async fn`). Tauri's invoke handler runs them on
 | Mutex serialisation across all similarity calls | Concurrent invocations | Cosine `Mutex` is held during the whole sort + sample + result build. Two parallel UI actions queue. Today's UI does not generate parallel calls; a future "preload similar for hovered image" feature would. |
 | `assetProtocol.scope: ["**"]` (in `tauri.conf.json`) | A future scenario where untrusted HTML is loaded into the WebView | The current app only loads its own bundled HTML, so this is abstract. For anything more public, scope needs narrowing. See `enhancements/recommendations/08-tauri-csp-asset-scope-hardening.md`. |
 | Frontend → backend payload shape evolution | A backend command adds a parameter | Today's frontend services explicitly construct the invoke payload, so adding a parameter on the backend doesn't break old frontend code that omits it (Tauri uses serde defaults), but adding a *required* parameter does. |
-| Profiling commands are always registered, even without `--profile` | Frontend calling `record_user_action` on a non-profiling build | The command runs but `perf::record_user_action` short-circuits internally if profiling is off. No-op, no error. |
+| Profiling commands are always registered, even without `--profiling` | Frontend calling `record_user_action` on a non-profiling build | The command runs but `perf::record_user_action` short-circuits internally if profiling is off. No-op, no error. |
 
 ## Partial / In Progress
 
