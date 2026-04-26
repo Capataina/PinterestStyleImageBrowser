@@ -4,14 +4,18 @@ Project-level rationale, conventions, and durable lessons. One bullet per note f
 
 ## Active work areas
 
-The encoder pipeline was overhauled on 2026-04-26: CLIP image + text branches swapped to the separate-graph OpenAI English exports (HF tokenizers crate for BPE), DINOv2 upgraded Small (384-d) → Base (768-d) with corrected preprocessing, SigLIP-2 wired in with verified URL + correct exact-square 256×256 + Gemma SentencePiece tokenizer. A comprehensive diagnostic system landed alongside (12 named diagnostics covering startup state, embedding quality, search rankings, tokenization, preprocessing samples, encoder run summaries, cross-encoder comparisons, and cosine math sanity). The embedding-pipeline migration (DB version 2) invalidates legacy embeddings on first launch under the new code so next indexing pass re-encodes cleanly. Build + 105/105 lib tests pass; not yet committed.
+**2026-04-26 Tier 1 + Tier 2 + Phase 4 + Phase 5 + Phase 6 + Phase 7 perf bundle SHIPPED** (commits `f5706ed` → `1761e4e`). Together they break the 22 s `ipc.get_images` freeze chain and add multi-encoder rank fusion as the new primary similarity path. App-support data wiped post-commit so the next launch produces a clean baseline. See `plans/2026-04-26-autonomous-session-report.md` for the full session report.
+
+The encoder pipeline was overhauled on 2026-04-26: CLIP image + text branches swapped to the separate-graph OpenAI English exports (HF tokenizers crate for BPE), DINOv2 upgraded Small (384-d) → Base (768-d) with corrected preprocessing, SigLIP-2 wired in with verified URL + correct exact-square 256×256 + Gemma SentencePiece tokenizer. A comprehensive diagnostic system landed alongside. The embedding-pipeline migration (DB version 3 as of 2026-04-26 with R6+R7+R8) invalidates legacy embeddings on first launch under the new code. Build + 120/120 lib tests + 62/62 vitest pass; clippy clean.
 
 Likeliest near-term landings:
 
-- **Wire SigLIP-2 text encoder through the picker** — the encoder is fully implemented; what's missing is `commands::semantic::semantic_search` reading the user's `textEncoder` preference and dispatching accordingly. Today the picker accepts the choice but the runtime always uses CLIP. See `systems/siglip2-encoder.md` § Partial / In Progress.
-- **Smart per-query encoder routing** — open architectural concern in `notes/preprocessing-spatial-coverage.md`. Color/scenery queries belong in SigLIP-2 (no crop, full-image coverage); character/object queries belong in CLIP. Decision deferred.
-- **Pipeline parallelism (#74)** — overlap thumbnails + encoding via independent worker threads using the DB as a queue. Tracked in `plans/pipeline-parallelism-and-stats-ui.md`.
-- **Pipeline stats UI (#75)** — surface `db::get_pipeline_stats` (already implemented backend-side) in the Settings drawer or status pill. Same plan file.
+- **R5 FP16 ONNX weights** — DEFERRED in the perf bundle. Needs a 200-image golden test set with hand-labelled known-similar pairs to validate the FP16 vs FP32 recall@10 trade-off before shipping. Until then, FP32 stays the safe default.
+- **R10 foreground/background encoder split** — perf-plan Tier 3. Phase 5 RRF changes the calculus: with fusion, the user benefits more from all three encoders running than from one finishing fast. Still valid as a future feature but lower priority.
+- **R11 decode-once fan-out** — real perf win, bigger refactor. Worth a focused session.
+- **Smart per-query encoder routing** — open architectural concern in `notes/preprocessing-spatial-coverage.md`. Phase 5 RRF mostly obviates this for image-image (fusion automatically blends encoder strengths), but text-side dispatch is still single-encoder per query.
+- **Indexing.rs phase-module split** — code-health audit medium. Pure-movement extraction; schedule a hygiene-focused session.
+- **`[...slug].tsx` route extraction** — code-health audit medium. Same shape.
 - **Watcher rebuild on root mutations** — today's gap (`add_root` / `remove_root` after launch don't reconfigure the watcher until next restart). Documented in `systems/watcher.md`.
 - **Path normalisation at insert time** — would close the second half of `notes/path-and-state-coupling.md`.
 

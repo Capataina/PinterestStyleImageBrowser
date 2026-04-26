@@ -27,6 +27,12 @@ src-tauri/src/similarity_and_semantic_search/cosine/
 │                       + scratch buffer + select_nth_unstable_by partial sort
 │                       + diagnostic emissions (cosine_cache_populated, embedding_stats,
 │                         pairwise_distance_distribution, self_similarity_check)
+├── rrf.rs           — Phase 5: pure Reciprocal Rank Fusion (Cormack 2009, k=60).
+│                       reciprocal_rank_fusion(ranked_lists, k_rrf, top_n) -> Vec<FusedItem>.
+│                       Powers commands::similarity::get_fused_similar_images via the
+│                       per-encoder caches in lib.rs::FusionIndexState. 6 unit tests pin
+│                       the contract (consensus-beats-lone-winner, k sharpness, etc.).
+│                       Full canonical home: systems/multi-encoder-fusion.md.
 ├── diagnostics.rs   — 4 stateless helpers consumed by index.rs and commands::*:
 │                       embedding_stats, pairwise_distance_distribution,
 │                       self_similarity_check, score_distribution_stats
@@ -34,6 +40,8 @@ src-tauri/src/similarity_and_semantic_search/cosine/
                        + 5 cache disk-persistence tests; in a separate impl CosineIndex block
 
 src-tauri/src/similarity_and_semantic_search/
+├── ort_session.rs        — Phase 2d/R4: shared M2-tuned ort Session builder (Level3 + intra=4 +
+│                            inter=1). Every encoder constructor goes through this.
 └── cosine_similarity.rs  — 9-line shim: `pub use crate::similarity_and_semantic_search::cosine::*;`
 ```
 

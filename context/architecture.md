@@ -13,20 +13,24 @@ This document is the structural map. Subsystem-level reality lives in `systems/`
 | Cargo package | `image-browser` v0.1.0, edition 2021 | `src-tauri/Cargo.toml` |
 | Tauri identifier | `com.ataca.image-browser` | `src-tauri/tauri.conf.json` |
 | Frontend bundler | Vite 7 + `vite-plugin-pages` (file-based routing) | `vite.config.ts`, `package.json` |
-| Backend source | 26 Rust files in `src-tauri/src/` after the modularisation | filesystem |
+| Backend source | 28 Rust files in `src-tauri/src/` (added `ort_session.rs`, `cosine/rrf.rs`) | filesystem |
 | Frontend source | 33 TypeScript files in `src/` (incl. settings/ subcomponents) | filesystem |
-| Persistence | Single SQLite file `Library/images.db`, **WAL journal mode**, 5 tables | `src-tauri/src/db/mod.rs:47-145` |
-| ML runtime | `ort = 2.0.0-rc.10`. CPU on macOS for all three encoder families (CoreML produces runtime inference errors for these graphs); CUDA on non-macOS with CPU fallback. | `src-tauri/Cargo.toml`, encoder source files |
+| Persistence | Single SQLite file `Library/images.db`, **WAL journal mode**, **two connections per real DB** (writer + read-only secondary), 5 tables. | `src-tauri/src/db/mod.rs` |
+| SQLite PRAGMAs | `journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=5000`, `wal_autocheckpoint=0` (manual via `checkpoint_passive` between encoder batches), `journal_size_limit=64 MiB`, `foreign_keys=ON`. | `db/mod.rs::initialize` |
+| ML runtime | `ort = 2.0.0-rc.10` with shared M2-tuned `Session` builder (`Level3 + intra_threads(4) + inter_threads(1)`). CPU on macOS for all three encoder families (CoreML produces runtime inference errors for these graphs); CUDA on non-macOS with CPU fallback. | `Cargo.toml`, `similarity_and_semantic_search/ort_session.rs` |
 | Image encoders | **CLIP ViT-B/32** (OpenAI English, separate `vision_model.onnx`, 512-d), **DINOv2-Base** (Meta self-supervised, 768-d, image-only), **SigLIP-2 Base 256** (Google sigmoid loss, 768-d shared text+image space). Picker UI in Settings selects per direction. | `similarity_and_semantic_search/encoder*.rs` |
-| Text encoders | **CLIP ViT-B/32** (OpenAI English, separate `text_model.onnx`, 512-d, BPE 77 tokens, pre-warmed). **SigLIP-2** (Gemma SentencePiece 256k vocab, 64 tokens, NO attention_mask — wired but runtime dispatch through the picker is the remaining gap). | `encoder_text/encoder.rs`, `encoder_siglip2.rs`, `indexing.rs` |
-| Tokenizer | HuggingFace `tokenizers = "0.22.2"` crate handles BPE (CLIP) and SentencePiece (SigLIP-2) uniformly via `tokenizer.json`. The custom Rust WordPiece tokenizer that previously served the multilingual model is gone. | `Cargo.toml` |
-| Tauri commands | **23**, grouped by concern under `commands/` (images, tags, notes, roots, similarity, semantic, profiling, encoders) | `lib.rs::run` invoke_handler |
+| Text encoders | **CLIP ViT-B/32** (512-d, BPE 77 tokens, real-input pre-warm via `encode("warmup")`). **SigLIP-2** (Gemma SentencePiece 256k vocab, 64 tokens, NO attention_mask). **Both wired through `semantic_search`'s `text_encoder_id` parameter** — the picker actually dispatches now. | `encoder_text/encoder.rs`, `encoder_siglip2.rs`, `commands/semantic.rs` |
+| Tokenizer | HuggingFace `tokenizers = "0.22.2"` crate handles BPE (CLIP) and SentencePiece (SigLIP-2) uniformly via `tokenizer.json`. | `Cargo.toml` |
+| Multi-encoder fusion | **Reciprocal Rank Fusion** (Cormack 2009, k=60) across CLIP + SigLIP-2 + DINOv2 for image-image similarity. Per-encoder cosine caches resident in `FusionIndexState`. Replaces the previous tiered random-sampling diversity strategy. | `similarity_and_semantic_search/cosine/rrf.rs`, `commands/similarity.rs::get_fused_similar_images`, `lib.rs::FusionIndexState` |
+| Encoder write path | Encoder pipeline writes embeddings via `upsert_embeddings_batch` (one `BEGIN IMMEDIATE` per chunk of ~32 rows), with `checkpoint_passive` between batches. Replaces the previous per-row `upsert_embedding` autocommit pattern that triggered multi-second checkpoint stalls. | `db/embeddings.rs::upsert_embeddings_batch`, `indexing.rs::run_clip_encoder` + `run_trait_encoder` |
+| Thumbnail pipeline | JPEG sources go through `jpeg-decoder::Decoder::scale()` for native scaled IDCT (1/8, 1/4, 1/2 factor), then `fast_image_resize 6.x` (NEON-optimised Lanczos3) for the final downsample. Falls back to `image-rs` for non-JPEG and any decode error. | `thumbnail/generator.rs` |
+| Tauri commands | **26**, grouped by concern under `commands/` (images, tags, notes, roots, similarity, semantic, profiling, encoders) — added `get_fused_similar_images` for RRF dispatch. | `lib.rs::run` invoke_handler |
 | Typed errors | `ApiError` discriminated union; mirrored on the frontend in `services/apiError.ts`. | `commands/error.rs` |
-| Profiling + diagnostics | Opt-in via `--profile` CLI flag. PerfLayer (span timing) + `record_diagnostic` (12 named domain diagnostics). Off by default — zero overhead. | `main.rs`, `perf.rs`, `perf_report.rs`, `cosine/diagnostics.rs` |
+| Profiling + diagnostics | Opt-in via `--profile` CLI flag. PerfLayer (span timing) + `record_diagnostic` (12 named diagnostics + the new `system_sample` from the 1Hz RSS/CPU sampler). On-exit report includes Stall Analysis + Resource Trends sections. Off by default — zero overhead. | `main.rs`, `perf.rs`, `perf_report.rs`, `cosine/diagnostics.rs` |
 | User state | `<repo>/Library/` in dev (`debug_assertions`); platform app-data dir in release. | `src-tauri/src/paths.rs` |
 | Models on disk | `Library/models/{clip_vision.onnx, clip_text.onnx, clip_tokenizer.json, dinov2_base_image.onnx, siglip2_vision.onnx, siglip2_text.onnx, siglip2_tokenizer.json}` (~2.5 GB total — all FP32, no quantization). Per-encoder fail-soft download. | `src-tauri/src/model_download.rs` |
 | Filesystem watcher | `notify-debouncer-mini`, 5s debounce, recursive on every enabled root | `src-tauri/src/watcher.rs` |
-| Embedding-pipeline migration | `meta(key, value)` table tracks `embedding_pipeline_version`. Bumping the const wipes legacy embeddings on first launch under the new code. Currently version 2. | `db/schema_migrations.rs::migrate_embedding_pipeline_version` |
+| Embedding-pipeline migration | `meta(key, value)` table tracks `embedding_pipeline_version`. Bumping the const wipes legacy embeddings + per-encoder rows on first launch under the new code. **Currently version 3** (bumped 2026-04-26 with R6+R7+R8 — the resize backend swap + scaled JPEG decode change preprocessed RGB buffers, and R8 stops writing the legacy `images.embedding` column). | `db/schema_migrations.rs::migrate_embedding_pipeline_version` |
 
 ## Repository Structure
 
@@ -89,12 +93,13 @@ PinterestStyleImageBrowser/
 └── src-tauri/                  # Rust backend + Tauri shell
     ├── Cargo.toml              # ort, rusqlite, tauri (+plugin-dialog, +plugin-opener), image, ndarray, rand,
     │                           # rayon, notify, notify-debouncer-mini, ureq, tracing/tracing-subscriber,
-    │                           # bytemuck, dirs, serde
+    │                           # bytemuck, dirs, serde, fast_image_resize 6 (R6 thumbnail resize),
+    │                           # jpeg-decoder 0.3 (R7 scaled IDCT), sysinfo 0.32 (Phase 7 RSS/CPU sampler)
     ├── tauri.conf.json         # csp: null, assetProtocol scope ["**"]
     └── src/
         ├── main.rs             # `--profile` parsing, tracing subscriber + opt-in PerfLayer, DB open + initialize, hands to lib::run
-        ├── lib.rs              # State types (CosineIndexState, TextEncoderState), run(): tauri::Builder.manage(...).setup(legacy migrate +
-        │                       # spawn pipeline + start watcher).invoke_handler![22 commands].run() with on-Exit perf report hook
+        ├── lib.rs              # State types (CosineIndexState, TextEncoderState{clip+siglip2}, FusionIndexState), run(): tauri::Builder.manage(...)
+        │                       # .setup(legacy migrate + spawn pipeline + start watcher).invoke_handler![26 commands].run() with on-Exit perf report hook
         ├── commands/           # Tauri command handlers, grouped by concern (audit modularisation)
         │   ├── mod.rs          # Re-exports + ImageSearchResult unified struct + resolve_image_id_for_cosine_path helper
         │   ├── error.rs        # ApiError enum with `#[serde(tag="kind", content="details")]`; From-impls for rusqlite/io/poison
@@ -102,7 +107,7 @@ PinterestStyleImageBrowser/
         │   ├── tags.rs         # get_tags, create_tag, delete_tag, add_tag_to_image, remove_tag_from_image
         │   ├── notes.rs        # get_image_notes, set_image_notes
         │   ├── roots.rs        # get_scan_root, set_scan_root, list_roots, add_root, remove_root, set_root_enabled
-        │   ├── similarity.rs   # get_similar_images, get_tiered_similar_images
+        │   ├── similarity.rs   # get_similar_images, get_tiered_similar_images, get_fused_similar_images (Phase 5 RRF)
         │   ├── semantic.rs     # semantic_search
         │   └── profiling.rs    # is_profiling_enabled, get_perf_snapshot, reset_perf_stats, export_perf_snapshot, record_user_action
         ├── db/                 # SQLite layer (post-split — was 1.6k-line db.rs)
@@ -129,6 +134,9 @@ PinterestStyleImageBrowser/
         │   ├── encoder_siglip2.rs  # Siglip2ImageEncoder + Siglip2TextEncoder; 256×256 exact-square bilinear
         │   │                       # + [-1,1] for image; Gemma SP, 64 tokens, NO attention_mask for text;
         │   │                       # both branches use pooler_output (MAP head), 768-d shared space
+        │   ├── ort_session.rs # Phase 2d/R4: shared M2-tuned `Session` builder. Level3 + intra_threads(4) +
+        │   │                   # inter_threads(1). Every encoder constructor (CLIP image+text, DINOv2,
+        │   │                   # SigLIP-2 image+text) goes through this so a future tuning change lands once.
         │   ├── cosine_similarity.rs  # 9-line shim: `pub use crate::similarity_and_semantic_search::cosine::*;`
         │   ├── cosine/         # Post-split (was 860-line cosine_similarity.rs)
         │   │   ├── mod.rs      # Module decls + pub use index::CosineIndex
@@ -137,6 +145,8 @@ PinterestStyleImageBrowser/
         │   │   │               # + scratch buffer + select_nth_unstable_by partial sort (2.53× speedup)
         │   │   │               # + emits cosine_cache_populated, embedding_stats,
         │   │   │               #   pairwise_distance_distribution, self_similarity_check diagnostics
+        │   │   ├── rrf.rs      # Phase 5: Reciprocal Rank Fusion (Cormack 2009, k=60). Fuses N per-encoder
+        │   │   │               # ranked lists into one. Powers get_fused_similar_images. 6 unit tests.
         │   │   ├── diagnostics.rs  # 4 stateless helpers: embedding_stats, pairwise_distance_distribution,
         │   │   │                   # self_similarity_check, score_distribution_stats
         │   │   └── cache.rs    # Persistent cosine_cache.bin (bincode); load_from_disk_if_fresh checks DB mtime
@@ -185,7 +195,7 @@ PinterestStyleImageBrowser/
                   │             Rust Backend                    │  │
                   │                                             │  │
                   │  lib.rs::run — manage state + setup +       │  │
-                  │     invoke_handler![22 commands]            │  │
+                  │     invoke_handler![26 commands]            │  │
                   │     │                                       │  │
                   │     ├─► commands/  (per-concern)            │  │
                   │     │      └─► db/  (WAL+NORMAL SQLite)      │ │
@@ -232,8 +242,9 @@ PinterestStyleImageBrowser/
 | `clip-image-encoder` | OpenAI CLIP ViT-B/32 separate `vision_model.onnx`; bicubic-shortest-edge-224 + center-crop, CLIP-native mean/std, 512-d L2-normalised, batched | `src-tauri/src/similarity_and_semantic_search/encoder.rs` | `systems/clip-image-encoder.md` |
 | `clip-text-encoder` | OpenAI English CLIP separate `text_model.onnx`; HF `tokenizers` crate BPE (max 77 tokens, pad id 49407), 512-d L2-normalised, lazy + pre-warm init | `similarity_and_semantic_search/encoder_text/` | `systems/clip-text-encoder.md` |
 | `dinov2-encoder` | DINOv2-Base (Meta self-supervised); image-only; bicubic-shortest-edge-256 + center-crop-224, ImageNet mean/std, CLS-token from `last_hidden_state[:,0,:]`, 768-d L2-normalised | `src-tauri/src/similarity_and_semantic_search/encoder_dinov2.rs` | `systems/dinov2-encoder.md` |
-| `siglip2-encoder` | SigLIP-2 Base 256 (Google sigmoid loss); image+text in shared 768-d space; image: 256×256 exact-square bilinear + [-1,1]; text: Gemma SP 64 tokens NO attention_mask; both use `pooler_output` (MAP head). Text-branch picker dispatch is partially wired. | `src-tauri/src/similarity_and_semantic_search/encoder_siglip2.rs` | `systems/siglip2-encoder.md` |
+| `siglip2-encoder` | SigLIP-2 Base 256 (Google sigmoid loss); image+text in shared 768-d space; image: 256×256 exact-square bilinear + [-1,1]; text: Gemma SP 64 tokens NO attention_mask; both use `pooler_output` (MAP head). **Text-branch picker dispatch landed Phase 4, 2026-04-26**. | `src-tauri/src/similarity_and_semantic_search/encoder_siglip2.rs` | `systems/siglip2-encoder.md` |
 | `cosine-similarity` | In-memory similarity index, `select_nth_unstable_by` partial-sort (2.53× speedup), reusable scratch buffer, persistent disk cache | `similarity_and_semantic_search/cosine/` | `systems/cosine-similarity.md` |
+| `multi-encoder-fusion` | **NEW (Phase 5)** — Reciprocal Rank Fusion (Cormack 2009, k=60) across CLIP + SigLIP-2 + DINOv2 for image-image similarity. Per-encoder cosine caches in `FusionIndexState`. Replaces tiered random-sampling. | `similarity_and_semantic_search/cosine/rrf.rs`, `commands/similarity.rs::get_fused_similar_images`, `lib.rs::FusionIndexState` | `systems/multi-encoder-fusion.md` |
 | `masonry-layout` | Shortest-column packing, hero promotion, 3D tilt, sortMode-aware, dimensions sourced from backend (no DOM image-load round-trip) | `src/components/Masonry.tsx`, `MasonryItem.tsx`, `MasonryAnchor.tsx` | `systems/masonry-layout.md` |
 | `tag-system` | Tag CRUD + delete (now wired), optimistic mutations, AND/OR filter mode toggle, `#` autocomplete, create-on-no-match | `src/components/{SearchBar,TagDropdown}.tsx`, `useTags.ts`, `useImages.ts` | `systems/tag-system.md` |
 | `search-routing` | Frontend priority chain: similar > semantic > tag > all; debounced semantic; selectedItem now resolved against `displayImages` (audit fix) | `src/pages/[...slug].tsx` | `systems/search-routing.md` |
@@ -270,7 +281,7 @@ PinterestStyleImageBrowser/
                        │ tauri::Builder.manage(db, cosine_state,
                        │   text_encoder_state, indexing_state, watcher_state)
                        │ .setup(legacy migrate + spawn pipeline + start watcher)
-                       │ .invoke_handler![22 commands]
+                       │ .invoke_handler![26 commands]
                        │ .run(|_,e| if Exit && profiling { render_session_report })
                        ▼
                   Frontend (services → queries → components)
@@ -304,7 +315,7 @@ Key directional rules observed in code:
    5a. Legacy migration: settings.json::scan_root → roots row
    5b. indexing::try_spawn_pipeline(...)  ← background thread
    5c. watcher::start(every enabled root, recursive)
-}).invoke_handler![22 commands].build().run(|e| if Exit && profiling { render_session_report })
+}).invoke_handler![26 commands].build().run(|e| if Exit && profiling { render_session_report })
 
 Background pipeline (indexing.rs::run_pipeline_inner) runs while UI is interactive:
   i.    Try to load cosine_cache.bin                   indexing.rs:182-189; cosine/cache.rs
@@ -421,7 +432,7 @@ The chain crosses 4 process boundaries (UI → IPC → DB → ONNX) and 2 synchr
 
 ## Inter-System Relationships
 
-This table satisfies the inter-system relationship mapping obligation. With 17 system files the floor is `min(17, C(17,2)=136) = 17`.
+This table satisfies the inter-system relationship mapping obligation. With 19 system files the floor is `min(19, C(19,2)=171) = 19`. Entries 26-30 added 2026-04-26 by the Tier 1 + Tier 2 + Phase 4 + Phase 5 perf bundle (see `plans/perf-optimisation-plan.md`).
 
 | # | A | B | Mechanism | What breaks if it fails |
 |---|---|---|-----------|-------------------------|
@@ -453,8 +464,13 @@ This table satisfies the inter-system relationship mapping obligation. With 17 s
 | 23 | cosine-similarity diagnostics | profiling | The 4 stateless helpers in `cosine/diagnostics.rs` (`embedding_stats`, `pairwise_distance_distribution`, `self_similarity_check`, `score_distribution_stats`) compute domain-specific stats and return `serde_json::Value` payloads. They are called from `cosine/index.rs::populate_from_db_for_encoder` and from `commands::similarity` / `commands::semantic` to enrich the `search_query` diagnostic. | If a helper panics on a malformed cache (NaN-only embeddings, empty cache), the encoder's populate pass would still succeed but the diagnostic payload would be missing. Today the helpers handle empty cases with explicit early returns. |
 | 24 | embedding-pipeline migration | every encoder + cosine cache | `db/schema_migrations.rs::migrate_embedding_pipeline_version` runs once after the embeddings table is created. When `meta.embedding_pipeline_version < CURRENT_PIPELINE_VERSION`, wipes legacy CLIP + dinov2_small embeddings so the next indexing pass re-encodes under the new pipelines. SigLIP-2 rows aren't wiped (no prior data). | If the version constant is bumped without code-side preprocessing changes, embeddings are wiped and re-encoded with no quality change — wasteful but not broken. Bump must be paired with a real pipeline change. |
 | 25 | tauri-commands | encoders.rs | `list_available_encoders` Tauri command serves the static `ENCODERS: &[EncoderInfo]` list (3 entries: clip_vit_b_32, siglip2_base, dinov2_base) to the frontend EncoderSection picker. Each entry carries id, display_name, description, dim, supports_text, supports_image. | EncoderInfo struct is mirrored as a TS interface in `EncoderSection.tsx`. Adding a backend entry without updating the picker UI's option-rendering logic surfaces as the option being available but with empty rationale text. |
+| 26 | database (writer) | database (read-only secondary) | `ImageDatabase.connection: Mutex<Connection>` (writer) + `ImageDatabase.reader: OnceLock<Mutex<Connection>>` (read-only secondary, opened in `initialize()` on the same SQLite file with `SQLITE_OPEN_READ_ONLY`). Foreground SELECTs go through `read_lock()`; encoder writes use the writer. Both share the file's WAL — writes are serialised at the WAL layer, reads are non-blocking against active writes. | If the secondary fails to open (permission, missing file post-init), `read_lock` falls back to the writer mutex — restores the old contended-but-correct behaviour. `:memory:` test DBs deliberately have no secondary; writer covers reads in tests. |
+| 27 | indexing | database (encoder write batching) | Both encoder loops in `indexing.rs` (`run_clip_encoder`, `run_trait_encoder`) call `database.upsert_embeddings_batch(encoder_id, &rows, legacy_clip_too)` once per ~32-image chunk instead of per-row `upsert_embedding`. Each batch is one `BEGIN IMMEDIATE` transaction → one COMMIT → one fsync. `database.checkpoint_passive()` runs between batches under `wal_autocheckpoint=0`. | If the batch fails partway, the transaction rolls back — no embeddings from that batch land. The encoder loop records each row as a write failure rather than pretending some succeeded. Rare under normal operation; mostly defends against disk-full / WAL-corruption edges. |
+| 28 | cosine-similarity | FusionIndexState (Phase 5) | `FusionIndexState.per_encoder: Arc<Mutex<HashMap<String, CosineIndex>>>` holds one cosine cache per encoder family for image-image rank fusion. Lazy-populated on first `get_fused_similar_images` call per encoder; ~6 MB per encoder for 2000 images. `invalidate_all()` clears every slot — wired into `set_scan_root`, `remove_root`, `set_root_enabled` next to the existing `CosineIndexState.invalidate()` call. | If `invalidate_all` is forgotten on a future root-mutation IPC, fusion would return stale entries from the now-disabled root. The 3 existing call sites are paired so a code reviewer sees the pattern. |
+| 29 | search-routing | FusionIndexState + RRF | `useTieredSimilarImages` hook now routes through `fetchFusedSimilarImages` → `get_fused_similar_images` IPC → `FusionIndexState.ranked_for_encoder` × 3 encoders → `cosine::rrf::reciprocal_rank_fusion(lists, k=60, top_n)` → resolved `ImageSearchResult[]`. Replaces the previous tiered random-sampling path (which still exists at `cosine/index.rs::get_tiered_similar_images` for reference but is no longer called from the frontend). | If a user clicks "View Similar" before any encoder has indexed the clicked image, the per-encoder loop emits "no_embedding_for_query_image" diagnostic entries and fusion returns empty rather than crashing. |
+| 30 | search-routing | semantic.rs SigLIP-2 dispatch (Phase 4) | `useSemanticSearch` hook reads `prefs.textEncoder` and threads it through `semanticSearch(query, topN, textEncoderId)` → `semantic_search` IPC → branches on `text_encoder_id`: `Some("siglip2_base")` → `Siglip2TextEncoder` + SigLIP-2 cosine cache; otherwise CLIP. Both branches load the matching image-side cosine cache via `ensure_loaded_for` so dimensions match. | If the user picks SigLIP-2 in the picker before any SigLIP-2 image embeddings exist, semantic search returns 0 results (encoder produces a 768-d vector but the cache populate finds 0 rows) — the `cosine_cache_populated` diagnostic surfaces this as `count=0`. |
 
-25 entries documented; floor of 19 cleared. Obligation cleared.
+30 entries documented; floor of 19 cleared. Obligation cleared.
 
 ## Critical Paths and Blast Radius
 
@@ -530,7 +546,33 @@ For a future session asking "where do I learn about X?":
 
 This subsection enumerates what was inspected during this upkeep run, satisfying the knowledge-gap obligation.
 
-### Inspected in full this run (2026-04-26 evening)
+### 2026-04-26 autonomous perf-bundle session (Tier 1 + Tier 2 + Phase 4-7)
+
+Inspected in full this session (in addition to the prior 2026-04-26 evening pass):
+
+- `src-tauri/src/db/mod.rs` — added `reader: OnceLock<Mutex<Connection>>` + `read_lock()` helper + `checkpoint_passive()` + new PRAGMAs in `initialize`.
+- `src-tauri/src/db/embeddings.rs` — added `upsert_embeddings_batch` (R1); routed `get_all_embeddings`, `get_all_embeddings_for`, `count_embeddings_for` through the read-only secondary.
+- `src-tauri/src/db/images_query.rs` — routed `get_images_with_thumbnails`, `get_images`, `get_image_id_by_path`, `get_pipeline_stats` through the read-only secondary; added `AggregatedRow`/`AggregatedValue` type aliases (clippy fix).
+- `src-tauri/src/db/schema_migrations.rs` — bumped `CURRENT_PIPELINE_VERSION` 2 → 3.
+- `src-tauri/src/indexing.rs` — switched both encoder loops (`run_clip_encoder` + `run_trait_encoder`) to `upsert_embeddings_batch` + `checkpoint_passive` between batches; legacy_clip_too=false (R8).
+- `src-tauri/src/similarity_and_semantic_search/ort_session.rs` — NEW. Shared M2-tuned `Session` builder. Used by every encoder constructor.
+- `src-tauri/src/similarity_and_semantic_search/encoder.rs`, `encoder_dinov2.rs`, `encoder_siglip2.rs`, `encoder_text/encoder.rs` — all re-routed through `build_tuned_session`. Text encoder gained real-input pre-warm (`encode("warmup")`) inside `new`.
+- `src-tauri/src/similarity_and_semantic_search/cosine/rrf.rs` — NEW. RRF algorithm + 6 unit tests.
+- `src-tauri/src/similarity_and_semantic_search/cosine/mod.rs` — added `pub mod rrf`.
+- `src-tauri/src/lib.rs` — added `FusionIndexState`; extended `TextEncoderState` to two slots (CLIP + SigLIP-2); added crate-level `#![allow(clippy::doc_lazy_continuation)]`.
+- `src-tauri/src/commands/similarity.rs` — added `get_fused_similar_images` IPC.
+- `src-tauri/src/commands/semantic.rs` — full rewrite: `text_encoder_id` parameter dispatches CLIP vs SigLIP-2; helper `encode_with_clip` / `encode_with_siglip2`.
+- `src-tauri/src/commands/roots.rs` — wired `fusion_state.invalidate_all()` next to existing `cosine_state.invalidate()` in 3 places.
+- `src-tauri/src/perf.rs` — added `spawn_system_sampler_thread` (1Hz RSS/CPU via sysinfo).
+- `src-tauri/src/perf_report.rs` — added `section_stall_analysis` + `section_resource_trends` + `percentile_summary` helper.
+- `src-tauri/src/main.rs` — calls `spawn_system_sampler_thread` next to existing `spawn_flush_thread`; collapsed identical if-branches in env_filter (clippy).
+- `src-tauri/src/thumbnail/generator.rs` — full rewrite of `generate_thumbnail`: `decode_jpeg_scaled` (R7) + `resize_with_fir` (R6) helpers added.
+- `src-tauri/src/paths.rs` — `strip_windows_extended_prefix` switched to idiomatic `strip_prefix` (clippy).
+- `src-tauri/Cargo.toml` — added `fast_image_resize 6`, `jpeg-decoder 0.3` (explicit), `sysinfo 0.32`.
+- Frontend: `src/services/images.ts` (added `fetchFusedSimilarImages` + `textEncoderId` arg to `semanticSearch`), `src/queries/useSimilarImages.ts` (routed through fusion), `src/queries/useSemanticSearch.ts` (threads `prefs.textEncoder`), `src/components/settings/EncoderSection.tsx` (removed experimental warning), `src/services/services.test.ts` (3 new fusion tests + 1 textEncoderId test).
+- Tests: `src-tauri/tests/cosine_topk_partial_sort_diagnostic.rs`, `src-tauri/tests/similarity_integration_test.rs` (clippy fixes).
+
+### Inspected in full this run (2026-04-26 evening — earlier pass)
 
 - **Encoder rewrites this session**: `encoder.rs` (CLIP image — full rewrite to separate vision_model.onnx + canonical preprocessing + L2-normalize), `encoder_text/encoder.rs` (CLIP text — full rewrite to HF tokenizers + OpenAI English text_model + max 77 + pad 49407), `encoder_dinov2.rs` (full rewrite to DINOv2-Base + canonical resize-256 + center-crop-224 + ImageNet stats + CLS slice), `encoder_siglip2.rs` (full rewrite to onnx-community URL + 256×256 stretch + Gemma SP + pooler_output + no attention_mask).
 - **Diagnostic infrastructure**: `cosine/diagnostics.rs` (new — 4 stateless helpers), `cosine/index.rs` (added 4 diagnostic emissions), `lib.rs` (added cosine_math_sanity startup diagnostic), `commands/semantic.rs` (added tokenizer_output + query_embedding + score_distribution + path_resolution_outcomes diagnostics), `commands/similarity.rs` (added score_distribution + path_resolution + cross_encoder_comparison once-per-session).

@@ -45,20 +45,42 @@ Source: `thumbnail/generator.rs:97-106`. The `min(1.0)` clamp prevents upscaling
 
 The indexing pipeline instantiates with `max_width=400, max_height=400`. Aspect ratio is preserved. Most thumbnails end up around 400×N or N×400.
 
-### Generation
+### Generation (R6 + R7 — Tier 2 perf bundle, 2026-04-26)
+
+Two-stage decode + resize using JPEG-aware fast paths:
 
 ```rust
-let img = ImageReader::open(path)?.with_guessed_format()?.decode()?;
-let (orig_w, orig_h) = (img.width(), img.height());
-if thumbnail_path.exists() {                    // disk cache hit — no work
-    return Ok(ThumbnailResult { thumbnail_path, original_width, original_height });
-}
-let (w, h) = compute_thumbnail_dimensions(orig_w, orig_h, max_width, max_height);
-let thumb = img.thumbnail(w, h);                // image::thumbnail uses Lanczos3
-thumb.save_with_format(&thumbnail_path, ImageFormat::Jpeg)?;
+// 1. Decode. For JPEG sources, scaled IDCT (1/8, 1/4, 1/2, or 1) at decode
+//    time so we never IDCT pixels we'll throw away. Falls back to image-rs
+//    for non-JPEG or any decode failure.
+let (rgb, original_width, original_height) =
+    self.decode_jpeg_scaled(image_path)
+        .unwrap_or_else(|| /* image-rs full decode */);
+
+if thumbnail_path.exists() { return Ok(...); }     // disk cache hit — no work
+
+// 2. Resize. fast_image_resize 6.x with NEON-optimised Lanczos3.
+let (w, h) = self.calculate_thumbnail_size(original_width, original_height);
+let resized = self.resize_with_fir(&rgb, w, h)?;
+image::DynamicImage::ImageRgb8(resized)
+    .save_with_format(&thumbnail_path, ImageFormat::Jpeg)?;
 ```
 
 `thumbnail/generator.rs`. The disk-cache short-circuit (`if thumbnail_path.exists()`) makes the indexing pipeline's per-image work near-zero on re-runs against a populated thumbnails directory — only the DB update fires (and only for rows where `thumbnail_path` is still NULL or empty).
+
+#### R7 — JPEG scaled IDCT decode
+
+`decode_jpeg_scaled(path)` reads the JPEG header to get true dimensions, picks the largest scale factor in `{1, 2, 4, 8}` such that the scaled buffer is still ≥ the target thumbnail size on every axis, then calls `jpeg_decoder::Decoder::scale(target_w, target_h)` to do *native* scaled IDCT at decode time. For 6000×3376 → 400×400 thumbnails this saves ~95% of the IDCT work — the fast_image_resize step that follows only has a small downsample left to do.
+
+Falls back to `None` (and the caller switches to the generic image-rs path) for: non-JPEG sources, any header read error, CMYK or L16 JPEGs (rare; image-rs handles them more robustly).
+
+#### R6 — fast_image_resize Lanczos3
+
+`resize_with_fir(src, target_w, target_h)` builds a `FirImage::from_vec_u8` over the RGB8 source bytes (zero-copy), runs `Resizer` with `ResizeAlg::Convolution(Lanczos3)`, and returns an RGB8 image-rs buffer. Falls back to `image::imageops::resize` if fast_image_resize fails for any reason.
+
+Published Neoverse-N1 numbers show 7-13× speedup over `image::imageops::resize` at the same Lanczos3 quality (433 ms → 62 ms on 4928×3279 RGB8 Lanczos3). M2's NEON is wider so the actual speedup should be at least as good.
+
+**Pipeline-version interaction.** Both R6 and R7 subtly change the RGB buffer that's fed downstream into the encoders' preprocessing. Even with identical encoder weights, embeddings produced from the new buffer differ slightly from those produced by the previous code. Mixing pre- and post-fix embeddings would corrupt cosine similarity. The pipeline version bump 2 → 3 (`db/schema_migrations.rs::CURRENT_PIPELINE_VERSION`) wipes all prior embeddings on first launch under the new code so re-encoding produces a clean library.
 
 ### Parallel execution
 

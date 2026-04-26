@@ -4,7 +4,7 @@
 
 Two related but separable next-session tasks. Both extend the existing indexing pipeline and surface its progress more richly to the user.
 
-- **Status:** active
+- **Status:** RETROSPECTIVE — both tasks landed in earlier sessions (parallelism via the `run_clip_encoder` / `run_trait_encoder` per-encoder loop + Phase 5 RRF using all three concurrently; stats UI as the StatsSection in Settings, commit `8c55aa4`). Kept here as a record of what was originally scoped and how the implementation diverged. The actual canonical home for current pipeline reality is `systems/indexing.md`; for the stats UI, `systems/frontend-state.md` and `systems/database.md`'s `get_pipeline_stats` description.
 - **Date:** 2026-04-26 (created during upkeep-context Restructure pass)
 - **Trigger:** user-flagged as the next two pieces of work in `Quick Notes.md`. Captured in this plan so they have a structured home before they're touched in code.
 

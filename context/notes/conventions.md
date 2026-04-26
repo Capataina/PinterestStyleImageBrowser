@@ -261,3 +261,48 @@ fs::rename(&tmp, &path)?;
 Used by `Settings::save`. Survives a crash mid-write — the original file is unchanged until the rename completes. No explicit fsync; sufficient for non-critical state on every modern filesystem the app realistically runs on.
 
 For very-critical state (cosine cache, models) the same pattern applies but isn't currently implemented (the cache uses a single-shot bincode write; a model download writes to `.part` then renames). Worth adding to the cosine cache path in the future.
+
+## R-tag perf annotation pattern (introduced 2026-04-26)
+
+Every line touched by the Tier 1 + Tier 2 perf bundle carries an `R<n>` prefix in its inline comment, where `<n>` is the recommendation number from `plans/perf-optimisation-plan.md`:
+
+```rust
+// R3 — busy_timeout caps how long a momentary lock contention waits
+// before returning SQLITE_BUSY. 5 s is generous enough that any
+// real-world contention resolves transparently.
+conn.pragma_update(None, "busy_timeout", 5000)?;
+```
+
+There are 43 such annotations across the perf-bundle commit set (grep `// R[0-9]`). The pattern serves three purposes:
+
+1. **Forward traceability** — a reader scanning a file can grep `R<n>` and immediately find every line that landed for that recommendation, then follow the trail to the plan file's reasoning.
+2. **Reverse traceability** — when the next perf report comes back and (say) `ipc.get_images` is still slow, you can grep `R2` to see exactly what the read-only secondary connection touched.
+3. **Review aid** — commit reviewers can correlate diff hunks against the plan's Tier 1/2 ranking without having to mentally cross-reference.
+
+Apply the same pattern to future numbered recommendation bundles. Don't introduce R-tags for ad-hoc fixes — the plan-traceability is what makes them worth their visual cost.
+
+## BEGIN IMMEDIATE for batched writes
+
+When the encoder pipeline (or any future bulk-insert path) writes many rows in a row, wrap the batch in `BEGIN IMMEDIATE` rather than relying on per-row autocommit:
+
+```rust
+let mut conn = self.connection.lock().unwrap();
+let tx = conn.transaction_with_behavior(
+    rusqlite::TransactionBehavior::Immediate,
+)?;
+{
+    let mut stmt = tx.prepare("INSERT OR REPLACE INTO ...")?;
+    for row in rows { stmt.execute(...)?; }
+}
+tx.commit()?;
+```
+
+`IMMEDIATE` rather than the default `DEFERRED`: `DEFERRED` upgrades to a write lock on the first INSERT, racing with any concurrent reader; `IMMEDIATE` takes the write lock up-front. The canonical example is `db/embeddings.rs::upsert_embeddings_batch`. Per-row autocommit produces N implicit transactions + N fsyncs; the batched form produces one of each, which is 10-100× faster for bulk inserts and eliminates the per-row mutex-and-checkpoint churn that produced the perf-1777212369 22 s freezes.
+
+## Read-only secondary `read_lock()` for foreground SELECTs
+
+`ImageDatabase` has two connections per real on-disk DB: the writer (`self.connection.lock()`) and the read-only secondary (`self.read_lock()`). Foreground IPC SELECTs route through `read_lock()` so they don't queue behind in-flight encoder write batches. Foreground writes (tag mutations, root toggles) keep using the writer mutex.
+
+When adding a new IPC SELECT, default to `read_lock()`. Use the writer only when the call genuinely writes. The two connections share the SQLite WAL, so reads are consistent without taking SQLite-level locks against the writer.
+
+For tests using `:memory:`, `read_lock()` falls back to the writer connection (`:memory:` is per-connection storage; a second connection sees a separate empty DB). No special test plumbing required.

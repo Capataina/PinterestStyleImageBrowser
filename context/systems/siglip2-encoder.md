@@ -169,12 +169,12 @@ The runtime currently dispatches all text-to-image queries through `ClipTextEnco
 
 ## Partial / In Progress
 
-- **Text-branch picker dispatch.** Encoder is fully implemented; runtime wiring in `commands::semantic::semantic_search` to choose between CLIP and SigLIP-2 text encoders based on `userPreferences.textEncoder` is not yet done. This is a small change (read pref → construct the right encoder via the trait) but requires adding a multi-encoder text-encoder state slot to replace the current `Mutex<Option<ClipTextEncoder>>`.
+- (none — text-branch picker dispatch landed in Phase 4 on 2026-04-26; see `commands::semantic::semantic_search`'s `text_encoder_id` parameter and `TextEncoderState`'s two-slot shape (`encoder` for CLIP + `siglip2_encoder` for SigLIP-2). The frontend `useSemanticSearch` hook now reads `prefs.textEncoder` and threads it through.)
 
 ## Planned / Missing / Likely Changes
 
-- **Wire text-encoder dispatch through the picker.** Replace `TextEncoderState.encoder: Mutex<Option<ClipTextEncoder>>` with a per-encoder map or a `Mutex<Option<Box<dyn TextEncoder>>>` so `semantic_search` can construct the right encoder.
 - **SigLIP-2 Large 384** as a quality-bump option. ~3× the size, materially better embeddings.
+- **Text-image RRF fusion.** Encoding the same query through both CLIP and SigLIP-2 text encoders and fusing the results via RRF (the same Phase 5 algorithm used for image-image). Would need a new `get_fused_semantic_search` command. Low priority — the picker's instant-switch already lets users compare encoders manually.
 - **Smart per-query encoder routing** — see the open concern in `notes/preprocessing-spatial-coverage.md`. SigLIP-2 is the natural target for color/scenery queries (no crop) and cross-lingual queries (256k Gemma vocab).
 
 ## Durable Notes / Discarded Approaches

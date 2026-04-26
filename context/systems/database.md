@@ -87,6 +87,9 @@ Source: `db/mod.rs:90-143`. The `roots` table is created first because `images.r
 ```rust
 conn.pragma_update(None, "journal_mode", "WAL")?;
 conn.pragma_update(None, "synchronous", "NORMAL")?;
+conn.pragma_update(None, "busy_timeout", 5000)?;            // R3 — Tier 1 perf
+conn.pragma_update(None, "wal_autocheckpoint", 0)?;         // R3 — manual via checkpoint_passive
+conn.pragma_update(None, "journal_size_limit", 67_108_864)?; // R3 — 64 MiB cap
 conn.execute("PRAGMA foreign_keys = ON;", [])?;
 ```
 
@@ -94,9 +97,60 @@ conn.execute("PRAGMA foreign_keys = ON;", [])?;
 |--------|-----|
 | `journal_mode = WAL` | The indexing pipeline opens its own `ImageDatabase` instance (a second SQLite connection to the same file). In default DELETE journal mode, the writer holds an exclusive lock for the duration of every write transaction, blocking all readers. WAL lets readers and the single writer coexist. SQLite's official recommendation for any multi-connection workload. |
 | `synchronous = NORMAL` | Default `FULL` fsyncs after every commit — appropriate where torn writes corrupt structure, but unnecessary for this app where every commit is recoverable on next launch (tag mutations user can re-do, thumbnails / embeddings can be regenerated). NORMAL is SQLite's explicitly-recommended pairing with WAL when "lose at most the last commit on power loss" is acceptable. |
+| `busy_timeout = 5000` (R3) | Default of 0 surfaces momentary lock contention (e.g. encoder batch commit while foreground IPC arrives) as `SQLITE_BUSY`. 5 s is generous enough that any real-world contention resolves transparently rather than reaching the user as an error. |
+| `wal_autocheckpoint = 0` (R3) | SQLite's automatic checkpointer fires every 1000 dirty pages by default — and that cadence interleaves with encoder batch commits in a way that produces multi-second stalls (the trigger for the perf-1777212369 22 s freeze). We disable auto and call `checkpoint_passive()` ourselves between encoder batches so checkpoints land at known quiet points. |
+| `journal_size_limit = 64 MiB` (R3) | Cap WAL file growth so it can't explode under bursty writes. The cap forces a truncate at the next quiet checkpoint, keeping disk usage bounded and reducing fsync cost at COMMIT. |
 | `foreign_keys = ON` | SQLite defaults this OFF for backwards compatibility. Without it, `ON DELETE CASCADE` on `images.root_id → roots.id` is a no-op. The pragma is what made `remove_root` actually wipe the root's images. |
 
-All three pragmas are set in `initialize` after every connection open. WAL also persists across reopens (it's a property of the DB file). `pragma_update` is the rusqlite path that returns Result so we surface migration-time failures rather than ignoring them.
+All pragmas are set in `initialize` after every connection open. WAL also persists across reopens (it's a property of the DB file). `pragma_update` is the rusqlite path that returns Result so we surface migration-time failures rather than ignoring them.
+
+### R2 — read-only secondary connection
+
+`ImageDatabase` holds two connections per real on-disk database:
+
+| Field | Type | Use |
+|-------|------|-----|
+| `connection` | `Mutex<rusqlite::Connection>` | The writer. Every INSERT/UPDATE/DELETE goes through this mutex. Encoder pipeline holds it for the duration of each batch transaction; foreground IPC writes (tag mutations, root toggles) take it briefly. |
+| `reader` | `OnceLock<Mutex<rusqlite::Connection>>` | A separate `SQLITE_OPEN_READ_ONLY` connection on the same file, opened lazily by `initialize()` after WAL mode is set. Used by foreground IPC SELECTs via `read_lock()`. `OnceLock` so `initialize` can populate through `&self`. |
+
+For `:memory:` databases (tests), `reader` stays empty — `:memory:` is per-connection storage so a second connection sees a separate empty DB. `read_lock()` falls back to the writer in that case; tests don't have foreground/background contention to worry about anyway.
+
+**Routing.** Foreground SELECTs go through `self.read_lock()`:
+- `get_images_with_thumbnails` (the IPC freeze case)
+- `get_images`, `get_image_id_by_path`, `get_pipeline_stats`
+- `get_all_embeddings`, `get_all_embeddings_for`, `count_embeddings_for` (cosine cache populate, foreground)
+
+The encoder writer keeps using `self.connection.lock()` directly. So a foreground `get_images` call no longer queues behind an in-flight encoder write batch — the two contend only at the SQLite WAL layer (which is non-blocking against active reads).
+
+### R1 — encoder write batching via `upsert_embeddings_batch`
+
+The encoder loops in `indexing.rs` write a chunk of (image_id, embedding) rows under one `BEGIN IMMEDIATE` transaction:
+
+```rust
+pub fn upsert_embeddings_batch(
+    &self,
+    encoder_id: &str,
+    rows: &[(ID, Vec<f32>)],
+    legacy_clip_too: bool,
+) -> rusqlite::Result<()>
+```
+
+`BEGIN IMMEDIATE` rather than the default `DEFERRED` — `DEFERRED` upgrades to a write lock on the first INSERT, racing with any concurrent read; `IMMEDIATE` takes the write lock up-front. `legacy_clip_too` is now always `false` from both encoder loops as of R8 (the legacy `images.embedding` double-write was dropped).
+
+Per the [PDQ benchmark](https://www.pdq.com/blog/improving-bulk-insert-speed-in-sqlite-a-comparison-of-transactions/), bulk inserts are 10-100× faster under one transaction than per-row autocommit. Combined with R2, the writer can run flat-out without affecting UI responsiveness.
+
+### R3 — `checkpoint_passive` between encoder batches
+
+```rust
+pub fn checkpoint_passive(&self) -> rusqlite::Result<()> {
+    if self.reader.get().is_none() { return Ok(()); }   // :memory: — no WAL file
+    self.connection.lock().unwrap()
+        .pragma_update(None, "wal_checkpoint", "PASSIVE")?;
+    Ok(())
+}
+```
+
+Called from both encoder loops between batches. PASSIVE mode does not block readers or writers — it processes whatever pages are clean and returns. Drives the WAL drain manually under `wal_autocheckpoint=0` so checkpoints land at predictable quiet points instead of mid-batch.
 
 ### Idempotent migrations
 
@@ -116,11 +170,13 @@ self.migrate_embedding_pipeline_version()?;
 
 Each schema delta probes `PRAGMA table_info(images)` and runs `ALTER TABLE images ADD COLUMN ...` only if the column is missing. Idempotent — re-running on an up-to-date schema is a no-op.
 
-The **embedding-pipeline version migration** is a different beast — it uses a separate `meta(key, value)` key-value table to record `embedding_pipeline_version`. When the stored version is less than `CURRENT_PIPELINE_VERSION` (currently `2`), it deletes embeddings that were produced by the previous pipeline so the next indexing pass re-encodes everything cleanly. Currently version 2 wipes:
+The **embedding-pipeline version migration** is a different beast — it uses a separate `meta(key, value)` key-value table to record `embedding_pipeline_version`. When the stored version is less than `CURRENT_PIPELINE_VERSION` (currently `3` as of 2026-04-26), it deletes embeddings that were produced by the previous pipeline so the next indexing pass re-encodes everything cleanly. The version 3 bump wipes:
 
-- `images.embedding` (legacy CLIP column — invalidated by the move from combined-graph multilingual to separate vision_model + OpenAI English text)
-- `embeddings WHERE encoder_id = 'clip_vit_b_32'` (same reason)
-- `embeddings WHERE encoder_id = 'dinov2_small'` (invalidated by the dim change 384 → 768 + the resize-geometry fix)
+- `images.embedding` (legacy CLIP column — invalidated by the move from combined-graph multilingual to separate vision_model + OpenAI English text; R8 stops writing it on first encode under v3)
+- `embeddings WHERE encoder_id = 'clip_vit_b_32'` (R6 + R7 changed the preprocessed RGB buffer fed into the encoder — fast_image_resize Lanczos3 + JPEG scaled IDCT produce subtly different bytes than the old image-rs CatmullRom + full IDCT path)
+- `embeddings WHERE encoder_id = 'dinov2_small'` (legacy id from before the upgrade to dinov2_base; orphaned)
+- `embeddings WHERE encoder_id = 'siglip2_base'` (same R6 + R7 reason — preprocessing buffer change invalidates SigLIP-2 embeddings too)
+- `embeddings WHERE encoder_id = 'dinov2_base'` (same R6 + R7 reason)
 
 `SigLIP-2` rows are not wiped because the SigLIP path wasn't producing embeddings before this version — there's nothing to invalidate.
 

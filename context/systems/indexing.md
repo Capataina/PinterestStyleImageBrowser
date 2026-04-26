@@ -68,9 +68,10 @@ Phase::Encode (runs each available encoder family in sequence)
        ──► db.get_images_without_embeddings() → Vec<ImageData>
        ──► For every chunk of 32:
                encoder.encode_batch(&[Path]) → Vec<Vec<f32>>
-               for each (image, embedding):
-                  db.update_image_embedding(image.id, embedding)        ← legacy column
-                  db.upsert_embedding(image.id, "clip_vit_b_32", embedding)  ← per-encoder table
+               db.upsert_embeddings_batch("clip_vit_b_32", &batch_rows, false)
+                       ↑ R1 — single BEGIN IMMEDIATE transaction per chunk.
+                         legacy_clip_too=false (R8 dropped the legacy column write).
+               db.checkpoint_passive()  ← R3 — drain WAL between batches
                emit Phase::Encode(processed, total) labelled "Encoding (CLIP)"
        ──► On first batch: emit "preprocessing_sample" diagnostic
        ──► At end of pass: emit "encoder_run_summary" diagnostic
@@ -79,11 +80,16 @@ Phase::Encode (runs each available encoder family in sequence)
 
     2. SigLIP-2 image branch via run_trait_encoder("siglip2_base", ...)  (if siglip2_vision.onnx exists)
        ──► db.get_images_without_embedding_for("siglip2_base")
-       ──► same chunk loop + same diagnostics as CLIP
+       ──► same chunk loop, same R1 batch transaction + R3 checkpoint between batches
 
     3. DINOv2-Base via run_trait_encoder("dinov2_base", ...)  (if dinov2_base_image.onnx exists)
        ──► db.get_images_without_embedding_for("dinov2_base")
-       ──► same chunk loop + same diagnostics
+       ──► same chunk loop, same R1 batch transaction + R3 checkpoint between batches
+
+    The encoder ORDER inside Phase::Encode honours the user's `priority_image_encoder`
+    setting. If the user picked DINOv2 in the picker, DINOv2 runs FIRST so its embeddings
+    land in the DB ASAP; the cosine cache hot-populates for that encoder as soon as its
+    pass finishes (rather than waiting for all three encoders).
 
     Each encoder family is independently fail-soft — a missing model file or a session-creation error
     skips that encoder's pass with `warn` and continues to the next family. The encoder_run_summary
