@@ -38,6 +38,7 @@ pub mod indexing;
 pub mod model_download;
 pub mod paths;
 pub mod perf;
+pub mod perf_report;
 pub mod root_struct;
 pub mod settings;
 pub mod similarity_and_semantic_search;
@@ -983,6 +984,41 @@ pub fn run(db: ImageDatabase, db_path: String) {
             export_perf_snapshot,
             record_user_action,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app, event| {
+            // RunEvent::Exit fires when the last window closes and the
+            // app is genuinely shutting down. This is our last chance
+            // to render the markdown report from the timeline.jsonl
+            // that's been accumulating during the session.
+            //
+            // We deliberately don't render on ExitRequested — that
+            // fires before windows are torn down and could be cancelled.
+            // Exit is the point of no return, and the flush thread is
+            // about to die with the process anyway.
+            //
+            // No-op when profiling isn't enabled (no session dir, no
+            // timeline file, nothing to report).
+            if let tauri::RunEvent::Exit = event {
+                if perf::is_profiling_enabled() {
+                    if let Some(dir) = perf::session_dir() {
+                        match perf_report::render_session_report(&dir) {
+                            Ok(_) => {
+                                // Use eprintln rather than tracing here
+                                // — the subscriber may already be tearing
+                                // down at exit, and we want this line to
+                                // make it to the terminal regardless.
+                                eprintln!(
+                                    "profiling report written to {}",
+                                    dir.display()
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("failed to write profiling report: {e}");
+                            }
+                        }
+                    }
+                }
+            }
+        });
 }
