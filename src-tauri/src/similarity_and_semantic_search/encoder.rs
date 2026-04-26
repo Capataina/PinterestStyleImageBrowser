@@ -169,7 +169,7 @@ impl ClipImageEncoder {
         // used ImageNet stats which subtly shift the embedding
         // distribution away from what the OpenAI reference produces.
         let mean = [0.48145466_f32, 0.4578275, 0.40821073];
-        let std = [0.26862954_f32, 0.26130258, 0.27577711];
+        let std = [0.26862954_f32, 0.261_302_6, 0.275_777_1];
 
         let plane = (CROP * CROP) as usize;
         for c in 0..3 {

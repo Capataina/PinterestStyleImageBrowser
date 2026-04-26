@@ -11,6 +11,6 @@ pub struct Tag {
 
 impl Tag {
     pub fn new(id: ID, name: String, color: String) -> Self {
-        return Self { id, name, color };
+        Self { id, name, color }
     }
 }

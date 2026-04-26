@@ -17,7 +17,7 @@ impl ImageDatabase {
             "INSERT INTO tags (name, color) VALUES (?1, ?2)",
             [name.clone(), color.clone()],
         )?;
-        return Ok(Tag::new(conn.last_insert_rowid(), name, color));
+        Ok(Tag::new(conn.last_insert_rowid(), name, color))
     }
 
     pub fn delete_tag(&self, tag_id: ID) -> rusqlite::Result<()> {
@@ -54,8 +54,8 @@ impl ImageDatabase {
 
         let rows = stmt.query([])?;
 
-        return rows
+        rows
             .map(|r| Ok(Tag::new(r.get("id")?, r.get("name")?, r.get("color")?)))
-            .collect();
+            .collect()
     }
 }

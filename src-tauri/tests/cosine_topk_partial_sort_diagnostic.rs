@@ -1,3 +1,4 @@
+#![allow(clippy::doc_lazy_continuation)]
 //! Diagnostic test for the code-health audit (2026-04-25).
 //!
 //! Demonstrates the equivalence + speed gap between the current full-sort

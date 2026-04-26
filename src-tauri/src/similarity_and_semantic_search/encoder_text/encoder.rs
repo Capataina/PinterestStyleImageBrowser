@@ -188,7 +188,7 @@ impl ClipTextEncoder {
             ids.truncate(self.max_seq_length);
         } else {
             let pad_count = self.max_seq_length - ids.len();
-            ids.extend(std::iter::repeat(self.pad_token_id).take(pad_count));
+            ids.extend(std::iter::repeat_n(self.pad_token_id, pad_count));
         }
         Ok(ids)
     }
@@ -273,7 +273,9 @@ impl ClipTextEncoder {
             for i in 0..batch_size {
                 let start = i * 512;
                 let end = start + 512;
-                embeddings.push(normalize(&data[start..end].to_vec()));
+                // 6a — `normalize` already accepts `&[f32]`, no need
+                // to clone the slice into a Vec just to borrow it back.
+                embeddings.push(normalize(&data[start..end]));
             }
             return Ok(embeddings);
         }

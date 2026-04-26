@@ -341,7 +341,7 @@ pub fn get_tiered_similar_images(
     // a fast DB→memory transfer of the new encoder's embeddings.
     cosine_state
         .ensure_loaded_for(&db, &encoder_id)
-        .map_err(|e| ApiError::Cosine(e))?;
+        .map_err(ApiError::Cosine)?;
 
     let mut index = cosine_state.index.lock()?;
 
@@ -491,7 +491,7 @@ pub fn get_similar_images(
 
     cosine_state
         .ensure_loaded_for(&db, &encoder_id)
-        .map_err(|e| ApiError::Cosine(e))?;
+        .map_err(ApiError::Cosine)?;
 
     let mut index = cosine_state.index.lock()?;
 

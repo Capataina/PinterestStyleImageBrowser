@@ -70,11 +70,17 @@ pub struct EncoderEmbeddingCount {
 /// from the returned tuples; callers that don't include the columns in
 /// their SELECT must alias `NULL AS thumbnail_path`, etc., so the
 /// helper's `row.get("thumbnail_path")` resolves to `None`.
+/// 6b — clippy::type_complexity. Aggregate row tuple shape is shared
+/// across the four LEFT-JOIN-aggregate callers. A type alias makes the
+/// shape grep-able and clippy-clean without forcing a struct (which
+/// would require updating every destructure site).
+type AggregatedRow = (ID, String, Vec<Tag>, Option<String>, Option<i64>, Option<i64>);
+type AggregatedValue = (String, Vec<Tag>, Option<String>, Option<i64>, Option<i64>);
+
 fn aggregate_image_rows(
     rows: &mut rusqlite::Rows<'_>,
-) -> rusqlite::Result<Vec<(ID, String, Vec<Tag>, Option<String>, Option<i64>, Option<i64>)>> {
-    let mut map: HashMap<ID, (String, Vec<Tag>, Option<String>, Option<i64>, Option<i64>)> =
-        HashMap::new();
+) -> rusqlite::Result<Vec<AggregatedRow>> {
+    let mut map: HashMap<ID, AggregatedValue> = HashMap::new();
     while let Some(row) = rows.next()? {
         let img_id: ID = row.get("img_id")?;
         let img_path: String = row.get("img_path")?;

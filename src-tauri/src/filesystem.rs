@@ -13,6 +13,12 @@ fn is_supported_image(path: &Path) -> bool {
 
 pub struct ImageScanner {}
 
+impl Default for ImageScanner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ImageScanner {
     pub fn new() -> Self {
         ImageScanner {}
@@ -31,11 +37,10 @@ impl ImageScanner {
             if file_type.is_dir() {
                 let mut nested = self.scan_directory(&path)?;
                 img_paths.append(&mut nested);
-            } else if file_type.is_file() {
-                if is_supported_image(&path) {
+            } else if file_type.is_file()
+                && is_supported_image(&path) {
                     img_paths.push(path.to_string_lossy().to_string());
                 }
-            }
         }
 
         Ok(img_paths)

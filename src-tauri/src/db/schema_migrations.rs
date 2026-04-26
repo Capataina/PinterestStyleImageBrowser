@@ -120,10 +120,8 @@ impl ImageDatabase {
             .ok()
             .and_then(|s| s.parse::<i64>().ok());
 
-        let needs_migration = match stored {
-            Some(v) if v >= CURRENT_PIPELINE_VERSION => false,
-            _ => true,
-        };
+        let needs_migration =
+            !matches!(stored, Some(v) if v >= CURRENT_PIPELINE_VERSION);
 
         if !needs_migration {
             return Ok(());

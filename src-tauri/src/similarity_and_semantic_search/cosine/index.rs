@@ -20,6 +20,12 @@ pub struct CosineIndex {
     pub(super) scratch: Vec<(usize, f32)>,
 }
 
+impl Default for CosineIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CosineIndex {
     pub fn new() -> Self {
         CosineIndex {
@@ -562,8 +568,10 @@ mod tests {
         for i in 0..100 {
             let mut vec = vec![0.0; 512];
             // Make some components match the query for varying similarity
-            for j in 0..(i % 512) {
-                vec[j] = 1.0;
+            // 6b — clippy::needless_range_loop. iter_mut().take() is
+            // the idiomatic form when the index isn't needed in the body.
+            for slot in vec.iter_mut().take(i % 512) {
+                *slot = 1.0;
             }
             let embedding = Array1::from_vec(vec);
             index.add_image(PathBuf::from(format!("/images/img_{}.jpg", i)), embedding);

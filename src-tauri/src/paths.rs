@@ -45,10 +45,11 @@ use std::path::PathBuf;
 /// the single place to fix Windows path handling if the schema ever
 /// changes (e.g., normalising at insert time).
 pub fn strip_windows_extended_prefix(path_str: &str) -> Cow<'_, str> {
-    if path_str.starts_with("\\\\?\\") {
-        Cow::Owned(path_str[4..].to_string())
-    } else {
-        Cow::Borrowed(path_str)
+    // 6b — clippy::manual_strip. strip_prefix returns the suffix
+    // directly when the prefix matches.
+    match path_str.strip_prefix("\\\\?\\") {
+        Some(stripped) => Cow::Owned(stripped.to_string()),
+        None => Cow::Borrowed(path_str),
     }
 }
 

@@ -331,7 +331,7 @@ pub fn flush_to_file(path: &std::path::Path) -> io::Result<()> {
     // Drain under the lock so we don't hold it during disk I/O.
     let drained: Vec<RawEvent> = {
         let mut buf = raw_events_buf().lock().map_err(|_| {
-            io::Error::new(io::ErrorKind::Other, "perf buffer mutex poisoned")
+            io::Error::other("perf buffer mutex poisoned")
         })?;
         std::mem::take(&mut *buf)
     };
@@ -348,7 +348,7 @@ pub fn flush_to_file(path: &std::path::Path) -> io::Result<()> {
         // non-serialisable types — RawEvent is constructed from owned
         // Strings + serde_json::Value, both always serialisable.
         let line = serde_json::to_string(&event)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
         writeln!(file, "{line}")?;
     }
     Ok(())

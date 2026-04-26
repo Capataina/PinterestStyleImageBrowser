@@ -39,16 +39,14 @@ fn main() {
     // We deliberately don't `.expect()` the init — if a subscriber is
     // already installed (e.g. during cargo test), we'd rather log
     // through the existing one than crash the binary.
+    // 6b — both branches were identical (the original intention was a
+    // higher verbosity in profiling mode, but the strings drifted to be
+    // the same). Collapsed to one filter that we use regardless. The
+    // PerfLayer registers separately below; the env filter just controls
+    // what the human-readable terminal output shows.
+    let _ = profiling; // currently unused; kept above for future use
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        // In profiling mode we want every instrumented span to fire so the
-        // report has full coverage. In normal mode we keep the default tame
-        // filter — info from us, warn from everything else — so the
-        // terminal stays readable.
-        if profiling {
-            EnvFilter::new("warn,image_browser_lib=info,image_browser=info")
-        } else {
-            EnvFilter::new("warn,image_browser_lib=info,image_browser=info")
-        }
+        EnvFilter::new("warn,image_browser_lib=info,image_browser=info")
     });
 
     let registry = tracing_subscriber::registry()

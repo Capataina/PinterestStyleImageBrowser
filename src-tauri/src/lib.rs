@@ -1,3 +1,13 @@
+// 6b — relax `clippy::doc_lazy_continuation`. The lint flags
+// rustdoc-style bullet lists where a continuation line is not
+// indented under its bullet — a stylistic preference that doesn't
+// match this codebase's docstring conventions (we use //! and ///
+// blocks heavily with consistent left-aligned continuations on
+// purpose, for terminal readability with `cargo doc --open` AND
+// when the file is read directly). Re-enabling per-line would
+// require touching ~10 files with no behavioural value.
+#![allow(clippy::doc_lazy_continuation)]
+
 use std::sync::{Arc, Mutex};
 use tracing::{error, info, warn};
 

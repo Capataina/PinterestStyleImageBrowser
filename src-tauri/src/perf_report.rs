@@ -62,7 +62,7 @@ pub fn render_session_report(session_dir: &Path) -> io::Result<()> {
     fs::write(&report_path, report)?;
 
     let raw_json = serde_json::to_string_pretty(&snap)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        .map_err(io::Error::other)?;
     fs::write(&raw_path, raw_json)?;
 
     Ok(())
@@ -97,7 +97,7 @@ fn build_markdown(events: &[RawEvent], snap: &perf::PerfSnapshot) -> String {
     // user events in call order; both share the relative-ms clock
     // so a single sort is well-defined.
     let mut sorted = events.to_vec();
-    sorted.sort_by_key(|e| event_ts(e));
+    sorted.sort_by_key(event_ts);
 
     let mut out = String::with_capacity(8192);
     out.push_str(&section_header(&sorted, snap));
@@ -177,7 +177,7 @@ fn section_header(events: &[RawEvent], snap: &perf::PerfSnapshot) -> String {
             format_us_human(dur)
         ));
     }
-    s.push_str("\n");
+    s.push('\n');
     s
 }
 
@@ -224,7 +224,7 @@ fn section_top_by_total(snap: &perf::PerfSnapshot) -> String {
             format_us_human(*max as u64),
         ));
     }
-    s.push_str("\n");
+    s.push('\n');
     s
 }
 
@@ -257,7 +257,7 @@ fn section_hotspots(snap: &perf::PerfSnapshot) -> String {
             format_us_human(sp.max_us as u64),
         ));
     }
-    s.push_str("\n");
+    s.push('\n');
     s
 }
 
@@ -290,7 +290,9 @@ fn section_outliers(sorted: &[RawEvent]) -> String {
             RawEvent::Diagnostic { .. } => {}
         }
     }
-    spans.sort_by(|a, b| b.2.cmp(&a.2));
+    // 6b — clippy::unnecessary_sort_by. Reverse-key sort_by_key is the
+    // idiomatic descending sort.
+    spans.sort_by_key(|b| std::cmp::Reverse(b.2));
     spans.truncate(OUTLIER_LIMIT);
 
     let mut s = String::new();
@@ -318,7 +320,7 @@ fn section_outliers(sorted: &[RawEvent]) -> String {
             cause.map(|c| format!("`{c}`")).unwrap_or_else(|| "—".into()),
         ));
     }
-    s.push_str("\n");
+    s.push('\n');
     s
 }
 
@@ -397,7 +399,7 @@ fn section_action_timeline(sorted: &[RawEvent]) -> String {
                     ));
                 }
             }
-            s.push_str("\n");
+            s.push('\n');
         }
     }
     if truncated {
@@ -434,7 +436,7 @@ fn section_per_span_table(snap: &perf::PerfSnapshot) -> String {
             format_us_human(sp.max_us as u64),
         ));
     }
-    s.push_str("\n");
+    s.push('\n');
     s
 }
 

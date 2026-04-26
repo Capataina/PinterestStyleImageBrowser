@@ -142,7 +142,7 @@ impl ImageDatabase {
 #[cfg(test)]
 mod tests {
     use super::super::test_helpers::fresh_db;
-    use super::*;
+    
 
     #[test]
     fn add_root_creates_row_with_enabled_true() {

@@ -49,7 +49,7 @@ fn test_real_image_similarity_search() {
 
     println!("Found {} images", image_paths.len());
     assert!(
-        image_paths.len() > 0,
+        !image_paths.is_empty(),
         "No images found in references directory"
     );
 
@@ -68,7 +68,7 @@ fn test_real_image_similarity_search() {
         println!(
             "Processing batch {}/{} (images {}-{})...",
             batch_idx + 1,
-            (total_images + BATCH_SIZE - 1) / BATCH_SIZE,
+            total_images.div_ceil(BATCH_SIZE),
             start_idx + 1,
             end_idx
         );
@@ -110,7 +110,7 @@ fn test_real_image_similarity_search() {
         index.cached_images.len()
     );
     assert!(
-        index.cached_images.len() > 0,
+        !index.cached_images.is_empty(),
         "No images were successfully encoded"
     );
 
@@ -136,7 +136,7 @@ fn test_real_image_similarity_search() {
     }
 
     assert!(
-        similar_images.len() > 0,
+        !similar_images.is_empty(),
         "Should return at least one similar image"
     );
 
@@ -153,8 +153,7 @@ fn test_real_image_similarity_search() {
     println!("\n=== Test 2: Testing multiple queries ===");
     let num_queries = image_paths.len().min(3); // Test with first 3 images
 
-    for query_idx in 0..num_queries {
-        let query_path = &image_paths[query_idx];
+    for (query_idx, query_path) in image_paths.iter().enumerate().take(num_queries) {
         let query_embedding = embeddings_map.get(query_path).unwrap();
 
         println!(
@@ -176,7 +175,7 @@ fn test_real_image_similarity_search() {
         }
 
         // Verify each query returns results
-        assert!(results.len() > 0, "Query {} returned no results", query_idx);
+        assert!(!results.is_empty(), "Query {} returned no results", query_idx);
     }
 
     // Test 3: Check embedding dimensions
@@ -297,7 +296,7 @@ fn test_similarity_distribution() {
         .iter()
         .take(sample_size)
         .cloned()
-        .zip(embeddings_vec.into_iter())
+        .zip(embeddings_vec)
         .collect();
 
     println!("Computing pairwise similarities...");
