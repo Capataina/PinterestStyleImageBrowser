@@ -24,6 +24,8 @@ export interface MasonryItemPlacement {
   x: number;
   y: number;
   width: number;
+  /** Rendered height in pixels (aspect-ratio scaled to column width). */
+  height: number;
   isSelected: boolean;
 }
 
@@ -91,6 +93,7 @@ export function computeMasonryLayout(
       x: 0,
       y: 0,
       width: selectedWidth,
+      height: selectedHeight,
       isSelected: true,
     });
 
@@ -113,14 +116,16 @@ export function computeMasonryLayout(
     }
 
     const ratio = columnWidth / img.width;
+    const itemHeight = img.height * ratio;
     placements.push({
       itemData: img,
       x: minIndex * (columnWidth + columnGap),
       y: colHeights[minIndex],
       width: columnWidth,
+      height: itemHeight,
       isSelected: false,
     });
-    colHeights[minIndex] += img.height * ratio + verticalGap;
+    colHeights[minIndex] += itemHeight + verticalGap;
   }
 
   const height = colHeights.length > 0 ? Math.max(...colHeights, 0) : 0;

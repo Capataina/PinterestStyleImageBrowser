@@ -47,19 +47,28 @@ export interface IndexingState {
  * current pipeline state to React.
  *
  * Side effects:
- * - When `phase` is "thumbnail" or "encode", periodically invalidates
- *   the ["images"] query so the grid refreshes as new images appear.
- *   Throttled — at most once every 2 seconds — to avoid render storms
- *   on large libraries (10k+ images).
- * - When `phase` reaches "ready", invalidates one final time so the
- *   grid shows the complete catalog.
+ * - During the "thumbnail" phase, periodically (every 5s) invalidates
+ *   the ["images"] query so the grid refreshes as new thumbnails
+ *   land. This is a real visible change worth refreshing for.
+ * - During the "encode" phase we do NOT invalidate. Encoders only
+ *   populate search-readiness (cosine cache), not the visible grid.
+ *   Refreshing here drove the symptom diagnosed in
+ *   `context/plans/performance-analysis.md`: full `get_images`
+ *   round-trips contending with SigLIP-2 inference, producing two
+ *   ~22-second freezes in a 1842-image folder add.
+ * - On the "ready" phase transition, invalidate ["images"] ONCE so
+ *   any final metadata (orphan flagging, root reconciliation) lands.
  */
 export function useIndexingProgress(): IndexingState {
   const [progress, setProgress] = useState<IndexingProgress | null>(null);
   const queryClient = useQueryClient();
 
-  // Throttle marker for invalidateQueries during long phases.
+  // Throttle marker for invalidateQueries during the thumbnail phase.
   const lastInvalidatedAt = useRef<number>(0);
+  // Track whether we've already done the one-shot ready invalidation
+  // for the current pipeline run. The pipeline can re-emit `ready`
+  // (e.g. after background DINOv2 finishes) — we only need one.
+  const readyInvalidatedFor = useRef<string | null>(null);
 
   useEffect(() => {
     let unlisten: UnlistenFn | null = null;
@@ -74,25 +83,43 @@ export function useIndexingProgress(): IndexingState {
 
           // Cache-invalidation strategy:
           //
-          // We used to invalidate every ~2s during thumbnail/encode
-          // phases. Combined with the backend's per-call shuffle, that
-          // produced visible "entire app reshuffles every 2 seconds"
-          // behaviour. The shuffle is now stable-by-id at the backend
-          // and frontend-side seeded; refetching no longer reorders.
+          // Thumbnail phase: refresh every ~5s so newly-generated
+          // thumbnails appear in the grid as they land. This is the
+          // user-visible payoff of indexing — keep it lively.
           //
-          // We still throttle invalidations during long phases so we
-          // get periodic visual updates of newly-indexed thumbnails
-          // without thrashing React. Empirically a 5-second cadence
-          // is plenty — the eye notices a refresh, not the lack of
-          // one for a few seconds.
-          if (payload.phase === "thumbnail" || payload.phase === "encode") {
+          // Encode phase: deliberately do NOT invalidate. Encoders
+          // populate search-readiness, not the visible grid. The grid
+          // was already correct after the thumbnail phase. Refreshing
+          // during encode was the headline finding in
+          // context/plans/performance-analysis.md — full grid refetches
+          // contended with heavy SigLIP-2 inference and produced two
+          // 22-second `get_images` stalls.
+          //
+          // Ready phase: one final invalidation so any metadata that
+          // changed during the run (orphan flags, root cleanup) lands.
+          if (payload.phase === "thumbnail") {
             const now = Date.now();
             if (now - lastInvalidatedAt.current > 5000) {
               lastInvalidatedAt.current = now;
               queryClient.invalidateQueries({ queryKey: ["images"] });
             }
           } else if (payload.phase === "ready") {
-            queryClient.invalidateQueries({ queryKey: ["images"] });
+            // Reset the throttle so the next run's thumbnail phase
+            // starts fresh.
+            lastInvalidatedAt.current = 0;
+            // De-dupe in case the pipeline re-emits `ready`. Use the
+            // message field as a coarse run identifier — different
+            // ready events for the same pipeline carry the same
+            // message, distinct runs (next folder add) emit a fresh
+            // sequence so this naturally re-arms.
+            const runKey = payload.message ?? "ready";
+            if (readyInvalidatedFor.current !== runKey) {
+              readyInvalidatedFor.current = runKey;
+              queryClient.invalidateQueries({ queryKey: ["images"] });
+            }
+          } else if (payload.phase === "scan") {
+            // New run starting — re-arm the ready de-dupe.
+            readyInvalidatedFor.current = null;
           }
         }
       );

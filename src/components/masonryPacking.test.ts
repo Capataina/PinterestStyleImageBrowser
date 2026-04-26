@@ -222,4 +222,34 @@ describe("computeMasonryLayout", () => {
     });
     expect(out.height).toBeGreaterThan(0);
   });
+
+  it("emits a per-placement height matching aspect-ratio scaling", () => {
+    // 200x100 source tile in a 100-wide column should render at 50px
+    // tall. Used by the Masonry viewport-culling pass — see
+    // Masonry.tsx and context/plans/performance-analysis.md.
+    const out = computeMasonryLayout({
+      items: [tile(1, 200, 100)],
+      containerWidth: 100,
+      minItemWidth: 100,
+      columnGap: 0,
+      verticalGap: 0,
+    });
+    expect(out.placements).toHaveLength(1);
+    expect(out.placements[0].height).toBeCloseTo(50, 5);
+  });
+
+  it("emits a hero placement height scaled to its spanned width", () => {
+    const selected = tile(1, 1000, 500);
+    const out = computeMasonryLayout({
+      items: [selected],
+      selectedItem: selected,
+      containerWidth: 900,
+      minItemWidth: 300,
+      columnGap: 0,
+      verticalGap: 0,
+    });
+    // Hero spans all 3 cols → 900px wide → 1000:500 ratio → 450 tall.
+    const hero = out.placements.find((p) => p.isSelected)!;
+    expect(hero.height).toBeCloseTo(450, 5);
+  });
 });
