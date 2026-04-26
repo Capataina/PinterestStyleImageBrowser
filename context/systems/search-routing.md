@@ -211,7 +211,7 @@ None.
 
 ## Planned / Missing / Likely Changes
 
-- **Pipeline stats UI**: surface `db::get_pipeline_stats` somewhere visible — top-of-page banner during indexing, status pill secondary line, or settings drawer. Tracked in `plans/pipeline-parallelism-and-stats-ui.md`.
+- **Pipeline stats UI**: shipped in commit `8c55aa4` as the StatsSection in the Settings drawer (per-encoder progress + total/with_thumbnail/with_embedding/orphaned counts).
 - **Verify `setIsInspecting` is consumed** or remove it.
 - **Programmatic re-download trigger** using `isMissingModelError(e)` — a button in the toast that calls a hypothetical `force_reindex` command.
 - **Multi-select** for batch tag/note operations (Phase 10 deferred).

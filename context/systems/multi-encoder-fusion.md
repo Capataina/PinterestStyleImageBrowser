@@ -117,5 +117,4 @@ The previous diversity strategy `cosine/index.rs::get_tiered_similar_images` (7-
 ## References
 
 - Cormack, Clarke & Büttcher (2009), *Reciprocal Rank Fusion outperforms Condorcet and individual rank learning methods*, SIGIR '09. [PDF](https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf).
-- `plans/perf-optimisation-plan.md` Phase 5.
-- `plans/2026-04-26-autonomous-session-report.md` § Multi-encoder fusion.
+- `notes.md` § Active work areas — Phase 5 (image-image fusion) + Phase 11d (text-image fusion). The original perf plan + autonomous session report were deleted post-ship.

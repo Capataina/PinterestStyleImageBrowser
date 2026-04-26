@@ -433,7 +433,7 @@ The chain crosses 4 process boundaries (UI → IPC → DB → ONNX) and 2 synchr
 
 ## Inter-System Relationships
 
-This table satisfies the inter-system relationship mapping obligation. With 19 system files the floor is `min(19, C(19,2)=171) = 19`. Entries 26-30 added 2026-04-26 by the Tier 1 + Tier 2 + Phase 4 + Phase 5 perf bundle (see `plans/perf-optimisation-plan.md`).
+This table satisfies the inter-system relationship mapping obligation. With 19 system files the floor is `min(19, C(19,2)=171) = 19`. Entries 26-30 added 2026-04-26 by the Tier 1 + Tier 2 + Phase 4 + Phase 5 perf bundle (see `notes.md` § Active work areas for the bundle's status; the per-recommendation R1-R16 plan was deleted after shipping).
 
 | # | A | B | Mechanism | What breaks if it fails |
 |---|---|---|-----------|-------------------------|
@@ -586,7 +586,7 @@ Inspected in full this session (in addition to the prior 2026-04-26 evening pass
 
 - All system docs in `context/systems/` for staleness assessment.
 - `notes.md`, all 8 notes files (after creating preprocessing-spatial-coverage.md, updating clip-preprocessing-decisions.md).
-- `context/architecture.md`, `context/plans/perf-diagnostics.md`.
+- `context/architecture.md`. The historical `plans/perf-diagnostics.md` master plan was deleted in a later upkeep — its content is captured in `systems/profiling.md`.
 - `git status` + `git log --oneline -10` to confirm uncommitted vs committed scope.
 
 ### Noted but not read in full this run

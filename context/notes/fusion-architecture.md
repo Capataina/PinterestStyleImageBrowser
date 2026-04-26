@@ -121,4 +121,4 @@ Fusion automatically picks it up because the iteration is over `enabled_encoders
 
 - `systems/multi-encoder-fusion.md` — implementation details (RRF math, per-encoder cache state, IPC shape).
 - `notes/encoder-additions-considered.md` — research-grade notes on what 4th encoder we might add.
-- `plans/perf-optimisation-plan.md` — Phase 5 (image-image fusion) and the broader perf bundle.
+- `notes.md` § Active work areas — Phase 5 (image-image fusion) was part of the broader perf bundle; the per-recommendation plan was deleted post-ship.

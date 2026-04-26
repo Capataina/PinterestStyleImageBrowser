@@ -228,12 +228,10 @@ Frontend `useIndexingProgress` hook subscribes to the `"indexing-progress"` even
 
 ## Partial / In Progress
 
-None — the pipeline as written is feature-complete for the current scope. Plans for parallelism live in `plans/pipeline-parallelism-and-stats-ui.md`.
+None — the pipeline is feature-complete for the current scope. Per-encoder parallelism shipped in Phase 11e; pipeline stats UI shipped as the StatsSection in the Settings drawer (Phase 8c4 / commit `8c55aa4`).
 
 ## Planned / Missing / Likely Changes
 
-- **Pipeline parallelism**: overlap thumbnail + encode phases via independent worker threads. The DB acts as the queue (rows missing thumbnails vs rows missing embeddings); each worker polls and processes. Requires careful ordering to avoid encoding before thumbnail confirms the file is decodable. Tracked in `plans/pipeline-parallelism-and-stats-ui.md`.
-- **Pipeline stats UI**: surface `db::get_pipeline_stats` (already implemented backend-side) in the Settings drawer or status pill — counts of total / with-thumbnail / with-embedding / orphaned. Tracked in the same plan.
 - **Watcher rebuild on root changes**: drop the existing `WatcherHandle` and re-call `watcher::start` after `add_root` / `remove_root` / `set_root_enabled`. Today's gap is documented in `systems/watcher.md`.
 - **Cancellation token for cooperative pipeline cancel**: today the only way to abort a running pipeline is to wait for it. A future "cancel-and-restart on rapid root switches" UX would need a `Arc<AtomicBool>` cancel flag checked between phases.
 - **Resumable downloads**: `model_download` could honour HTTP `Range` headers to resume partial downloads instead of restarting from byte 0.

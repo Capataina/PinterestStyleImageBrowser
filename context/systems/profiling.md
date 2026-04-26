@@ -247,7 +247,7 @@ The percentiles are computed on demand from the recent-samples ringbuffer in `sn
 - `src/services/perf.ts` (wrappers + perfInvoke + onRenderProfiler)
 - `<Profiler id="masonry">` integration in `pages/[...slug].tsx` (commit `ee8c5d6`)
 - Per-session directory `<app_data_dir>/exports/perf-{unix_ts}/` containing `timeline.jsonl`, `report.md`, `raw.json`
-- Master plan `context/plans/perf-diagnostics.md` (the original spec, much of which is now shipped)
+- The historical `context/plans/perf-diagnostics.md` master spec was deleted in upkeep after Phases 1-5 shipped; future-work items (Phase 6 timeline rotation, Phase 7+ system sampling — partially shipped, etc.) are tracked in `notes.md` § Active work areas.
 
 ## Known Issues / Active Risks
 

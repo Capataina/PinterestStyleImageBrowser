@@ -264,7 +264,7 @@ For very-critical state (cosine cache, models) the same pattern applies but isn'
 
 ## R-tag perf annotation pattern (introduced 2026-04-26)
 
-Every line touched by the Tier 1 + Tier 2 perf bundle carries an `R<n>` prefix in its inline comment, where `<n>` is the recommendation number from `plans/perf-optimisation-plan.md`:
+Every line touched by the Tier 1 + Tier 2 perf bundle carries an `R<n>` prefix in its inline comment, where `<n>` was the recommendation number from the (since-deleted) per-recommendation perf plan. The shipped recommendations and their R-numbers are summarised in `notes.md` § Active work areas; the deferred ones (R5, R10-R16) are described there too.
 
 ```rust
 // R3 — busy_timeout caps how long a momentary lock contention waits

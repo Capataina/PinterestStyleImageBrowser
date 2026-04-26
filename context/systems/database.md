@@ -396,7 +396,7 @@ None.
 - **Sharper error types for known constraint violations** — `add_root`'s UNIQUE error should surface as `ApiError::BadInput("already added")` rather than generic `ApiError::Db`.
 - **Endianness guard for embedding BLOBs** — write a magic byte sequence as a header so loading a wrong-endian BLOB errors loudly instead of producing garbage.
 - **WAL checkpoint hint in shutdown** — call `wal_checkpoint(TRUNCATE)` on app exit so the `-wal` file shrinks. Cosmetic.
-- **Pipeline stats UI** — `get_pipeline_stats` is implemented and tested but not yet surfaced. Plan: add to the Settings drawer or status pill (`plans/pipeline-parallelism-and-stats-ui.md`).
+- **Pipeline stats UI** — `get_pipeline_stats` shipped to the Settings drawer's StatsSection in commit `8c55aa4` (per-encoder progress + total/with_thumbnail/with_embedding/orphaned counts).
 
 ## Durable Notes / Discarded Approaches
 
