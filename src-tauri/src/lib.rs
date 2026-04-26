@@ -115,10 +115,25 @@ impl CosineIndexState {
     }
 }
 
-/// State for the text encoder used in semantic search
-/// Lazy-loaded on first semantic search query
+/// State for the text encoders used in semantic search.
+///
+/// Each encoder is lazy-loaded on first use. We hold one slot per
+/// supported family (CLIP — 512-d English BPE; SigLIP-2 — 768-d
+/// Gemma SentencePiece) so the user can switch the text encoder in
+/// the picker mid-session without paying the model-load cost again
+/// when they swap back.
+///
+/// Two slots not three because DINOv2 is image-only — there is no
+/// DINOv2 text branch to dispatch through.
 pub struct TextEncoderState {
+    /// CLIP English text encoder. 512-d output. Default.
     pub encoder: Mutex<Option<ClipTextEncoder>>,
+    /// SigLIP-2 base 256 text encoder. 768-d output, Gemma SentencePiece
+    /// tokenizer (256k vocab). The picker dispatches semantic_search
+    /// here when the user has SigLIP-2 selected as the text encoder.
+    pub siglip2_encoder: Mutex<
+        Option<crate::similarity_and_semantic_search::encoder_siglip2::Siglip2TextEncoder>,
+    >,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -148,8 +163,11 @@ pub fn run(db: ImageDatabase, db_path: String) {
     };
 
     // Text encoder state (lazy-loaded on first semantic search).
+    // Phase 4 — both encoders coexist so the picker can switch
+    // dispatch instantly without paying the model-load cost twice.
     let text_encoder_state = TextEncoderState {
         encoder: Mutex::new(None),
+        siglip2_encoder: Mutex::new(None),
     };
 
     // Single-flight guard for the indexing pipeline. Wrapped in Arc so

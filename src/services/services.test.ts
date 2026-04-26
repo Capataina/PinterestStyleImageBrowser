@@ -193,13 +193,28 @@ describe("services/images", () => {
     expect(result).toBeNull();
   });
 
-  it("semanticSearch invokes with query + topN", async () => {
+  it("semanticSearch invokes with query + topN + textEncoderId (undefined when not passed)", async () => {
     const { semanticSearch } = await import("./images");
     mockInvoke.mockResolvedValueOnce([]);
     await semanticSearch("cyberpunk", 25);
     expect(mockInvoke).toHaveBeenCalledWith("semantic_search", {
       query: "cyberpunk",
       topN: 25,
+      textEncoderId: undefined,
+    });
+  });
+
+  it("semanticSearch passes textEncoderId through when supplied", async () => {
+    // Phase 4 — picker dispatch. The hook reads prefs.textEncoder and
+    // forwards it; backend branches on this id ("siglip2_base" → SigLIP-2,
+    // anything else → CLIP fallback).
+    const { semanticSearch } = await import("./images");
+    mockInvoke.mockResolvedValueOnce([]);
+    await semanticSearch("cyberpunk", 25, "siglip2_base");
+    expect(mockInvoke).toHaveBeenCalledWith("semantic_search", {
+      query: "cyberpunk",
+      topN: 25,
+      textEncoderId: "siglip2_base",
     });
   });
 });

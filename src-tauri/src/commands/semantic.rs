@@ -6,23 +6,57 @@ use crate::perf;
 use crate::commands::{resolve_image_id_for_cosine_path, ApiError, ImageSearchResult};
 use crate::db::ImageDatabase;
 use crate::paths;
+use crate::similarity_and_semantic_search::encoder_siglip2::{
+    Siglip2TextEncoder, SIGLIP2_TEXT_MODEL_FILENAME, SIGLIP2_TOKENIZER_FILENAME,
+};
 use crate::similarity_and_semantic_search::encoder_text::ClipTextEncoder;
 use crate::{CosineIndexState, TextEncoderState};
 
-/// Semantic search: find images matching a text query using CLIP embeddings
+/// Stable encoder ids for the text-side picker. Must match the values
+/// in `commands::encoders::ENCODERS` and the frontend `imageEncoder` /
+/// `textEncoder` localStorage entries.
+pub const CLIP_TEXT_ENCODER_ID: &str = "clip_vit_b_32";
+pub const SIGLIP2_TEXT_ENCODER_ID: &str = "siglip2_base";
+
+/// Semantic search: find images matching a text query using the user's
+/// chosen text encoder.
+///
+/// Phase 4 dispatch:
+///
+/// `text_encoder_id` — Optional encoder id from the frontend
+/// `useUserPreferences().textEncoder` setting. Recognised values:
+///   - `Some("siglip2_base")`  → SigLIP-2 768-d shared text+image space
+///   - `Some("clip_vit_b_32")` → CLIP English 512-d (default)
+///   - `None` or anything else → CLIP fallback
+///
+/// The cosine cache is loaded for the *matching* image-encoder family
+/// (CLIP image embeddings if CLIP text was used; SigLIP-2 image
+/// embeddings if SigLIP-2 text was used). Mixing dimensions would
+/// crash with a dim-mismatch panic in ndarray's dot product — the
+/// `ensure_loaded_for` call below guarantees the right cache is
+/// resident before we touch it.
 #[tauri::command]
-#[tracing::instrument(name = "ipc.semantic_search", skip(db, cosine_state, text_encoder_state), fields(query_len = query.len(), top_n))]
+#[tracing::instrument(name = "ipc.semantic_search", skip(db, cosine_state, text_encoder_state), fields(query_len = query.len(), top_n, text_encoder_id))]
 pub fn semantic_search(
     db: State<'_, ImageDatabase>,
     cosine_state: State<'_, CosineIndexState>,
     text_encoder_state: State<'_, TextEncoderState>,
     query: String,
     top_n: usize,
+    text_encoder_id: Option<String>,
 ) -> Result<Vec<ImageSearchResult>, ApiError> {
     use ndarray::Array1;
 
+    let chosen = match text_encoder_id.as_deref() {
+        Some(SIGLIP2_TEXT_ENCODER_ID) => SIGLIP2_TEXT_ENCODER_ID,
+        // Default + explicit CLIP + any unknown id all fall through to CLIP
+        // (the bullet-proof default). The frontend already validates ids
+        // against list_available_encoders, but we don't trust that here.
+        _ => CLIP_TEXT_ENCODER_ID,
+    };
+
     info!(
-        "semantic_search called - query: '{}', top_n: {}",
+        "semantic_search called - query: '{}', top_n: {}, encoder: {chosen}",
         query, top_n
     );
 
@@ -32,131 +66,39 @@ pub fn semantic_search(
         return Ok(Vec::new());
     }
 
-    // Lazy-load text encoder if not initialized
-    let mut encoder_lock = text_encoder_state.encoder.lock()?;
+    // Branch on the chosen encoder. Each branch produces one Vec<f32>
+    // text_embedding + a `dim` for the diagnostic + the cosine_cache_id
+    // ("which image-side cache do we need to be loaded?").
+    let (text_embedding, dim, cosine_cache_id) = if chosen == SIGLIP2_TEXT_ENCODER_ID {
+        encode_with_siglip2(&text_encoder_state, query)?
+    } else {
+        encode_with_clip(&text_encoder_state, query)?
+    };
 
-    if encoder_lock.is_none() {
-        info!("Initializing text encoder...");
-        let models_dir = paths::models_dir();
-        // New filenames — separate-graph CLIP text model, BPE tokenizer.
-        // The old `model_text.onnx` (multilingual distillation) is now
-        // unused; if it exists from a previous install, it sits idle
-        // in models_dir until cleanup is added.
-        let model_path = models_dir.join(crate::model_download::CLIP_TEXT_FILENAME);
-        let tokenizer_path = models_dir.join(crate::model_download::CLIP_TOKENIZER_FILENAME);
-
-        // Typed errors for the model-missing case so the frontend can
-        // trigger a re-download dialog rather than showing a generic
-        // toast (audit ApiError finding — discriminating the kind lets
-        // the UI branch on the cause).
-        if !model_path.exists() {
-            return Err(ApiError::TextModelMissing(
-                model_path.display().to_string(),
-            ));
-        }
-        if !tokenizer_path.exists() {
-            return Err(ApiError::TokenizerMissing(
-                tokenizer_path.display().to_string(),
-            ));
-        }
-
-        let encoder = ClipTextEncoder::new(&model_path, &tokenizer_path)
-            .map_err(|e| ApiError::Encoder(format!("text encoder init failed: {e}")))?;
-
-        *encoder_lock = Some(encoder);
-        info!("Text encoder initialized successfully");
-    }
-
-    let encoder = encoder_lock.as_mut().unwrap();
-
-    // Tokenizer diagnostic — emit the raw query, decoded tokens, and
-    // attention mask sum BEFORE running inference. Lets the report
-    // show "user typed 'blue fish' → tokens ['<|startoftext|>', 'blue</w>',
-    // 'fish</w>', '<|endoftext|>'], 4 real tokens out of 77 max" so a
-    // user can spot tokenizer breakage (everything → <unk>, query
-    // truncated mid-word, vocab mismatch with model).
-    {
-        let tok = encoder.tokenizer_for_diagnostic();
-        match tok.encode(query, true) {
-            Ok(encoding) => {
-                let ids: Vec<u32> = encoding.get_ids().to_vec();
-                let tokens: Vec<String> = encoding.get_tokens().to_vec();
-                let attn: Vec<u32> = encoding.get_attention_mask().to_vec();
-                let attn_sum: u32 = attn.iter().sum();
-                let unk_count = tokens.iter().filter(|t| t.contains("<unk>") || t.contains("[UNK]")).count();
-                perf::record_diagnostic(
-                    "tokenizer_output",
-                    serde_json::json!({
-                        "encoder_id": "clip_vit_b_32",
-                        "raw_query": query,
-                        "raw_query_len_chars": query.chars().count(),
-                        "token_count": ids.len(),
-                        "attention_mask_sum": attn_sum,
-                        "max_seq_length": encoder.max_seq_length(),
-                        "token_ids": ids,
-                        "decoded_tokens": tokens,
-                        "interpretation": if ids.len() <= 2 {
-                            "WARNING: only special tokens — query produced zero real tokens (empty query or tokenizer broken)"
-                        } else if unk_count > ids.len() / 2 {
-                            "WARNING: majority of tokens are <unk> — vocab mismatch with model"
-                        } else if ids.len() > encoder.max_seq_length() {
-                            "WARNING: query exceeds max_seq_length and will be truncated mid-content"
-                        } else {
-                            "OK"
-                        },
-                    }),
-                );
-            }
-            Err(e) => {
-                perf::record_diagnostic(
-                    "tokenizer_output",
-                    serde_json::json!({
-                        "encoder_id": "clip_vit_b_32",
-                        "raw_query": query,
-                        "error": e.to_string(),
-                        "interpretation": "ERROR: tokenizer.encode() failed",
-                    }),
-                );
-            }
-        }
-    }
-
-    // Encode the text query
-    debug!("Encoding query: '{}'", query);
-    let text_embedding = encoder
-        .encode(query)
-        .map_err(|e| ApiError::Encoder(format!("encode query: {e}")))?;
     debug!(
-        "Text embedding generated - length: {}",
+        "Text embedding generated for {chosen} - length: {}",
         text_embedding.len()
     );
 
-    // Force the cosine cache to hold CLIP-family image embeddings —
-    // we use ClipTextEncoder above, which produces 512-d vectors that
-    // only make sense compared against CLIP-family image embeddings
-    // (also 512-d). Without this, a previous "View Similar" call with
-    // DINOv2 (384-d) selected would have left the cache in a state
-    // where dot-producting against the 512-d text query crashes
-    // ndarray with a dim-mismatch panic.
-    //
-    // Future: when SigLIP-2 text dispatch is wired, this should
-    // pick the encoder matching the user's textEncoder setting.
+    // Force the cosine cache to hold image embeddings from the matching
+    // encoder family. Without this, a previous "View Similar" call with
+    // DINOv2 (768-d) selected would leave the cache as DINOv2 — a CLIP
+    // text query (512-d) would crash the dot product on dim mismatch.
     cosine_state
-        .ensure_loaded_for(&db, "clip_vit_b_32")
-        .map_err(|e| ApiError::Cosine(e))?;
+        .ensure_loaded_for(&db, cosine_cache_id)
+        .map_err(ApiError::Cosine)?;
     let mut index = cosine_state.index.lock()?;
 
     if index.cached_images.is_empty() {
-        debug!("Populating cosine index from database...");
-        index.populate_from_db(&db);
+        debug!("Populating cosine index from database (cache was empty)...");
+        index.populate_from_db_for_encoder(&db, cosine_cache_id);
         debug!(
             "Cosine index populated with {} images",
             index.cached_images.len()
         );
     }
 
-    // Find similar images using cosine similarity
-    // Use get_similar_images_sorted for semantic search to get results in proper order
+    // Find similar images using cosine similarity.
     let query_array = Array1::from_vec(text_embedding.clone());
     let cache_size = index.cached_images.len();
     let raw_results = index.get_similar_images_sorted(&query_array, top_n, None);
@@ -167,17 +109,8 @@ pub fn semantic_search(
         query
     );
 
-    // Get all images once for flexible matching (audit: was previously
-    // implicit in semantic_search but two of the similarity commands
-    // called get_all_images twice — hoisting once is the consistent
-    // pattern across all three).
     let all_images = db.get_all_images().ok();
 
-    // Convert results to ImageSearchResult with thumbnail info.
-    // Path resolution + Windows-prefix normalisation is shared via
-    // `resolve_image_id_for_cosine_path`. Track resolution outcomes
-    // for the diagnostic so we can spot path-mapping bugs vs encoder-
-    // quality issues.
     let mut resolution_misses: Vec<String> = Vec::new();
     let mut thumb_misses: u32 = 0;
     let results: Vec<ImageSearchResult> = raw_results
@@ -190,7 +123,6 @@ pub fn semantic_search(
                 resolution_misses.push(path.to_string_lossy().into_owned());
             }
             image_info.map(|(id, final_path)| {
-                // Get thumbnail info if available
                 let thumbnail_info = db.get_image_thumbnail_info(id).ok().flatten();
                 if thumbnail_info.is_none() {
                     thumb_misses += 1;
@@ -211,29 +143,23 @@ pub fn semantic_search(
         })
         .collect();
 
-    // Compute query-embedding stats so the diagnostic shows whether
-    // the text branch is producing reasonable vectors (mean L2 ~1.0,
-    // no NaNs, non-degenerate range).
+    // Query-embedding health stats.
     let q_norm: f32 = text_embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
     let q_nan_count = text_embedding.iter().filter(|x| x.is_nan()).count();
     let q_inf_count = text_embedding.iter().filter(|x| x.is_infinite()).count();
     let q_min = text_embedding.iter().cloned().fold(f32::INFINITY, f32::min);
     let q_max = text_embedding.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
 
-    // Diagnostic — full cosine result list for the typed text query.
-    // Lets the user audit "blue fish returned X" against the cosine-
-    // ranking truth, plus score-distribution stats, query-embedding
-    // health, and path-resolution outcomes.
     perf::record_diagnostic(
         "search_query",
         serde_json::json!({
             "type": "semantic",
-            "encoder_id": "clip_vit_b_32",
+            "encoder_id": chosen,
             "top_n": top_n,
             "query_text": query,
             "cosine_cache_size": cache_size,
             "query_embedding": {
-                "dim": text_embedding.len(),
+                "dim": dim,
                 "l2_norm": q_norm,
                 "min": q_min,
                 "max": q_max,
@@ -266,10 +192,7 @@ pub fn semantic_search(
         }),
     );
 
-    info!(
-        "semantic_search returning {} results",
-        results.len()
-    );
+    info!("semantic_search returning {} results ({chosen})", results.len());
 
     if !results.is_empty() {
         debug!("Top 5 results:");
@@ -288,4 +211,145 @@ pub fn semantic_search(
     }
 
     Ok(results)
+}
+
+/// CLIP text encode + tokenizer diagnostic. Returns
+/// (embedding, dim, cosine_cache_id_to_load).
+fn encode_with_clip(
+    text_encoder_state: &TextEncoderState,
+    query: &str,
+) -> Result<(Vec<f32>, usize, &'static str), ApiError> {
+    let mut encoder_lock = text_encoder_state.encoder.lock()?;
+
+    if encoder_lock.is_none() {
+        info!("Initializing CLIP text encoder...");
+        let models_dir = paths::models_dir();
+        let model_path = models_dir.join(crate::model_download::CLIP_TEXT_FILENAME);
+        let tokenizer_path = models_dir.join(crate::model_download::CLIP_TOKENIZER_FILENAME);
+        if !model_path.exists() {
+            return Err(ApiError::TextModelMissing(
+                model_path.display().to_string(),
+            ));
+        }
+        if !tokenizer_path.exists() {
+            return Err(ApiError::TokenizerMissing(
+                tokenizer_path.display().to_string(),
+            ));
+        }
+        let encoder = ClipTextEncoder::new(&model_path, &tokenizer_path)
+            .map_err(|e| ApiError::Encoder(format!("CLIP text encoder init failed: {e}")))?;
+        *encoder_lock = Some(encoder);
+        info!("CLIP text encoder initialized successfully");
+    }
+
+    let encoder = encoder_lock.as_mut().unwrap();
+    record_clip_tokenizer_diagnostic(encoder, query);
+    let emb = encoder
+        .encode(query)
+        .map_err(|e| ApiError::Encoder(format!("CLIP encode query: {e}")))?;
+    let dim = emb.len();
+    Ok((emb, dim, CLIP_TEXT_ENCODER_ID))
+}
+
+/// SigLIP-2 text encode + diagnostic. Returns the same shape as
+/// encode_with_clip so the call-site stays uniform.
+fn encode_with_siglip2(
+    text_encoder_state: &TextEncoderState,
+    query: &str,
+) -> Result<(Vec<f32>, usize, &'static str), ApiError> {
+    let mut encoder_lock = text_encoder_state.siglip2_encoder.lock()?;
+
+    if encoder_lock.is_none() {
+        info!("Initializing SigLIP-2 text encoder...");
+        let models_dir = paths::models_dir();
+        let model_path = models_dir.join(SIGLIP2_TEXT_MODEL_FILENAME);
+        let tokenizer_path = models_dir.join(SIGLIP2_TOKENIZER_FILENAME);
+        if !model_path.exists() {
+            return Err(ApiError::TextModelMissing(
+                model_path.display().to_string(),
+            ));
+        }
+        if !tokenizer_path.exists() {
+            return Err(ApiError::TokenizerMissing(
+                tokenizer_path.display().to_string(),
+            ));
+        }
+        let encoder = Siglip2TextEncoder::new(&model_path, &tokenizer_path)
+            .map_err(|e| ApiError::Encoder(format!("SigLIP-2 text encoder init failed: {e}")))?;
+        *encoder_lock = Some(encoder);
+        info!("SigLIP-2 text encoder initialized successfully");
+    }
+
+    let encoder = encoder_lock.as_mut().unwrap();
+    // SigLIP-2 doesn't expose the same tokenizer_for_diagnostic helper;
+    // emit a minimal "encoder-id only" tokenizer_output so the report
+    // still shows a row for this query and you can spot the encoder
+    // change at a glance.
+    perf::record_diagnostic(
+        "tokenizer_output",
+        serde_json::json!({
+            "encoder_id": SIGLIP2_TEXT_ENCODER_ID,
+            "raw_query": query,
+            "raw_query_len_chars": query.chars().count(),
+            "interpretation": "OK (SigLIP-2 SentencePiece — token ids not surfaced in diagnostic)",
+        }),
+    );
+    use crate::similarity_and_semantic_search::encoders::TextEncoder as TextEncoderTrait;
+    let emb = encoder
+        .encode(query)
+        .map_err(|e| ApiError::Encoder(format!("SigLIP-2 encode query: {e}")))?;
+    let dim = emb.len();
+    Ok((emb, dim, SIGLIP2_TEXT_ENCODER_ID))
+}
+
+/// CLIP-specific tokenizer diagnostic — same payload as before the
+/// Phase 4 split. SigLIP-2 doesn't expose the equivalent shape
+/// (different tokenizer, different vocab semantics).
+fn record_clip_tokenizer_diagnostic(encoder: &ClipTextEncoder, query: &str) {
+    let tok = encoder.tokenizer_for_diagnostic();
+    match tok.encode(query, true) {
+        Ok(encoding) => {
+            let ids: Vec<u32> = encoding.get_ids().to_vec();
+            let tokens: Vec<String> = encoding.get_tokens().to_vec();
+            let attn: Vec<u32> = encoding.get_attention_mask().to_vec();
+            let attn_sum: u32 = attn.iter().sum();
+            let unk_count = tokens
+                .iter()
+                .filter(|t| t.contains("<unk>") || t.contains("[UNK]"))
+                .count();
+            perf::record_diagnostic(
+                "tokenizer_output",
+                serde_json::json!({
+                    "encoder_id": CLIP_TEXT_ENCODER_ID,
+                    "raw_query": query,
+                    "raw_query_len_chars": query.chars().count(),
+                    "token_count": ids.len(),
+                    "attention_mask_sum": attn_sum,
+                    "max_seq_length": encoder.max_seq_length(),
+                    "token_ids": ids,
+                    "decoded_tokens": tokens,
+                    "interpretation": if ids.len() <= 2 {
+                        "WARNING: only special tokens — query produced zero real tokens (empty query or tokenizer broken)"
+                    } else if unk_count > ids.len() / 2 {
+                        "WARNING: majority of tokens are <unk> — vocab mismatch with model"
+                    } else if ids.len() > encoder.max_seq_length() {
+                        "WARNING: query exceeds max_seq_length and will be truncated mid-content"
+                    } else {
+                        "OK"
+                    },
+                }),
+            );
+        }
+        Err(e) => {
+            perf::record_diagnostic(
+                "tokenizer_output",
+                serde_json::json!({
+                    "encoder_id": CLIP_TEXT_ENCODER_ID,
+                    "raw_query": query,
+                    "error": e.to_string(),
+                    "interpretation": "ERROR: tokenizer.encode() failed",
+                }),
+            );
+        }
+    }
 }

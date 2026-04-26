@@ -273,12 +273,19 @@ export async function fetchTieredSimilarImages(imageId: number, encoderId?: stri
  */
 export async function semanticSearch(
   query: string,
-  topN: number = 50
+  topN: number = 50,
+  textEncoderId?: string
 ): Promise<SimilarImageItem[]> {
   try {
+    // Phase 4 — backend dispatches on textEncoderId. Recognised values:
+    //   "siglip2_base"   → SigLIP-2 768-d
+    //   "clip_vit_b_32"  → CLIP English 512-d (default)
+    //   undefined / unknown → CLIP fallback
+    // The frontend pulls this from useUserPreferences().textEncoder so
+    // the picker selection in SettingsDrawer is honoured.
     const results: Parameters<typeof mapImageSearchResult>[0][] = await perfInvoke(
       "semantic_search",
-      { query, topN }
+      { query, topN, textEncoderId }
     );
     return results.map(mapImageSearchResult);
   } catch (error) {

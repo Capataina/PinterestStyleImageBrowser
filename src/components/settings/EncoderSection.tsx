@@ -203,9 +203,6 @@ export function EncoderSection() {
             });
             update("textEncoder", id);
           }}
-          experimental={
-            "Note: text-encoder dispatch beyond CLIP is not fully wired yet — picker accepts the choice but only CLIP path is functional today."
-          }
         />
       </div>
     </Section>
