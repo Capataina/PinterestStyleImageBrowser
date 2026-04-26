@@ -23,5 +23,6 @@ mod cache;
 pub mod diagnostics;
 pub mod index;
 pub(crate) mod math;
+pub mod rrf;
 
 pub use index::CosineIndex;

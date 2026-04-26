@@ -115,6 +115,85 @@ impl CosineIndexState {
     }
 }
 
+/// Phase 5 — per-encoder cosine caches for multi-encoder rank fusion.
+///
+/// The primary `CosineIndexState` holds ONE encoder's cache at a time
+/// (the user's "active" image encoder). Fusion needs all three caches
+/// resident simultaneously so it can score the query image in each
+/// encoder's space without paying a populate-roundtrip per fusion call.
+///
+/// Lazy-populated: each encoder's slot stays empty until the first
+/// fusion call asks for it. Memory cost on a 2000-image library is
+/// roughly 2000 × 768 × 4 bytes per slot ≈ 6 MB per encoder, ~18 MB
+/// total — small enough that holding all three resident is the right
+/// trade vs the alternative ~150 ms cold-populate cost on every
+/// fusion call.
+///
+/// `invalidate_all()` clears every slot (and is wired into the same
+/// root-change paths that already invalidate `CosineIndexState`).
+pub struct FusionIndexState {
+    pub per_encoder:
+        Arc<Mutex<std::collections::HashMap<String, CosineIndex>>>,
+}
+
+impl FusionIndexState {
+    pub fn new() -> Self {
+        Self {
+            per_encoder: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        }
+    }
+
+    /// Clear every per-encoder cache. Called from the same root-change
+    /// IPCs that invalidate `CosineIndexState` so a disabled-root toggle
+    /// flushes the fusion caches too. Without this, fusion would
+    /// happily return images from a now-disabled root because its
+    /// cached entries weren't cleared.
+    pub fn invalidate_all(&self) {
+        if let Ok(mut m) = self.per_encoder.lock() {
+            m.clear();
+        }
+    }
+
+    /// Lazy populate (or reuse) the per-encoder cache for `encoder_id`,
+    /// then run the cosine query against it. Returns the top-K
+    /// (path, score) list excluding `exclude_path`.
+    ///
+    /// Caller hands in `top_k` — fusion tops out at ~50 per encoder
+    /// in practice (the rank-fusion contribution at rank 50 with
+    /// k_rrf=60 is ~0.009, smaller still beyond that).
+    pub fn ranked_for_encoder(
+        &self,
+        db: &ImageDatabase,
+        encoder_id: &str,
+        query: &ndarray::Array1<f32>,
+        top_k: usize,
+        exclude_path: Option<&std::path::PathBuf>,
+    ) -> Result<Vec<(std::path::PathBuf, f32)>, String> {
+        let mut map = self
+            .per_encoder
+            .lock()
+            .map_err(|e| format!("fusion mutex poisoned: {e}"))?;
+        let entry = map
+            .entry(encoder_id.to_string())
+            .or_insert_with(CosineIndex::new);
+        if entry.cached_images.is_empty() {
+            entry.populate_from_db_for_encoder(db, encoder_id);
+        }
+        if entry.cached_images.is_empty() {
+            // No embeddings available for this encoder — return empty
+            // ranked list. Fusion still works with the other encoders.
+            return Ok(Vec::new());
+        }
+        Ok(entry.get_similar_images_sorted(query, top_k, exclude_path))
+    }
+}
+
+impl Default for FusionIndexState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// State for the text encoders used in semantic search.
 ///
 /// Each encoder is lazy-loaded on first use. We hold one slot per
@@ -149,7 +228,9 @@ pub fn run(db: ImageDatabase, db_path: String) {
         add_root, get_scan_root, list_roots, remove_root, set_root_enabled, set_scan_root,
     };
     use commands::semantic::semantic_search;
-    use commands::similarity::{get_similar_images, get_tiered_similar_images};
+    use commands::similarity::{
+        get_fused_similar_images, get_similar_images, get_tiered_similar_images,
+    };
     use commands::tags::{
         add_tag_to_image, create_tag, delete_tag, get_tags, remove_tag_from_image,
     };
@@ -170,6 +251,11 @@ pub fn run(db: ImageDatabase, db_path: String) {
         siglip2_encoder: Mutex::new(None),
     };
 
+    // Phase 5 — per-encoder fusion caches. Empty until the first
+    // get_fused_similar_images call asks for an encoder; lazy-populated
+    // from the same DB rows the primary CosineIndexState reads.
+    let fusion_state = FusionIndexState::new();
+
     // Single-flight guard for the indexing pipeline. Wrapped in Arc so
     // the .setup() callback (and later set_scan_root commands) can both
     // hand a clone to the indexing thread.
@@ -188,6 +274,7 @@ pub fn run(db: ImageDatabase, db_path: String) {
         .manage(db)
         .manage(cosine_state)
         .manage(text_encoder_state)
+        .manage(fusion_state)
         .manage(indexing_state.clone())
         .manage(watcher_state.clone())
         .setup({
@@ -364,6 +451,7 @@ pub fn run(db: ImageDatabase, db_path: String) {
             remove_tag_from_image,
             get_similar_images,
             get_tiered_similar_images,
+            get_fused_similar_images,
             semantic_search,
             get_scan_root,
             set_scan_root,

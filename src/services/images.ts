@@ -265,6 +265,37 @@ export async function fetchTieredSimilarImages(imageId: number, encoderId?: stri
 }
 
 /**
+ * Phase 5 — multi-encoder rank-fusion similarity.
+ *
+ * Calls every available encoder (CLIP + SigLIP-2 + DINOv2), gets each
+ * encoder's top-K similarity ranking, and fuses them via Reciprocal
+ * Rank Fusion. The fused output is naturally diverse (different
+ * encoders disagree about what's "similar") AND naturally relevant
+ * (consensus across encoders surfaces the genuinely best matches),
+ * which makes the previous tiered-random-sampling redundant.
+ *
+ * `topN` is how many fused results to return. The backend defaults
+ * `perEncoderTopK` to ~5×topN so each encoder contributes enough
+ * candidates to the fusion pool.
+ */
+export async function fetchFusedSimilarImages(
+  imageId: number,
+  topN: number = 30,
+  perEncoderTopK?: number
+) {
+  try {
+    const results: Parameters<typeof mapImageSearchResult>[0][] = await perfInvoke(
+      "get_fused_similar_images",
+      { imageId, topN, perEncoderTopK }
+    );
+    return results.map(mapImageSearchResult);
+  } catch (error) {
+    console.error("[Frontend] Error in fetchFusedSimilarImages:", error);
+    throw new Error(formatApiError(error));
+  }
+}
+
+/**
  * Semantic search: find images matching a text query using CLIP embeddings.
  * Supports 50+ languages thanks to the multilingual CLIP model.
  *

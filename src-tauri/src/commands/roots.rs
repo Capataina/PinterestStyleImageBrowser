@@ -9,7 +9,7 @@ use crate::indexing::{self, IndexingState};
 use crate::paths;
 use crate::root_struct::Root;
 use crate::settings;
-use crate::CosineIndexState;
+use crate::{CosineIndexState, FusionIndexState};
 
 /// Read the currently-configured scan root from settings.json, if any.
 /// Returns Ok(None) when no root has been picked yet (first-launch state).
@@ -31,6 +31,7 @@ pub fn set_scan_root(
     app: AppHandle,
     db: State<'_, ImageDatabase>,
     cosine_state: State<'_, CosineIndexState>,
+    fusion_state: State<'_, FusionIndexState>,
     indexing_state: State<'_, Arc<IndexingState>>,
     path: String,
 ) -> Result<(), ApiError> {
@@ -49,6 +50,10 @@ pub fn set_scan_root(
     db.add_root(path.clone())?;
 
     cosine_state.invalidate();
+    // Phase 5 — fusion caches contain entries from the now-removed
+    // root; clear so the next fusion call rebuilds against the new
+    // image set.
+    fusion_state.invalidate_all();
 
     indexing::try_spawn_pipeline(
         app.clone(),
@@ -108,6 +113,7 @@ pub fn add_root(
 pub fn remove_root(
     db: State<'_, ImageDatabase>,
     cosine_state: State<'_, CosineIndexState>,
+    fusion_state: State<'_, FusionIndexState>,
     id: i64,
 ) -> Result<(), ApiError> {
     db.remove_root(id)?;
@@ -129,6 +135,7 @@ pub fn remove_root(
     // way to clean is to drop the whole cache and let next-query
     // populate from the remaining DB rows.
     cosine_state.invalidate();
+    fusion_state.invalidate_all();
     info!("remove_root removed root id {}", id);
     Ok(())
 }
@@ -139,6 +146,7 @@ pub fn remove_root(
 pub fn set_root_enabled(
     db: State<'_, ImageDatabase>,
     cosine_state: State<'_, CosineIndexState>,
+    fusion_state: State<'_, FusionIndexState>,
     id: i64,
     enabled: bool,
 ) -> Result<(), ApiError> {
@@ -146,5 +154,6 @@ pub fn set_root_enabled(
     // Cosine cache may include images from the toggled root; clear so
     // the next similarity query rebuilds with the right active set.
     cosine_state.invalidate();
+    fusion_state.invalidate_all();
     Ok(())
 }

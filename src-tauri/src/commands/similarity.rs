@@ -5,7 +5,10 @@ use tracing::{debug, info, warn};
 use crate::commands::{resolve_image_id_for_cosine_path, ApiError, ImageSearchResult};
 use crate::db::ImageDatabase;
 use crate::perf;
-use crate::CosineIndexState;
+use crate::similarity_and_semantic_search::cosine::rrf::{
+    reciprocal_rank_fusion, RankedList, DEFAULT_K_RRF,
+};
+use crate::{CosineIndexState, FusionIndexState};
 
 /// Has the once-per-session cross-encoder comparison fired yet?
 /// Cross-encoder comparison is expensive (builds a temporary
@@ -104,6 +107,212 @@ fn run_cross_encoder_comparison(
             "note": "Fires once per session — first View-Similar after launch. Subsequent searches skip the cross-encoder cost.",
         }),
     );
+}
+
+/// Phase 5 — multi-encoder rank fusion for image-image similarity.
+///
+/// Replaces the tiered "1 of top 5, 5 of top 25" sampling strategy
+/// with Reciprocal Rank Fusion across every available encoder. The
+/// fused output naturally surfaces images that *all three* encoders
+/// agree are similar (CLIP for concept overlap + DINOv2 for visual
+/// structure + SigLIP-2 for descriptive content), which is both more
+/// accurate AND more diverse than any single-encoder ranking.
+///
+/// The user no longer pays the "we randomly skipped some good results
+/// to get diversity" tax — diversity emerges from inter-encoder
+/// disagreement on what counts as similar.
+///
+/// Implementation:
+/// 1. For each encoder family (CLIP, SigLIP-2, DINOv2): pull the
+///    query image's per-encoder embedding from the DB. Skip encoders
+///    that don't have an embedding for this image yet (graceful
+///    fallback — fusion still works with whichever encoders are
+///    indexed).
+/// 2. Score the query against that encoder's per-image embeddings
+///    via FusionIndexState.ranked_for_encoder, getting top-K.
+/// 3. Apply RRF over the 1-3 ranked lists to produce one fused list.
+/// 4. Resolve paths → image ids + thumbnails like the other similarity
+///    commands.
+///
+/// `top_n`: how many fused results to return.
+/// `per_encoder_top_k`: how many top results from each encoder to
+///   feed into the fusion. Defaults to `5 * top_n` (~150 for top_n=30)
+///   so the fusion has enough candidate diversity from each encoder.
+#[tauri::command]
+#[tracing::instrument(
+    name = "ipc.get_fused_similar_images",
+    skip(db, fusion_state),
+    fields(image_id, top_n, per_encoder_top_k)
+)]
+pub fn get_fused_similar_images(
+    db: State<'_, ImageDatabase>,
+    fusion_state: State<'_, FusionIndexState>,
+    image_id: i64,
+    top_n: usize,
+    per_encoder_top_k: Option<usize>,
+) -> Result<Vec<ImageSearchResult>, ApiError> {
+    use ndarray::Array1;
+    use std::path::PathBuf;
+
+    let per_encoder_top_k = per_encoder_top_k.unwrap_or(top_n.saturating_mul(5).max(50));
+    info!(
+        "get_fused_similar_images - image_id: {image_id}, top_n: {top_n}, \
+         per_encoder_top_k: {per_encoder_top_k}"
+    );
+
+    let started = std::time::Instant::now();
+    let all_images = db.get_all_images()?;
+    let exclude_path = all_images
+        .iter()
+        .find(|img| img.id == image_id)
+        .map(|img| PathBuf::from(&img.path));
+
+    // Encoder set is the same as cross_encoder_comparison —
+    // dinov2_small is the legacy 384-d id, excluded.
+    const FUSION_ENCODERS: &[&str] = &["clip_vit_b_32", "siglip2_base", "dinov2_base"];
+
+    let mut ranked_lists: Vec<RankedList> = Vec::with_capacity(FUSION_ENCODERS.len());
+    let mut per_encoder_diag: Vec<serde_json::Value> = Vec::new();
+
+    for enc in FUSION_ENCODERS {
+        let enc_started = std::time::Instant::now();
+        // Pull this encoder's embedding for the query image.
+        let q_emb = db.get_embedding(image_id, enc).ok();
+        let q_emb = match q_emb.filter(|v| !v.is_empty()) {
+            Some(v) => v,
+            None => {
+                per_encoder_diag.push(serde_json::json!({
+                    "encoder_id": enc,
+                    "status": "no_embedding_for_query_image",
+                    "elapsed_ms": enc_started.elapsed().as_millis() as u64,
+                }));
+                continue;
+            }
+        };
+        let q = Array1::from_vec(q_emb);
+        let ranked = fusion_state
+            .ranked_for_encoder(
+                &db,
+                enc,
+                &q,
+                per_encoder_top_k,
+                exclude_path.as_ref(),
+            )
+            .map_err(ApiError::Cosine)?;
+        let count = ranked.len();
+        if count == 0 {
+            per_encoder_diag.push(serde_json::json!({
+                "encoder_id": enc,
+                "status": "empty_ranked_list_for_encoder",
+                "elapsed_ms": enc_started.elapsed().as_millis() as u64,
+            }));
+            continue;
+        }
+        ranked_lists.push(RankedList {
+            encoder_id: (*enc).to_string(),
+            items: ranked.clone(),
+        });
+        per_encoder_diag.push(serde_json::json!({
+            "encoder_id": enc,
+            "status": "ok",
+            "ranked_count": count,
+            "top5_paths": ranked.iter().take(5)
+                .map(|(p, s)| serde_json::json!({"path": p.to_string_lossy(), "score": *s}))
+                .collect::<Vec<_>>(),
+            "elapsed_ms": enc_started.elapsed().as_millis() as u64,
+        }));
+    }
+
+    if ranked_lists.is_empty() {
+        info!("Fusion: no encoder produced a ranked list — returning empty");
+        return Ok(Vec::new());
+    }
+
+    let fused = reciprocal_rank_fusion(&ranked_lists, DEFAULT_K_RRF, top_n);
+
+    // Resolve paths → ImageSearchResult, with the same path-resolution
+    // + thumbnail-enrichment shape the other similarity commands use.
+    let mut resolution_misses: Vec<String> = Vec::new();
+    let mut thumb_misses: u32 = 0;
+    let results: Vec<ImageSearchResult> = fused
+        .iter()
+        .filter_map(|f| {
+            match resolve_image_id_for_cosine_path(&db, &f.path, Some(&all_images)) {
+                Some((id, final_path)) => {
+                    let thumb_info = db.get_image_thumbnail_info(id).ok().flatten();
+                    if thumb_info.is_none() {
+                        thumb_misses += 1;
+                    }
+                    let (thumbnail_path, width, height) = thumb_info
+                        .map(|(tp, w, h)| (Some(tp), Some(w), Some(h)))
+                        .unwrap_or((None, None, None));
+                    Some(ImageSearchResult {
+                        id,
+                        path: final_path,
+                        // The "score" surfaced to the frontend is the
+                        // fused RRF score. It's bounded roughly between
+                        // 0 and N_encoders × 1/(k+1) (≈ 0.05 for 3
+                        // encoders + k=60), not the [0,1] cosine range
+                        // the single-encoder paths return — frontends
+                        // that present this score should label it
+                        // "Fused" rather than "Cosine similarity".
+                        score: f.fused_score,
+                        thumbnail_path,
+                        width,
+                        height,
+                    })
+                }
+                None => {
+                    resolution_misses.push(f.path.to_string_lossy().into_owned());
+                    None
+                }
+            }
+        })
+        .collect();
+
+    perf::record_diagnostic(
+        "search_query",
+        serde_json::json!({
+            "type": "fused",
+            "top_n": top_n,
+            "per_encoder_top_k": per_encoder_top_k,
+            "k_rrf": DEFAULT_K_RRF,
+            "query_image_id": image_id,
+            "query_image_path": exclude_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+            "encoders_used": ranked_lists
+                .iter()
+                .map(|r| r.encoder_id.clone())
+                .collect::<Vec<_>>(),
+            "encoders_skipped": FUSION_ENCODERS.len() - ranked_lists.len(),
+            "fused_result_count": fused.len(),
+            "resolved_count": results.len(),
+            "thumbnail_misses": thumb_misses,
+            "missed_paths_sample":
+                resolution_misses.iter().take(10).cloned().collect::<Vec<_>>(),
+            "per_encoder": per_encoder_diag,
+            "fused_top10_with_evidence": fused.iter().take(10).map(|f| serde_json::json!({
+                "path": f.path.to_string_lossy(),
+                "fused_score": f.fused_score,
+                "per_encoder_evidence": f.per_encoder.iter().map(|(e, r, s)| serde_json::json!({
+                    "encoder_id": e,
+                    "rank": r,
+                    "encoder_score": s,
+                })).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+            "total_elapsed_ms": started.elapsed().as_millis() as u64,
+        }),
+    );
+
+    info!(
+        "get_fused_similar_images returning {} results (used {} encoders, {} ms)",
+        results.len(),
+        ranked_lists.len(),
+        started.elapsed().as_millis(),
+    );
+
+    Ok(results)
 }
 
 #[tauri::command]

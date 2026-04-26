@@ -219,6 +219,44 @@ describe("services/images", () => {
   });
 });
 
+describe("services/fusedSimilar", () => {
+  it("fetchFusedSimilarImages calls get_fused_similar_images with imageId + topN + perEncoderTopK", async () => {
+    // Phase 5 — replaces the tiered random-sampling system. Backend
+    // calls all three encoders (CLIP, SigLIP-2, DINOv2) and fuses
+    // the rankings via Reciprocal Rank Fusion.
+    const { fetchFusedSimilarImages } = await import("./images");
+    mockInvoke.mockResolvedValueOnce([]);
+    await fetchFusedSimilarImages(42, 30);
+    expect(mockInvoke).toHaveBeenCalledWith("get_fused_similar_images", {
+      imageId: 42,
+      topN: 30,
+      perEncoderTopK: undefined,
+    });
+  });
+
+  it("fetchFusedSimilarImages defaults topN to 30 when not supplied", async () => {
+    const { fetchFusedSimilarImages } = await import("./images");
+    mockInvoke.mockResolvedValueOnce([]);
+    await fetchFusedSimilarImages(7);
+    expect(mockInvoke).toHaveBeenCalledWith("get_fused_similar_images", {
+      imageId: 7,
+      topN: 30,
+      perEncoderTopK: undefined,
+    });
+  });
+
+  it("fetchFusedSimilarImages forwards perEncoderTopK when set", async () => {
+    const { fetchFusedSimilarImages } = await import("./images");
+    mockInvoke.mockResolvedValueOnce([]);
+    await fetchFusedSimilarImages(7, 30, 200);
+    expect(mockInvoke).toHaveBeenCalledWith("get_fused_similar_images", {
+      imageId: 7,
+      topN: 30,
+      perEncoderTopK: 200,
+    });
+  });
+});
+
 describe("services/tags", () => {
   it("createTag uses default colour when none provided", async () => {
     const { createTag } = await import("./tags");
