@@ -75,7 +75,19 @@ pub fn semantic_search(
         text_embedding.len()
     );
 
-    // Ensure cosine index is populated
+    // Force the cosine cache to hold CLIP-family image embeddings —
+    // we use ClipTextEncoder above, which produces 512-d vectors that
+    // only make sense compared against CLIP-family image embeddings
+    // (also 512-d). Without this, a previous "View Similar" call with
+    // DINOv2 (384-d) selected would have left the cache in a state
+    // where dot-producting against the 512-d text query crashes
+    // ndarray with a dim-mismatch panic.
+    //
+    // Future: when SigLIP-2 text dispatch is wired, this should
+    // pick the encoder matching the user's textEncoder setting.
+    cosine_state
+        .ensure_loaded_for(&db, "clip_vit_b_32")
+        .map_err(|e| ApiError::Cosine(e))?;
     let mut index = cosine_state.index.lock()?;
 
     if index.cached_images.is_empty() {

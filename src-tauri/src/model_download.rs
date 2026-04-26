@@ -32,7 +32,8 @@ use tracing::{debug, info, warn};
 use crate::paths;
 
 use crate::similarity_and_semantic_search::encoder_dinov2;
-use crate::similarity_and_semantic_search::encoder_siglip2;
+// encoder_siglip2 import removed alongside the SigLIP-2 download targets;
+// re-add when verified URLs land.
 
 /// Image encoder ONNX. Xenova/clip-vit-base-patch32 combined-graph export.
 const IMAGE_MODEL_URL: &str =
@@ -86,28 +87,20 @@ where
     // its own module (see encoder_siglip2.rs, encoder_dinov2.rs) so
     // fixes are localised.
     let targets = [
-        // CLIP family (existing — image, text, tokenizer)
+        // CLIP family (image, text, tokenizer)
         (IMAGE_MODEL_URL, IMAGE_MODEL_FILENAME),
         (TEXT_MODEL_URL, TEXT_MODEL_FILENAME),
         (TOKENIZER_URL, TOKENIZER_FILENAME),
-        // SigLIP-2 family (new — image, text, tokenizer)
-        (
-            encoder_siglip2::SIGLIP2_IMAGE_MODEL_URL,
-            encoder_siglip2::SIGLIP2_IMAGE_MODEL_FILENAME,
-        ),
-        (
-            encoder_siglip2::SIGLIP2_TEXT_MODEL_URL,
-            encoder_siglip2::SIGLIP2_TEXT_MODEL_FILENAME,
-        ),
-        (
-            encoder_siglip2::SIGLIP2_TOKENIZER_URL,
-            encoder_siglip2::SIGLIP2_TOKENIZER_FILENAME,
-        ),
-        // DINOv2 (new — image only, no text encoder, no tokenizer)
+        // DINOv2 (image only — no text encoder, no tokenizer)
         (
             encoder_dinov2::DINOV2_IMAGE_MODEL_URL,
             encoder_dinov2::DINOV2_IMAGE_MODEL_FILENAME,
         ),
+        // SigLIP-2 entries removed — both attempted URLs (Xenova,
+        // onnx-community) returned 401. Re-add once a verified
+        // ONNX export URL is available. The encoder_siglip2 module
+        // stays compiled (the URLs are still defined as constants
+        // there for future use).
     ];
 
     // Phase 1: figure out which files are missing and how big they are

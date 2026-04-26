@@ -28,28 +28,25 @@ pub struct EncoderInfo {
 const ENCODERS: &[EncoderInfo] = &[
     EncoderInfo {
         id: "clip_vit_b_32",
-        display_name: "CLIP ViT-B/32 (legacy)",
-        description: "OpenAI's original CLIP from 2021. Decent generalist; the multilingual text encoder supports 50+ languages but English quality is mediocre because it's a knowledge-distilled approximation. Superseded by SigLIP-2 on benchmarks but still works fine and is the default fallback.",
+        display_name: "CLIP ViT-B/32",
+        description: "OpenAI's CLIP via Xenova's ONNX export. The multilingual text encoder supports 50+ languages but English quality is mediocre because it's a knowledge-distilled approximation. Currently the only working text→image encoder (SigLIP-2 ONNX exports were 401-gated when checked).",
         dim: 512,
         supports_text: true,
         supports_image: true,
     },
     EncoderInfo {
-        id: "siglip2_base",
-        display_name: "SigLIP-2 Base (recommended for text→image)",
-        description: "Google's 2025 update to CLIP with sigmoid loss. Better text→image alignment than CLIP-multilingual on English content per ICCV/ICLR papers. Pair the SigLIP-2 text + image encoders together for best results. Uses SentencePiece tokenisation.",
-        dim: 768,
-        supports_text: true,
-        supports_image: true,
-    },
-    EncoderInfo {
         id: "dinov2_small",
-        display_name: "DINOv2 Small (recommended for image→image)",
-        description: "Meta's self-supervised image encoder. No text branch — image-only. Dominates CLIP/SigLIP at finding visually similar images: same person across photos, same character, similar pose, similar art style. 5× advantage on fine-grained image-image benchmarks. Best choice for the 'View Similar' feature.",
+        display_name: "DINOv2 Small",
+        description: "Meta's self-supervised image encoder. No text branch — image-only. Dominates CLIP at finding visually similar images: same person across photos, same character, similar pose, similar art style. 5× advantage on fine-grained image-image benchmarks. Recommended for the 'View Similar' feature.",
         dim: 384,
         supports_text: false,
         supports_image: true,
     },
+    // SigLIP-2 entry removed for now — the Xenova/siglip2-base-patch16-224
+    // and onnx-community/siglip2-base-patch16-224 URLs both 401'd when
+    // checked. The encoder_siglip2.rs code is still there (image + text
+    // encoders implementing the traits) so re-adding the entry is one
+    // line once a verified ONNX export URL is found.
 ];
 
 #[tauri::command]

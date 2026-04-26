@@ -18,6 +18,23 @@ pub(crate) fn score_cmp_desc(a: &(usize, f32), b: &(usize, f32)) -> std::cmp::Or
 
 // Function to compute cosine similarity between two embeddings
 pub(crate) fn cosine_similarity(a: &Array1<f32>, b: &Array1<f32>) -> f32 {
+    // Guard against dimension mismatch — ndarray::dot panics if the
+    // lengths differ. Returning 0.0 means "not similar" which is the
+    // safe semantic for cross-encoder vectors. This case happens when
+    // the cosine cache holds embeddings from one encoder (e.g. DINOv2,
+    // 384-d) and a query arrives from a different encoder (e.g. CLIP
+    // text, 512-d) — should be prevented by the dispatch layer
+    // (ensure_loaded_for) but defending here too means a code-path bug
+    // doesn't crash the app.
+    if a.len() != b.len() {
+        tracing::warn!(
+            "cosine_similarity dim mismatch: query={} cache={}; returning 0.0",
+            a.len(),
+            b.len()
+        );
+        return 0.0;
+    }
+
     let dot_product = a.dot(b);
     let norm_a = a.dot(a).sqrt();
     let norm_b = b.dot(b).sqrt();

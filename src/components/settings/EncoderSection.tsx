@@ -55,6 +55,23 @@ export function EncoderSection() {
     };
   }, []);
 
+  // Validate the saved encoder choice against the live options. Cleans
+  // up stale localStorage entries (e.g. the user picked SigLIP-2 in a
+  // previous session, then we removed it from the available list when
+  // the URL turned out to be 401-gated). Without this, picking an
+  // unknown encoder ID silently produces 0 search results.
+  useEffect(() => {
+    if (!encoders) return;
+    if (!encoders.find((e) => e.id === prefs.imageEncoder && e.supports_image)) {
+      const fallback = encoders.find((e) => e.supports_image);
+      if (fallback) update("imageEncoder", fallback.id);
+    }
+    if (!encoders.find((e) => e.id === prefs.textEncoder && e.supports_text)) {
+      const fallback = encoders.find((e) => e.supports_text);
+      if (fallback) update("textEncoder", fallback.id);
+    }
+  }, [encoders, prefs.imageEncoder, prefs.textEncoder, update]);
+
   if (error) {
     return (
       <Section title="Encoders">
