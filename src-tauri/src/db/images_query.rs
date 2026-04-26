@@ -11,9 +11,34 @@
 use std::collections::HashMap;
 
 use rusqlite::params_from_iter;
+use serde::Serialize;
 
 use super::{ID, ImageDatabase};
 use crate::{image_struct::ImageData, tag_struct::Tag};
+
+/// Pipeline progress snapshot — counts of images at each stage.
+///
+/// Returned by `get_pipeline_stats` and exposed to the frontend via
+/// the `get_pipeline_stats` Tauri command. Lets the user see at a
+/// glance how much work the indexing pipeline has done so far:
+/// how many images are catalogued, how many have thumbnails, how
+/// many have CLIP embeddings, how many are orphaned (file deleted
+/// from disk between launches).
+///
+/// All counts come from a single SELECT — it's one DB Mutex
+/// acquisition per call regardless of library size.
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+pub struct PipelineStats {
+    /// Every row in the `images` table (including orphaned).
+    pub total_images: i64,
+    /// Rows with a non-empty `thumbnail_path`.
+    pub with_thumbnail: i64,
+    /// Rows with a non-empty `embedding` BLOB.
+    pub with_embedding: i64,
+    /// Rows where the file was found missing on disk during the last
+    /// orphan-detection pass.
+    pub orphaned: i64,
+}
 
 /// Aggregate the standard "images LEFT JOIN images_tags LEFT JOIN tags"
 /// row shape into a Vec of `(id, path, tags, thumbnail_path, width, height)`.
@@ -333,6 +358,41 @@ impl ImageDatabase {
             Err(rusqlite::Error::QueryReturnedNoRows)
         }
     }
+
+    /// Snapshot of the pipeline's progress — total / with-thumbnail /
+    /// with-embedding / orphaned counts, all from one SELECT.
+    ///
+    /// SUM(CASE WHEN ... THEN 1 ELSE 0 END) collapses what would
+    /// otherwise be 4 separate COUNT queries into one full-table scan.
+    /// For ~10k image libraries the difference is small but the locking
+    /// story is cleaner — one Mutex acquire vs four.
+    pub fn get_pipeline_stats(&self) -> rusqlite::Result<PipelineStats> {
+        let conn = self.connection.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT
+                COUNT(*) AS total,
+                SUM(CASE
+                    WHEN thumbnail_path IS NOT NULL AND thumbnail_path != ''
+                    THEN 1 ELSE 0
+                END) AS with_thumbnail,
+                SUM(CASE
+                    WHEN embedding IS NOT NULL AND length(embedding) > 0
+                    THEN 1 ELSE 0
+                END) AS with_embedding,
+                SUM(CASE WHEN orphaned = 1 THEN 1 ELSE 0 END) AS orphaned
+            FROM images",
+        )?;
+        let row = stmt.query_row([], |row| {
+            Ok(PipelineStats {
+                total_images: row.get::<_, i64>(0)?,
+                // SUM returns NULL on empty tables, hence Option::unwrap_or(0)
+                with_thumbnail: row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                with_embedding: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                orphaned: row.get::<_, Option<i64>>(3)?.unwrap_or(0),
+            })
+        })?;
+        Ok(row)
+    }
 }
 
 #[cfg(test)]
@@ -349,6 +409,60 @@ mod tests {
 
         let images = db.get_images(vec![], "".to_string()).unwrap();
         assert_eq!(images.len(), 1);
+    }
+
+    #[test]
+    fn pipeline_stats_empty_db() {
+        let db = fresh_db();
+        let stats = db.get_pipeline_stats().unwrap();
+        assert_eq!(stats.total_images, 0);
+        assert_eq!(stats.with_thumbnail, 0);
+        assert_eq!(stats.with_embedding, 0);
+        assert_eq!(stats.orphaned, 0);
+    }
+
+    #[test]
+    fn pipeline_stats_counts_each_stage_independently() {
+        let db = fresh_db();
+
+        // 3 images total: img_a has both thumbnail + embedding,
+        // img_b has only thumbnail, img_c has neither.
+        db.add_image("/img_a.jpg".into(), None).unwrap();
+        db.add_image("/img_b.jpg".into(), None).unwrap();
+        db.add_image("/img_c.jpg".into(), None).unwrap();
+
+        // Add a thumbnail to img_a + img_b
+        let id_a = db.get_image_id_by_path("/img_a.jpg").unwrap();
+        let id_b = db.get_image_id_by_path("/img_b.jpg").unwrap();
+        db.update_image_thumbnail(id_a, std::path::Path::new("/thumb_a.jpg"), 100, 200)
+            .unwrap();
+        db.update_image_thumbnail(id_b, std::path::Path::new("/thumb_b.jpg"), 100, 200)
+            .unwrap();
+
+        // Add an embedding to img_a only
+        db.update_image_embedding(id_a, vec![0.1, 0.2, 0.3])
+            .unwrap();
+
+        let stats = db.get_pipeline_stats().unwrap();
+        assert_eq!(stats.total_images, 3);
+        assert_eq!(stats.with_thumbnail, 2, "thumbnail count");
+        assert_eq!(stats.with_embedding, 1, "embedding count");
+        assert_eq!(stats.orphaned, 0);
+    }
+
+    #[test]
+    fn pipeline_stats_counts_orphaned_separately() {
+        let db = fresh_db();
+        let r = db.add_root("/root".into()).unwrap();
+        db.add_image("/root/alive.jpg".into(), Some(r.id)).unwrap();
+        db.add_image("/root/dead.jpg".into(), Some(r.id)).unwrap();
+        // Mark dead.jpg as orphan (not in alive set).
+        db.mark_orphaned(r.id, &["/root/alive.jpg".to_string()])
+            .unwrap();
+
+        let stats = db.get_pipeline_stats().unwrap();
+        assert_eq!(stats.total_images, 2);
+        assert_eq!(stats.orphaned, 1);
     }
 
     #[test]

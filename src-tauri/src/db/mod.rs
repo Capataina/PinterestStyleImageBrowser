@@ -14,7 +14,7 @@
 use std::sync::Mutex;
 
 mod embeddings;
-mod images_query;
+pub mod images_query;
 mod notes_orphans;
 mod roots;
 mod schema_migrations;
