@@ -40,6 +40,25 @@ notify-debouncer-mini = { version = "0.7", default-features = false }
 bytemuck = "1.25.0"
 tokenizers = "0.22.2"
 
+# R6 perf: NEON-optimised image resize. Replaces image::imageops::resize
+# in the thumbnail generator (was the dominant cost in the thumbnail
+# pipeline at ~256 ms/image; published ARM64 numbers show 7-13× speedup
+# over the image crate at the same Lanczos3 quality). The `image` feature
+# enables IntoImageView for image::DynamicImage so the adapter is one
+# call. Version 6.x is the current release as of 2026-01.
+fast_image_resize = { version = "6", features = ["image"] }
+
+# R7 perf: explicit jpeg-decoder dependency (image crate already pulls
+# it transitively, but exposing it directly lets us call Decoder::scale()
+# for native scaled IDCT before the resize step. For 6000×3376 → 400×400
+# thumbnails this saves ~95% of the IDCT work.
+jpeg-decoder = "0.3"
+
+# Phase 7 diagnostics: 1 Hz process RSS / CPU sampling under --profile.
+# `sysinfo` is the cross-platform crate that abstracts over
+# /proc on Linux, mach on macOS, PSAPI on Windows.
+sysinfo = { version = "0.32", default-features = false, features = ["system"] }
+
 # Platform-gated ONNX Runtime so each OS pulls in only the execution
 # providers it can actually use:
 #

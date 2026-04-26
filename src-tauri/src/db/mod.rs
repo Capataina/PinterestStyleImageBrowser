@@ -264,6 +264,24 @@ impl ImageDatabase {
              ON embeddings(encoder_id);",
             [],
         )?;
+        // R9 — composite index on (root_id, orphaned). Every foreground
+        // SELECT against `images` that powers the grid filters by both
+        // (`orphaned = 0 AND (root_id IS NULL OR root_id IN (...))`).
+        // Without this, SQLite full-scans the images table; once
+        // libraries grow past a few thousand rows the scan cost
+        // becomes visible inside `get_images.row_iter` (one of the
+        // Batch 3 subspans) as the dominant component of the
+        // foreground SELECT. NULL root_id rows still match this index
+        // — SQLite indexes nulls in composite indexes since it can use
+        // the index even when the leading column is NULL. (root_id
+        // first means the OR-NULL branch and the IN-list branch both
+        // benefit; orphaned second means we still get a scan range
+        // narrowing for the `orphaned = 0` predicate.)
+        self.connection.lock().unwrap().execute(
+            "CREATE INDEX IF NOT EXISTS idx_images_root_orphaned
+             ON images(root_id, orphaned);",
+            [],
+        )?;
 
         // One-shot embedding-pipeline invalidation. Runs AFTER the
         // embeddings table is created (it issues DELETE against that

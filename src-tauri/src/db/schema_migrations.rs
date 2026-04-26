@@ -81,7 +81,24 @@ impl ImageDatabase {
     /// Bump `CURRENT_PIPELINE_VERSION` whenever a future change
     /// invalidates existing embeddings.
     pub(super) fn migrate_embedding_pipeline_version(&self) -> rusqlite::Result<()> {
-        const CURRENT_PIPELINE_VERSION: i64 = 2;
+        // Version 3 — bumped 2026-04-26 with the Tier-1 + Tier-2 perf
+        // bundle. The R6 fast_image_resize swap changes the resize
+        // backend (image-rs CatmullRom → fast_image_resize Lanczos3);
+        // R7 changes the JPEG decode path (full decode → scaled IDCT
+        // for JPEGs). Both produce subtly different RGB buffers than
+        // the previous code, which means thumbnails AND any encoder
+        // reading from those preprocessed buffers will produce
+        // slightly different embeddings. Easier to wipe and re-encode
+        // than to live with a hybrid library where some embeddings
+        // came from the old buffers and some from the new.
+        //
+        // R8 also lands here: the legacy images.embedding column is
+        // no longer written by the encoder pipeline (CLIP only writes
+        // to the per-encoder embeddings table). The bump triggers a
+        // wipe of the legacy column so the cosine populate fallback
+        // (cosine/index.rs) sees an empty legacy column and reads only
+        // the per-encoder rows.
+        const CURRENT_PIPELINE_VERSION: i64 = 3;
 
         let conn = self.connection.lock().unwrap();
 

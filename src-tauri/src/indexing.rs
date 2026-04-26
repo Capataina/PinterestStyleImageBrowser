@@ -714,13 +714,13 @@ fn run_clip_encoder(
                     }
                 }
                 // R1 — single-transaction batch write of every row in
-                // this chunk. Replaces the previous per-row
-                // update_image_embedding + upsert_embedding pair (each
-                // its own implicit transaction → fsync) with one
-                // BEGIN IMMEDIATE … COMMIT round-trip. legacy_clip_too
-                // = true so the CLIP path keeps writing the legacy
-                // images.embedding column for back-compat with
-                // semantic_search.
+                // this chunk. R8 — legacy_clip_too = false: we no
+                // longer double-write to the legacy images.embedding
+                // column. The schema bump to pipeline version 3 wipes
+                // any stale legacy data, so the cosine populate
+                // fallback path (cosine/index.rs) just sees an empty
+                // legacy column on first re-index and reads from the
+                // per-encoder embeddings table only.
                 let batch_rows: Vec<(crate::db::ID, Vec<f32>)> = chunk
                     .iter()
                     .zip(embeddings.iter())
@@ -730,7 +730,7 @@ fn run_clip_encoder(
                 match database.upsert_embeddings_batch(
                     "clip_vit_b_32",
                     &batch_rows,
-                    true,
+                    false,
                 ) {
                     Ok(()) => succeeded += row_count,
                     Err(e) => {
