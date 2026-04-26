@@ -29,8 +29,19 @@ pub struct CosineIndexState {
     /// Wrapped in Arc<Mutex<...>> rather than plain Mutex<...> so the
     /// indexing thread (Pass 5) can hold a clone alongside the Tauri-
     /// managed state. Both point at the same in-memory cache.
+    ///
+    /// The cache holds embeddings from ONE encoder at a time —
+    /// whichever the user's `imageEncoder` setting selects. When the
+    /// setting changes, the cache is wiped + repopulated from the
+    /// embeddings table for the new encoder. Repopulate is fast
+    /// because the embeddings are already on disk; only the new
+    /// encoder's embeddings need DB → memory transfer.
     pub index: Arc<Mutex<CosineIndex>>,
     pub db_path: String,
+    /// The encoder_id whose embeddings are currently loaded into
+    /// `index`. Empty string when uninitialised. Read at search-time
+    /// to detect stale cache after a settings change.
+    pub current_encoder_id: Arc<Mutex<String>>,
 }
 
 /// State for the text encoder used in semantic search
@@ -57,9 +68,11 @@ pub fn run(db: ImageDatabase, db_path: String) {
     };
 
     let cosine_index = Arc::new(Mutex::new(CosineIndex::new()));
+    let current_encoder_id = Arc::new(Mutex::new(String::new()));
     let cosine_state = CosineIndexState {
         index: cosine_index.clone(),
         db_path: db_path.clone(),
+        current_encoder_id: current_encoder_id.clone(),
     };
 
     // Text encoder state (lazy-loaded on first semantic search).

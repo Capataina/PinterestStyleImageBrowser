@@ -32,6 +32,46 @@ impl CosineIndex {
         self.cached_images.push((path, embedding));
     }
 
+    /// Populate the in-memory index from the per-encoder embeddings
+    /// table, picking only rows for the given encoder_id.
+    ///
+    /// Used by the encoder-picker dispatch: when the user switches
+    /// the chosen image encoder, the cache is wiped and repopulated
+    /// from this method. The on-disk embeddings stay intact (one row
+    /// per (image_id, encoder_id)) so swapping back to a previously-
+    /// used encoder is instant — the embeddings are already there.
+    #[tracing::instrument(name = "cosine.populate_for_encoder", skip(self, db))]
+    pub fn populate_from_db_for_encoder(
+        &mut self,
+        db: &db::ImageDatabase,
+        encoder_id: &str,
+    ) {
+        let start = Instant::now();
+        info!("populate_from_db_for_encoder({encoder_id})");
+        let rows = match db.get_all_embeddings_for(encoder_id) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("populate_from_db_for_encoder({encoder_id}) failed: {e}");
+                return;
+            }
+        };
+        let total = rows.len();
+        self.cached_images.clear();
+        self.cached_images.reserve(total);
+        for (_id, path, embedding) in rows {
+            if embedding.is_empty() {
+                continue;
+            }
+            self.cached_images
+                .push((PathBuf::from(path), Array1::from_vec(embedding)));
+        }
+        info!(
+            "populate_for_encoder({encoder_id}) done: {} embeddings in {:?}",
+            self.cached_images.len(),
+            start.elapsed()
+        );
+    }
+
     /// Populate the in-memory index by SELECTing every embedding in one
     /// query.
     ///

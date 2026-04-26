@@ -508,36 +508,139 @@ fn run_encoder_phase(
     db_path: &str,
     image_model_path: &Path,
 ) -> Result<(), String> {
-    // Returns Result<_, String> rather than the trait-object error
-    // type so the JoinHandle is Send (the encoder library's error
-    // boxes aren't Send + Sync everywhere). String loses some
-    // structure but the encoder phase is a leaf — failure is logged
-    // by the caller via tracing::warn!, no further dispatch.
+    // Encodes through three image encoders sequentially:
+    //   1. CLIP-ViT-B/32 (legacy default, also written to images.embedding
+    //      for backward compatibility with semantic_search's existing
+    //      get_image_embedding call site)
+    //   2. SigLIP-2-Base (new, for users who pick it in Settings)
+    //   3. DINOv2-Small (new, for "View Similar" — image-image specialist)
+    //
+    // Each encoder's results land in the embeddings table keyed by
+    // (image_id, encoder_id), so swapping encoders in Settings doesn't
+    // require re-encoding.
+    //
+    // Sequential rather than parallel because each encoder is single-
+    // threaded ONNX inference — running them all in parallel would
+    // contend on the same CPU cores. Future optimisation: use rayon's
+    // pool to interleave preprocessing across encoders.
     let _encode_phase = tracing::info_span!("pipeline.encode_phase").entered();
 
     let database = ImageDatabase::new(db_path).map_err(|e| e.to_string())?;
+
+    // 1. CLIP — legacy column + new embeddings table.
+    run_clip_encoder(app, &database, image_model_path)?;
+
+    // 2. SigLIP-2 — new embeddings table only.
+    let siglip2_path = paths::models_dir().join(
+        crate::similarity_and_semantic_search::encoder_siglip2::SIGLIP2_IMAGE_MODEL_FILENAME,
+    );
+    if siglip2_path.exists() {
+        run_trait_encoder(
+            app,
+            &database,
+            "siglip2_base",
+            || crate::similarity_and_semantic_search::encoder_siglip2::Siglip2ImageEncoder::new(&siglip2_path),
+        )?;
+    } else {
+        warn!("SigLIP-2 image model missing at {}; skipping", siglip2_path.display());
+    }
+
+    // 3. DINOv2 — new embeddings table only.
+    let dinov2_path = paths::models_dir().join(
+        crate::similarity_and_semantic_search::encoder_dinov2::DINOV2_IMAGE_MODEL_FILENAME,
+    );
+    if dinov2_path.exists() {
+        run_trait_encoder(
+            app,
+            &database,
+            "dinov2_small",
+            || crate::similarity_and_semantic_search::encoder_dinov2::Dinov2ImageEncoder::new(&dinov2_path),
+        )?;
+    } else {
+        warn!("DINOv2 image model missing at {}; skipping", dinov2_path.display());
+    }
+
+    Ok(())
+}
+
+/// CLIP encoder phase — writes BOTH the legacy `images.embedding`
+/// column (kept for backward-compat with semantic_search's existing
+/// reader) AND the new `embeddings` table row keyed by encoder_id.
+/// This double-write goes away in a future migration once everyone
+/// has re-indexed.
+fn run_clip_encoder(
+    app: &AppHandle,
+    database: &ImageDatabase,
+    model_path: &Path,
+) -> Result<(), String> {
     let needs_embed = database
         .get_images_without_embeddings()
         .map_err(|e| e.to_string())?;
-    let total_embed = needs_embed.len();
-    if total_embed == 0 {
+    let total = needs_embed.len();
+    if total == 0 {
         return Ok(());
     }
-    emit(app, Phase::Encode, 0, total_embed, None);
+    emit(app, Phase::Encode, 0, total, Some("Encoding (CLIP)".into()));
 
-    let mut encoder = ClipImageEncoder::new(image_model_path).map_err(|e| e.to_string())?;
+    let mut encoder = ClipImageEncoder::new(model_path).map_err(|e| e.to_string())?;
     const BATCH_SIZE: usize = 32;
     let mut processed = 0usize;
     for chunk in needs_embed.chunks(BATCH_SIZE) {
         let batch_paths: Vec<&Path> = chunk.iter().map(|i| Path::new(&i.path)).collect();
         let embeddings = encoder.encode_batch(&batch_paths).map_err(|e| e.to_string())?;
         for (image, embedding) in chunk.iter().zip(embeddings.iter()) {
+            // Legacy column (semantic_search still reads this).
             database
                 .update_image_embedding(image.id, embedding.clone())
                 .map_err(|e| e.to_string())?;
+            // New per-encoder table.
+            database
+                .upsert_embedding(image.id, "clip_vit_b_32", embedding)
+                .map_err(|e| e.to_string())?;
         }
         processed += chunk.len();
-        emit(app, Phase::Encode, processed, total_embed, None);
+        emit(app, Phase::Encode, processed, total, Some("Encoding (CLIP)".into()));
+    }
+    Ok(())
+}
+
+/// Generic per-encoder loop using the ImageEncoder trait. Used for
+/// SigLIP-2 + DINOv2; each writes only to the new embeddings table.
+fn run_trait_encoder<F, E>(
+    app: &AppHandle,
+    database: &ImageDatabase,
+    encoder_id: &str,
+    make_encoder: F,
+) -> Result<(), String>
+where
+    F: FnOnce() -> Result<E, Box<dyn std::error::Error>>,
+    E: crate::similarity_and_semantic_search::encoders::ImageEncoder,
+{
+    use std::path::Path as StdPath;
+    let needs = database
+        .get_images_without_embedding_for(encoder_id)
+        .map_err(|e| e.to_string())?;
+    let total = needs.len();
+    if total == 0 {
+        return Ok(());
+    }
+    let label = format!("Encoding ({encoder_id})");
+    emit(app, Phase::Encode, 0, total, Some(label.clone()));
+
+    let mut encoder = make_encoder().map_err(|e| e.to_string())?;
+    let mut processed = 0usize;
+    // Trait default `encode_batch` falls back to one-by-one. Future:
+    // override per encoder if batching is faster.
+    for chunk in needs.chunks(32) {
+        let paths: Vec<&StdPath> = chunk.iter().map(|(_, p)| StdPath::new(p)).collect();
+        let embeddings = encoder.encode_batch(&paths).map_err(|e| e.to_string())?;
+        for ((id, _path), embedding) in chunk.iter().zip(embeddings.iter()) {
+            database
+                .upsert_embedding(*id, encoder_id, embedding)
+                .map_err(|e| e.to_string())?;
+        }
+        processed += chunk.len();
+        emit(app, Phase::Encode, processed, total, Some(label.clone()));
     }
     Ok(())
 }
