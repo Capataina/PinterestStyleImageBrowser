@@ -379,8 +379,7 @@ impl ImageDatabase {
     /// from the legacy `images.embedding` column for users who
     /// haven't re-indexed under the new schema yet — `OR` the
     /// embeddings table if they have), `siglip2_base`, and
-    /// `dinov2_small`. Adding new encoders means appending to this
-    /// list.
+    /// `dinov2_base`. Adding new encoders means appending to this list.
     pub fn get_pipeline_stats(&self) -> rusqlite::Result<PipelineStats> {
         let conn = self.connection.lock().unwrap();
 
@@ -409,8 +408,12 @@ impl ImageDatabase {
         })?;
         drop(stmt);
 
-        // Per-encoder counts from the new embeddings table.
-        let known_encoders = ["clip_vit_b_32", "siglip2_base", "dinov2_small"];
+        // Per-encoder counts from the new embeddings table. The legacy
+        // `dinov2_small` ID is intentionally NOT in this list — the
+        // pipeline-version 2 migration deletes any rows under that ID
+        // on first launch, so listing it here just produced a permanent
+        // "DINOv2 0/N" duplicate row in the Settings drawer.
+        let known_encoders = ["clip_vit_b_32", "siglip2_base", "dinov2_base"];
         let mut counts: Vec<EncoderEmbeddingCount> = Vec::with_capacity(known_encoders.len());
         for encoder_id in known_encoders {
             let mut stmt = conn.prepare(

@@ -1,30 +1,63 @@
+---
+name: CLIP preprocessing decisions
+description: History and current state of CLIP image-encoder preprocessing — what was wrong, what was fixed, what the trade-offs were
+type: project
+---
+
 # clip-preprocessing-decisions
 
-## Current Understanding
+## Current state (2026-04-26)
 
-The CLIP image encoder's preprocessing has two known quality concerns that are intentional shortcuts, not unexamined defaults:
+CLIP image preprocessing now matches the canonical OpenAI / Xenova
+pipeline:
 
-| Step | Current value | Reference CLIP | Source |
-|------|---------------|----------------|--------|
-| Resize filter | `FilterType::Nearest` | Bicubic / Lanczos | `encoder.rs:69` |
-| Per-channel mean | `[0.485, 0.456, 0.406]` (ImageNet) | `[0.48145466, 0.4578275, 0.40821073]` (CLIP) | `encoder.rs:91` |
-| Per-channel std | `[0.229, 0.224, 0.225]` (ImageNet) | `[0.26862954, 0.26130258, 0.27577711]` (CLIP) | `encoder.rs:92` |
+| Step | Value | Source |
+|------|-------|--------|
+| Resize filter | `FilterType::CatmullRom` (bicubic-family — closest match to PIL's `BICUBIC`) | `encoder.rs` |
+| Resize geometry | Aspect-preserving shortest-edge → 224, then center-crop 224×224 | `encoder.rs` |
+| Per-channel mean | `[0.48145466, 0.4578275, 0.40821073]` (CLIP-native) | `encoder.rs` |
+| Per-channel std | `[0.26862954, 0.26130258, 0.27577711]` (CLIP-native) | `encoder.rs` |
+| L2 normalize on output | yes | `encoder.rs` |
 
-The author's inline comment at `encoder.rs:90` reads: "CLIP-style normalization, we use IMGNET stats here." The substitution is acknowledged in code.
+Replaced the prior `resize_exact(224, 224)` + `Lanczos3` + ImageNet
+mean/std + no-output-normalize pipeline. The migration
+`migrate_embedding_pipeline_version` (version 2) wipes legacy CLIP
+embeddings on first launch so the next indexing pass re-encodes
+under the new pipeline.
 
-## Rationale
+## Why the old pipeline was a problem
 
-The current preprocessing produces *useful* embeddings — semantic search returns sensible matches and visual similarity finds meaningfully similar images. The accuracy delta vs reference CLIP has not been measured. Running the same image through this pipeline and an OpenAI reference would produce two embedding vectors with cosine similarity near but not identical to 1.0; the resulting semantic-search ranking would be similar but not identical.
+- **`resize_exact(224, 224)` squashed non-square images** — CLIP was
+  trained on aspect-preserving resize + center-crop. Embeddings of
+  squashed images shifted away from what reference CLIP would
+  produce.
+- **ImageNet mean/std subtly skewed normalization** — every channel's
+  mean/std differed from the values CLIP was trained on, biasing
+  the embedding distribution.
+- **No L2 normalize** meant cosine had to divide by norms every call;
+  worked but masked the fact that the embedding magnitudes drifted
+  off the unit sphere.
 
-The trade-off accepted: visible quality is acceptable for the personal-library use case; engineering cost (one minute of changes) is small but the verification cost (build a comparison harness) is non-trivial, so the change has been deferred.
+## What replaced it (and what stayed open)
 
-## Guiding Principles
+Fixed: bicubic-family resize, aspect-preserving geometry,
+CLIP-native normalization stats, L2-normalize output. These are now
+consistent with `Xenova/clip-vit-base-patch32`'s
+`preprocessor_config.json`.
 
-- This is the cheapest known quality win in the codebase. When the next session decides to invest in embedding quality, swap both: `FilterType::Lanczos3` and the CLIP-native mean/std.
-- After swapping, validate by encoding a known image and comparing cosine similarity vs a Python reference — the answer should be ≥ 0.999.
-- If the cosine drops below that, there is a deeper preprocessing mismatch (most likely the ONNX export baked in normalisation in a way the export doesn't show).
-- Do not silently change one without the other — the two are paired choices.
+**Still open:** the center-crop step itself drops everything outside
+the central 224×224 region. For images where meaningful content
+sits at the edges (splash arts with edge scenery, group photos,
+landscapes with foreground at the bottom), the encoder never sees
+that content. See `preprocessing-spatial-coverage.md` for the
+concern and possible directions.
 
-## What Was Tried
+## Validation
 
-Nothing in version control changed these values. The `Nearest` filter was the original choice from the first encoder commit; the ImageNet stats appear to be a copy-paste from a generic image-classification reference rather than a CLIP-specific one. The author noted the choice but did not revisit.
+The diagnostic stack now emits `preprocessing_sample` (per-encoder
+first-image L2 norm + range + NaN counts), `embedding_stats`
+(per-encoder L2-norm distribution across the cache), and
+`pairwise_distance_distribution` (50-sample histogram). These
+together replace the "build a comparison harness vs Python
+reference" deferred work — quality issues surface in the report
+without a separate validation tool.

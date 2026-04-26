@@ -74,7 +74,7 @@ export function StatsSection() {
         return "CLIP";
       case "siglip2_base":
         return "SigLIP-2";
-      case "dinov2_small":
+      case "dinov2_base":
         return "DINOv2";
       default:
         return id;

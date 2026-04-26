@@ -1,162 +1,248 @@
 # tauri-commands
 
-*Maturity: working*
+*Maturity: comprehensive*
 
 ## Scope / Purpose
 
-The IPC surface between the React frontend and the Rust backend. Owns: state management lifecycle (`tauri::Builder::manage`), Windows-extended-path normalisation, and the multi-strategy fallback that maps cosine-result paths back to DB ids. Eight command handlers live in this layer.
+The IPC surface between the React frontend and the Rust backend. Owns the 22-command handler layer (grouped by concern under `commands/`), the typed `ApiError` discriminated union that flows over the wire, the unified `ImageSearchResult` shape returned by every cosine/semantic command, the lazy text-encoder init in `commands::semantic`, and the `resolve_image_id_for_cosine_path` helper that maps cosine-result paths back to DB ids via three lookup strategies.
+
+This used to be all of `lib.rs` (918 lines). After the audit Modularisation finding it lives in `src-tauri/src/commands/` with one submodule per concern; `lib.rs` is now 232 lines (state types + `run()` + on-Exit perf-report hook only).
 
 ## Boundaries / Ownership
 
-- **Owns:** `#[tauri::command]` handler bodies, `State<'_, ImageDatabase>`/`State<'_, CosineIndexState>`/`State<'_, TextEncoderState>` injection, `map_err(|e| e.to_string())` boundary, the path-normalisation closure (currently triplicated).
-- **Does not own:** SQL (delegates to `database`), cosine math (delegates to `cosine-similarity`), encoding (delegates to the encoder modules).
-- **Public API (the 8 commands):**
+- **Owns:** `#[tauri::command]` handler bodies for all 22 commands, the typed-error `ApiError` enum + From-impls + JSON wire shape, `ImageSearchResult` (the unified return type), `resolve_image_id_for_cosine_path` helper, the lazy + pre-warmed text-encoder lifecycle, the cosine cache invalidation pattern on root mutations.
+- **Does not own:** SQL (delegates to `db/`), cosine math (delegates to `cosine/`), encoding (delegates to `encoder` and `encoder_text`), path stripping (delegates to `paths::strip_windows_extended_prefix`), the indexing pipeline (delegates to `indexing::try_spawn_pipeline`), settings reading (delegates to `settings::Settings`).
+- **Public API (the 22 commands):**
 
-| Command | Inputs | Output | Implementation |
-|---------|--------|--------|----------------|
-| `get_images` | `filter_tag_ids: Vec<i64>`, `filter_string: String` | `Vec<ImageData>` | Delegates to `db.get_images_with_thumbnails`. `filter_string` is unused on the backend; preserved as cache-key on the frontend. |
-| `get_tags` | – | `Vec<Tag>` | `db.get_tags()` |
-| `create_tag` | `name: String`, `color: String` | `Tag` | `db.create_tag(name, color)` |
-| `add_tag_to_image` | `image_id: i64`, `tag_id: i64` | `()` | `db.add_tag_to_image(...)`. `INSERT` (not `OR IGNORE`) — duplicate assignment errors. |
-| `remove_tag_from_image` | `image_id: i64`, `tag_id: i64` | `()` | `db.remove_tag_from_image(...)` |
-| `get_similar_images` | `image_id: i64`, `top_n: usize` | `Vec<SimilarImage{id, path, score}>` | Cosine `get_similar_images` with diversity sampling; multi-strategy DB-id mapping. |
-| `get_tiered_similar_images` | `image_id: i64` | `Vec<SimilarImage>` | Cosine `get_tiered_similar_images` (7-tier); multi-strategy DB-id mapping. |
-| `semantic_search` | `query: String`, `top_n: usize` | `Vec<SemanticSearchResult{id, path, score, thumbnail_path?, width?, height?}>` | Lazy-init text encoder → `cosine.get_similar_images_sorted` → enrich with thumbnail info. |
+| Command | Inputs | Output | Where |
+|---------|--------|--------|-------|
+| `get_images` | `filter_tag_ids: Vec<i64>`, `filter_string: String`, `match_all_tags: Option<bool>` | `Vec<ImageData>` | `commands/images.rs` |
+| `get_tags` | – | `Vec<Tag>` | `commands/tags.rs` |
+| `create_tag` | `name: String`, `color: String` | `Tag` | `commands/tags.rs` |
+| `delete_tag` | `tag_id: i64` | `()` | `commands/tags.rs` |
+| `add_tag_to_image` | `image_id: i64`, `tag_id: i64` | `()` | `commands/tags.rs` |
+| `remove_tag_from_image` | `image_id: i64`, `tag_id: i64` | `()` | `commands/tags.rs` |
+| `get_similar_images` | `image_id: i64`, `top_n: usize` | `Vec<ImageSearchResult>` | `commands/similarity.rs` |
+| `get_tiered_similar_images` | `image_id: i64` | `Vec<ImageSearchResult>` | `commands/similarity.rs` |
+| `semantic_search` | `query: String`, `top_n: usize` | `Vec<ImageSearchResult>` | `commands/semantic.rs` |
+| `get_image_notes` | `image_id: i64` | `Option<String>` | `commands/notes.rs` |
+| `set_image_notes` | `image_id: i64`, `notes: String` | `()` | `commands/notes.rs` |
+| `get_scan_root` | – | `Option<String>` | `commands/roots.rs` (legacy compat) |
+| `set_scan_root` | `path: String` | `()` | `commands/roots.rs` (replace-all semantic) |
+| `list_roots` | – | `Vec<Root>` | `commands/roots.rs` |
+| `add_root` | `path: String` | `Root` | `commands/roots.rs` |
+| `remove_root` | `id: i64` | `()` | `commands/roots.rs` |
+| `set_root_enabled` | `id: i64`, `enabled: bool` | `()` | `commands/roots.rs` |
+| `is_profiling_enabled` | – | `bool` | `commands/profiling.rs` |
+| `get_perf_snapshot` | – | `PerfSnapshot` | `commands/profiling.rs` |
+| `reset_perf_stats` | – | `Result<(), String>` | `commands/profiling.rs` |
+| `export_perf_snapshot` | – | `Result<String, String>` (returns absolute path) | `commands/profiling.rs` |
+| `record_user_action` | `action: String`, `payload: serde_json::Value` | `()` | `commands/profiling.rs` |
 
-Source: `lib.rs:49-621`. Handler registration is at `lib.rs:612-621`.
+Every command except the three profiling escape-hatches returns `Result<T, ApiError>`. Handler registration is at `lib.rs:171-194`.
 
 ## Current Implemented Reality
 
-### Three Tauri-managed state objects
+### `commands/` submodule layout
 
-```rust
-tauri::Builder::default()
-    .manage(db)                  // ImageDatabase
-    .manage(cosine_state)        // CosineIndexState  { index: Mutex<CosineIndex>, db_path: String }
-    .manage(text_encoder_state)  // TextEncoderState  { encoder: Mutex<Option<TextEncoder>> }
+```
+src-tauri/src/commands/
+├── mod.rs        — module re-exports + ImageSearchResult struct + resolve_image_id_for_cosine_path helper
+├── error.rs      — pub enum ApiError + Display + std::error::Error + From<rusqlite::Error> +
+│                    From<std::io::Error> + From<std::sync::PoisonError<T>> + 5 unit tests
+├── images.rs     — get_images
+├── tags.rs       — 5 tag commands
+├── notes.rs      — get_image_notes, set_image_notes
+├── roots.rs      — 6 root + scan-root commands; cosine cache invalidation on every mutation
+├── similarity.rs — get_similar_images, get_tiered_similar_images
+├── semantic.rs   — semantic_search (with lazy text-encoder fallback)
+└── profiling.rs  — 5 profiling escape-hatch commands
 ```
 
-`lib.rs:597-611`. Each command takes the state via `State<'_, T>`.
-
-### Lazy text-encoder init
-
-The text encoder is the heaviest resource (an ONNX session + a tokenizer vocab). It is created lazily on first semantic search:
+### `ApiError` typed wire format
 
 ```rust
-if encoder_lock.is_none() {
-    if !model_path.exists() { return Err(format!("Text model not found at: {}", ...)); }
-    if !tokenizer_path.exists() { return Err(format!("Tokenizer not found at: {}", ...)); }
-    *encoder_lock = Some(TextEncoder::new(model_path, tokenizer_path)?);
+#[derive(Debug, Serialize, Clone)]
+#[serde(tag = "kind", content = "details", rename_all = "snake_case")]
+pub enum ApiError {
+    TokenizerMissing(String),
+    TextModelMissing(String),
+    ImageModelMissing(String),
+    Db(String),
+    Encoder(String),
+    Cosine(String),
+    NotFound(String),
+    BadInput(String),
+    Io(String),
+    Internal(String),
 }
 ```
 
-`lib.rs:114-142`. The `Option` wrapper is what allows a `Mutex<Option<...>>` to be created at app start without paying the model-load cost upfront. A side effect is that a missing `tokenizer.json` only manifests as an error on the first semantic-search query, not at app startup.
+`commands/error.rs:35-76`. The `#[serde(tag, content, rename_all = "snake_case")]` attribute pins the JSON wire shape. Adding a new variant is forward-compatible: the frontend handles unknown kinds via the default case in its switch.
 
-### Path normalisation — the triplicated closure
-
-The cosine module returns `Vec<(PathBuf, f32)>`. Mapping `PathBuf` back to a DB id requires the path to look identical to whatever the DB stored — but the DB may have stored a regular path while cosine constructed it with a Windows-extended `\\?\` prefix.
-
-The closure that strips that prefix is **defined inline** inside three commands:
-
-- `semantic_search` at `lib.rs:182-188`
-- `get_similar_images` at `lib.rs:467-475`
-- `get_tiered_similar_images` at `lib.rs:308-315`
-
-```rust
-let normalize_path = |path_str: &str| -> String {
-    if path_str.starts_with("\\\\?\\") {
-        path_str[4..].to_string()
-    } else {
-        path_str.to_string()
-    }
-};
+Wire example:
+```json
+{ "kind": "tokenizer_missing", "details": "/Users/.../Library/models/tokenizer.json" }
+{ "kind": "db", "details": "no such row" }
+{ "kind": "encoder", "details": "ONNX session creation failed: ..." }
 ```
 
-Three exact copies. A future refactor should extract this to a module-level helper. The deeper fix is to normalise paths at insert time (in the filesystem-scanner) so the strip is never needed.
+`From`-impls let command bodies use `?` directly:
 
-### Multi-strategy DB-id mapping
+| `From<X>` | Mapping |
+|-----------|---------|
+| `From<rusqlite::Error>` | `QueryReturnedNoRows` → `ApiError::NotFound("database row")`; everything else → `ApiError::Db(e.to_string())` |
+| `From<std::io::Error>` | → `ApiError::Io(e.to_string())` |
+| `From<std::sync::PoisonError<T>>` | → `ApiError::Cosine(format!("mutex poisoned: {e}"))` (the only mutex this crate exposes is the cosine index — the name is slightly imprecise but the intent is clear) |
 
-After cosine returns a path, the command tries to map it to an `images.id` row using up to three strategies:
+The `QueryReturnedNoRows → NotFound` mapping lets the frontend branch on `kind === "not_found"` instead of string-matching on the message.
 
-1. **Normalised path lookup** — `db.get_image_id_by_path(&normalize_path(path_str))`.
-2. **Original path lookup** — `db.get_image_id_by_path(&path_str)` (in case the DB stored the `\\?\` prefix).
-3. **Flexible match against all images** — fetch `db.get_all_images()` and find one whose path matches under either normalisation or canonicalisation.
+### `ImageSearchResult` — unified shape
 
-Implementation: `get_similar_images` at `lib.rs:484-573`. `get_tiered_similar_images` at `lib.rs:319-373`. `semantic_search` uses a slightly simpler 3-strategy variant at `lib.rs:194-221`.
+```rust
+#[derive(serde::Serialize)]
+pub struct ImageSearchResult {
+    pub id: ID,
+    pub path: String,
+    pub score: f32,
+    pub thumbnail_path: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+}
+```
 
-This was added in commit `2606854` (2025-12-12): "Enhanced the logic for mapping image paths to IDs by normalizing Windows extended path prefixes, attempting both normalized and original formats, and adding a flexible fallback that compares canonicalized paths against all images in the database. This increases robustness when handling various path representations and improves matching accuracy."
+`commands/mod.rs:54-65`. Replaces the previous two-struct shape (`SimilarImage` for cosine commands, `SemanticSearchResult` for semantic). All three cosine/semantic commands now return this unified shape — the frontend deserialises one type. Audit "dimensions to backend" finding (`fb23bdb`): width/height are now sourced from the DB row, eliminating the previous DOM Image-load round-trip the frontend used to do per-tile.
 
-### `[Backend] ...` logging convention
+### `resolve_image_id_for_cosine_path` — extracted helper
 
-Every command logs its inputs, intermediate states, and outputs via `println!("[Backend] ...")`. There are 16 such calls across `lib.rs`. The convention is:
+```rust
+pub(crate) fn resolve_image_id_for_cosine_path(
+    db: &ImageDatabase,
+    cosine_path: &Path,
+    all_images_cache: Option<&[ImageData]>,
+) -> Option<(ID, String)>
+```
 
-- One log on entry: `[Backend] {command} called - {key args}`.
-- Logs on cache state transitions: `[Backend] Cache is empty, populating from database...`.
-- Logs on output mapping (per-result file name + score for the first 5 results).
-- One log on exit: `[Backend] {command} returning N results`.
+`commands/mod.rs:90-131`. Three lookup strategies:
 
-This is excellent for development but unsuitable for production. Replacing `println!` with `tracing::info!`/`tracing::debug!` and gating verbose logs by env var is the obvious next step.
+1. Strip `\\?\` (via `paths::strip_windows_extended_prefix` — `Cow` return, no alloc on common path), DB lookup using normalised path.
+2. DB lookup using the raw cosine path (in case the DB stored the prefixed form).
+3. Walk `all_images_cache` comparing under any normalisation (canonicalised, stripped, raw, etc.).
 
-### `map_err(|e| e.to_string())` at the IPC boundary
+Returns `Some((id, canonical_path))` if any strategy matches; `None` otherwise. Used by `commands::semantic::semantic_search`, `commands::similarity::get_similar_images`, and `commands::similarity::get_tiered_similar_images`. Replaces the previous triplicated inline closure + 60-line duplicated lookup blocks (audit Pattern Extraction finding `02b12b9`).
 
-Five Tauri commands wrap their internal `Result<_, _>` with `.map_err(|e| e.to_string())` before returning. Errors crossing the IPC boundary are stringified — typed errors are erased.
+### Lazy + pre-warmed text encoder
 
-Frontend consequence: `services/images.ts` catches and re-throws with a generic `"Search failed: ..."` message. The actual cause (tokenizer missing, CUDA init, DB lock contention) is lost on the wire.
+```rust
+let mut encoder_lock = text_encoder_state.encoder.lock()?;     // From<PoisonError>
+
+if encoder_lock.is_none() {
+    let model_path = paths::models_dir().join("model_text.onnx");
+    let tokenizer_path = paths::models_dir().join("tokenizer.json");
+
+    if !model_path.exists()    { return Err(ApiError::TextModelMissing(model_path.display().to_string())); }
+    if !tokenizer_path.exists(){ return Err(ApiError::TokenizerMissing(tokenizer_path.display().to_string())); }
+
+    let encoder = TextEncoder::new(&model_path, &tokenizer_path)
+        .map_err(|e| ApiError::Encoder(format!("text encoder init failed: {e}")))?;
+    *encoder_lock = Some(encoder);
+}
+```
+
+`commands/semantic.rs:33-62`. The lazy fallback is preserved even though the indexing pipeline pre-warms the encoder — pre-warm can fail (model still downloading on first launch) and the lazy path covers it. If pre-warm succeeded, the `if encoder_lock.is_none()` short-circuits.
+
+The typed `TextModelMissing` / `TokenizerMissing` errors let the frontend's `isMissingModelError(e)` helper trigger a re-download dialog instead of showing a generic toast.
+
+### Cosine cache invalidation on root mutations
+
+Every `commands/roots.rs` mutation clears `cosine_state.index.cached_images`:
+
+```rust
+if let Ok(mut idx) = cosine_state.index.lock() {
+    idx.cached_images.clear();
+}
+```
+
+This ensures the next similarity / semantic call rebuilds from the (now-mutated) DB. The `set_scan_root` flow also calls `try_spawn_pipeline` immediately so the cache is repopulated in the background. `add_root` and `remove_root` similarly trigger reindex; `set_root_enabled` does not (the grid query handles it; the cosine cache rebuild happens lazily on the next query).
+
+### State injection pattern
+
+Each command takes the relevant Tauri-managed state via `State<'_, T>`:
+
+```rust
+tauri::Builder::default()
+    .plugin(tauri_plugin_opener::init())
+    .plugin(tauri_plugin_dialog::init())
+    .manage(db)                       // ImageDatabase
+    .manage(cosine_state)              // CosineIndexState { index: Arc<Mutex<CosineIndex>>, db_path: String }
+    .manage(text_encoder_state)        // TextEncoderState { encoder: Mutex<Option<TextEncoder>> }
+    .manage(indexing_state.clone())    // Arc<IndexingState> for single-flight
+    .manage(watcher_state.clone())     // Arc<Mutex<Option<WatcherHandle>>>
+```
+
+`lib.rs:82-89`. The `Arc<IndexingState>` and `Arc<Mutex<Option<WatcherHandle>>>` Tauri-managed states are referenced via `State<'_, Arc<IndexingState>>` — the frontend never sees them, but the commands that mutate roots use them to spawn the indexing pipeline.
+
+### `tracing::instrument` coverage
+
+Every `#[tauri::command]` handler is wrapped with `#[tracing::instrument(name = "ipc.{name}", skip(...))]`. Span names follow the `ipc.{command_name}` convention. Used by the profiling system to surface per-command latency in the perf report.
 
 ## Key Interfaces / Data Flow
 
-The full IPC surface is a thin layer that orchestrates state. Per-command flows are documented in `architecture.md` (semantic search) and the relevant system files (`database`, `cosine-similarity`, `clip-text-encoder`).
+The full IPC surface is a thin layer that orchestrates state. Per-command flows are documented in `architecture.md` (semantic search) and the relevant system files (`database`, `cosine-similarity`, `clip-text-encoder`, `multi-folder-roots`, `indexing`).
 
-The state-injection pattern:
+The state-injection pattern + `?`-via-From-impls collapses most command bodies to:
 
-```text
-tauri::Builder::default()
-    .plugin(tauri_plugin_opener::init())
-    .manage(db)
-    .manage(cosine_state)
-    .manage(text_encoder_state)
-    .invoke_handler(tauri::generate_handler![ ...8 commands... ])
-    .run(tauri::generate_context!())
+```rust
+#[tauri::command]
+#[tracing::instrument(name = "ipc.get_tags", skip(db))]
+pub fn get_tags(db: State<'_, ImageDatabase>) -> Result<Vec<Tag>, ApiError> {
+    Ok(db.get_tags()?)    // From<rusqlite::Error> handles the conversion
+}
 ```
 
 All commands are sync (`fn` not `async fn`). Tauri's invoke handler runs them on its thread pool but each individual command serialises through whatever `Mutex` it acquires.
 
 ## Implemented Outputs / Artifacts
 
-- 8 IPC handlers reachable from `invoke()` on the frontend.
-- Two ad-hoc result types: `SimilarImage { id, path, score }` and `SemanticSearchResult { id, path, score, thumbnail_path?, width?, height? }` (`lib.rs:13-28`). The latter is richer because the frontend wants thumbnails directly without a follow-up `get_image_thumbnail_info` round trip.
+- 22 IPC handlers reachable from `invoke()` on the frontend.
+- 1 unified `ImageSearchResult` struct returned by every cosine / semantic command.
+- 1 typed `ApiError` enum with 10 variants, mirrored on the frontend in `services/apiError.ts`.
+- Frontend `formatApiError(unknown)` helper that handles ApiError + legacy strings + Error instances uniformly; `isMissingModelError(e)` predicate for the re-download flow.
+- 5 unit tests in `commands/error.rs::tests` pinning the wire format, the rusqlite no-rows special case, and the Display labels.
 
 ## Known Issues / Active Risks
 
 | Risk | Triggered by | Downstream impact |
 |------|--------------|-------------------|
-| `delete_tag` exists in `db.rs` but is **not registered** in `invoke_handler!` | Wanting to remove a tag via UI | No code path can call it from the frontend. `db.delete_tag` is dead code from the IPC surface's perspective. |
-| Triplicated `normalize_path` closure | Future schema or path-format change | Three places to edit; easy to update one and forget the others. The flexible-match fallback uses additional inline canonicalisation that is also duplicated. |
-| String-stringified errors | Any error in any command | Frontend cannot distinguish "model file missing" from "tokenizer parse failed" from "CUDA init error" from "Mutex poisoned" — all surface as generic "Search failed". |
-| `println!` in hot path | Every command call | stdout grows unbounded in dev; production builds also log. No log level control. |
-| Mutex serialisation across all similarity calls | Concurrent invocations | Cosine `Mutex` is held during the whole sort + sample + result build. Two parallel UI actions queue. Today's UI does not generate parallel calls, but a future "preload similar for hovered image" feature would. |
-| Hardcoded model-file paths | A future `models/` move | The `models/model_text.onnx` and `models/tokenizer.json` paths are hardcoded inside `semantic_search` (`lib.rs:121-122`). |
-| `assetProtocol.scope: ["**"]` (in `tauri.conf.json`) | A future scenario where untrusted HTML is loaded into the WebView | The current app only loads its own bundled HTML, so this is abstract. For anything more public, scope needs narrowing. |
+| Three profiling commands return `Result<_, String>` not `Result<_, ApiError>` | Profiling commands existed before the typed-error migration and weren't updated | Frontend's `formatApiError` handles strings via the `instanceof Error` / `String(error)` fallback. Cosmetic inconsistency. |
+| `From<PoisonError<T>>` always maps to `ApiError::Cosine` regardless of which mutex was actually poisoned | Any mutex poison anywhere in the codebase | Misleading error label (e.g., a poisoned `TextEncoderState.encoder` shows as "cosine error: mutex poisoned"). Source comment acknowledges this. |
+| `add_root` UNIQUE constraint surfaces as generic `ApiError::Db("UNIQUE constraint failed")` | User adds the same folder twice | Could be sharpened to `ApiError::BadInput("already added")` with a specific check. |
+| Mutex serialisation across all similarity calls | Concurrent invocations | Cosine `Mutex` is held during the whole sort + sample + result build. Two parallel UI actions queue. Today's UI does not generate parallel calls; a future "preload similar for hovered image" feature would. |
+| `assetProtocol.scope: ["**"]` (in `tauri.conf.json`) | A future scenario where untrusted HTML is loaded into the WebView | The current app only loads its own bundled HTML, so this is abstract. For anything more public, scope needs narrowing. See `enhancements/recommendations/08-tauri-csp-asset-scope-hardening.md`. |
+| Frontend → backend payload shape evolution | A backend command adds a parameter | Today's frontend services explicitly construct the invoke payload, so adding a parameter on the backend doesn't break old frontend code that omits it (Tauri uses serde defaults), but adding a *required* parameter does. |
+| Profiling commands are always registered, even without `--profile` | Frontend calling `record_user_action` on a non-profiling build | The command runs but `perf::record_user_action` short-circuits internally if profiling is off. No-op, no error. |
 
 ## Partial / In Progress
 
-None active.
+- Per-command `tracing::instrument` coverage is complete; per-DB-method coverage (`db.*`) is not. Adding span names like `db.get_image_thumbnail_info` would let the perf report attribute per-DB-method time instead of just per-IPC time. Not yet done.
 
 ## Planned / Missing / Likely Changes
 
-- Register `delete_tag` as a Tauri command + add a delete affordance in `TagDropdown`.
-- Add a `scan_directory(path)` command that triggers the full filesystem → DB → thumbnails → encoding pipeline at runtime, paired with a Tauri `dialog` plugin invocation on the frontend.
-- Add a `rescan_directory()` companion command for re-indexing without restart.
-- Replace `println!` with `tracing` + `tracing-subscriber`.
-- Extract `normalize_windows_path` into a module-level helper; eventually move the normalisation to insert time.
-- Surface real error strings to the frontend (preserve `.to_string()` of typed errors with their context).
+- **Sharpen `add_root` errors** — distinguish UNIQUE constraint from other DB errors; surface as `ApiError::BadInput("already added: {path}")`.
+- **Migrate the 3 profiling commands to `ApiError`** for consistency.
+- **Add a `force_reindex` command** for the case where the user wants to wipe the cache + re-run the pipeline without changing roots. Today this requires `set_scan_root(current_path)` which is awkward.
+- **`PoisonError` mapping by source mutex** — could be done via wrapper structs that carry a name through. Today's `From<PoisonError>` is convenient but less precise.
 
 ## Durable Notes / Discarded Approaches
 
-- **The lazy `Mutex<Option<TextEncoder>>` pattern was a deliberate choice.** Eager init at app startup would add several seconds to launch even for users who never run a semantic search. Lazy init defers the cost until the first search and pays it once. A `OnceLock` would be a cleaner spelling but does not interact well with the `Result<TextEncoder, ...>` constructor.
-- **Tauri commands are sync, not async.** Tauri 2 supports async commands but every operation in this codebase is naturally synchronous (SQLite calls, mutex-protected mutation, ONNX inference is blocking). Adding `async fn` would force `.await` discipline without buying anything for now.
-- **The flexible-match fallback was added because Windows path canonicalisation is unstable.** A `\\?\C:\foo\bar` path may or may not match `C:\foo\bar` depending on whether `canonicalize()` succeeds (which depends on the file existing on disk *right now*). The fallback walks all images comparing under multiple normalisations to handle the worst case where the path stored at insert time differs from the path in the cosine cache.
+- **Tauri commands stay sync, not async.** Tauri 2 supports async commands but every operation in this codebase is naturally synchronous (SQLite calls, mutex-protected mutation, ONNX inference is blocking). Adding `async fn` would force `.await` discipline without buying anything for now. Background work (indexing) lives on its own thread, not in the command body.
+- **Lazy `Mutex<Option<TextEncoder>>` was preserved even after pre-warm.** Pre-warm covers the common case; lazy fallback covers the edge cases (pre-warm failed silently because the model was still downloading). The double init protection costs nothing because the lock check `if encoder_lock.is_none()` short-circuits when pre-warm succeeded.
+- **`ApiError` over per-command typed errors.** A per-command enum would be more precise but multiplied 22 times. The shared kind allows cross-command branching on the frontend (e.g., "any model-missing error triggers the re-download flow regardless of which command failed").
+- **`#[serde(tag, content)]` over a flat shape.** The discriminated-union shape with a string `kind` is what makes the frontend's `switch (e.kind)` work cleanly. Adding a new variant doesn't break the frontend's `default` arm.
+- **`?` over `.map_err`.** The `From`-impls remove every per-call `.map_err(|e| ApiError::Db(e.to_string()))` boilerplate. Rust 1.x has had question-mark-with-From for many years; this codebase finally uses it consistently after the typed-error migration.
+- **The flexible-match path-resolution fallback was added because Windows path canonicalisation is unstable.** A `\\?\C:\foo\bar` path may or may not match `C:\foo\bar` depending on whether `canonicalize()` succeeds. Strategy 3's flexible match handles the worst case where the path stored at insert time differs from the path in the cosine cache. The deeper fix (normalise-at-insert) is documented in `notes/path-and-state-coupling.md`.
+- **Cosine cache invalidation on root mutations is direct, not eventual.** Clearing `cached_images` synchronously before returning means the next user query rebuilds from current DB state. An async invalidation channel was considered and rejected — the synchronous path is simpler and doesn't have race conditions.
 
 ## Obsolete / No Longer Relevant
 
-None.
+The pre-Phase-6 `lib.rs` (918 lines, all 8 commands inline, `[Backend] ...` println logging, untyped `Result<_, String>` returns) is gone. The `[Backend] ...` logging convention was replaced wholesale by `tracing::info!` / `debug!` / `warn!` during the Phase 6 tracing migration. The previous separate `SimilarImage` and `SemanticSearchResult` structs are replaced by the unified `ImageSearchResult`.

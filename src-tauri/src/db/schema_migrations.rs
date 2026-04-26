@@ -59,6 +59,103 @@ impl ImageDatabase {
         Ok(())
     }
 
+    /// Embedding-pipeline version-bump migration. Runs once when
+    /// the version stored in `meta` (key `embedding_pipeline_version`)
+    /// is less than the current version. Wipes embeddings produced
+    /// by the previous pipeline so the next indexing pass re-encodes
+    /// everything with the new model + preprocessing.
+    ///
+    /// Why this is needed:
+    /// - **CLIP**: switched from the combined-graph multilingual model
+    ///   (in a different embedding space than the image branch) to
+    ///   the SEPARATE OpenAI vision_model.onnx + text_model.onnx.
+    ///   New preprocessing (bicubic-shortest-edge-224 + center-crop +
+    ///   L2-normalize) produces a different embedding distribution
+    ///   than the old (resize_exact-224 + Lanczos3 + no-normalize).
+    ///   Mixing the two corrupts cosine similarity rankings.
+    /// - **DINOv2**: switched from `dinov2_small` (384-d, wrong
+    ///   preprocessing) to `dinov2_base` (768-d, correct preprocessing).
+    ///   Old `dinov2_small` rows are abandoned because the encoder_id
+    ///   changed; this just cleans them up to free disk.
+    ///
+    /// Bump `CURRENT_PIPELINE_VERSION` whenever a future change
+    /// invalidates existing embeddings.
+    pub(super) fn migrate_embedding_pipeline_version(&self) -> rusqlite::Result<()> {
+        const CURRENT_PIPELINE_VERSION: i64 = 2;
+
+        let conn = self.connection.lock().unwrap();
+
+        // Ensure meta table exists.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )",
+            [],
+        )?;
+
+        let stored: Option<i64> = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'embedding_pipeline_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok());
+
+        let needs_migration = match stored {
+            Some(v) if v >= CURRENT_PIPELINE_VERSION => false,
+            _ => true,
+        };
+
+        if !needs_migration {
+            return Ok(());
+        }
+
+        info!(
+            "Embedding pipeline version migration: stored={:?}, current={} — \
+             wiping legacy embeddings to trigger re-encode",
+            stored, CURRENT_PIPELINE_VERSION
+        );
+
+        // Wipe legacy CLIP from images.embedding column.
+        let cleared_legacy = conn.execute(
+            "UPDATE images SET embedding = NULL WHERE embedding IS NOT NULL",
+            [],
+        )?;
+        info!("  cleared {} legacy CLIP embeddings from images.embedding", cleared_legacy);
+
+        // Wipe per-encoder rows for the encoders whose pipelines changed.
+        // SigLIP-2 rows weren't produced before this version (encoder
+        // wasn't wired), so no cleanup needed there.
+        let cleared_clip = conn.execute(
+            "DELETE FROM embeddings WHERE encoder_id = 'clip_vit_b_32'",
+            [],
+        )?;
+        let cleared_small = conn.execute(
+            "DELETE FROM embeddings WHERE encoder_id = 'dinov2_small'",
+            [],
+        )?;
+        info!(
+            "  cleared {} clip_vit_b_32 + {} dinov2_small embeddings from embeddings table",
+            cleared_clip, cleared_small
+        );
+
+        // Mark migration complete.
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('embedding_pipeline_version', ?1) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![CURRENT_PIPELINE_VERSION.to_string()],
+        )?;
+
+        info!(
+            "Embedding pipeline migration complete (version → {}). \
+             Next indexing pass will re-encode all images.",
+            CURRENT_PIPELINE_VERSION
+        );
+        Ok(())
+    }
+
     /// Add notes (free-text per-image annotations, Phase 11) and
     /// orphaned (deleted-from-disk marker, Phase 7) columns.
     pub(super) fn migrate_add_notes_and_orphaned_columns(&self) -> rusqlite::Result<()> {

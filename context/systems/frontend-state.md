@@ -1,16 +1,18 @@
 # frontend-state
 
-*Maturity: working*
+*Maturity: comprehensive*
 
 ## Scope / Purpose
 
-The shared state layer for the React app. Owns: TanStack Query configuration, the file-based routing setup (`vite-plugin-pages`), and the standard optimistic-mutation pattern that all tag mutations follow. No global store (zustand is declared in `package.json` but never imported).
+The shared state layer for the React app. Owns: TanStack Query configuration, the file-based routing setup (`vite-plugin-pages`), the `useUserPreferences` localStorage layer, the `useIndexingProgress` Tauri-event subscription, the `useRoots` mutations, the canonical optimistic-mutation pattern that all tag/root mutations follow, and the settings drawer's split into per-section components.
+
+No global state store exists. `zustand` is declared in `package.json` from earlier planning but never imported — the combination of TanStack Query (server state) + `useUserPreferences` (localStorage-backed prefs) + per-page `useState` (transient UI state) covers every state need in the app.
 
 ## Boundaries / Ownership
 
-- **Owns:** `queryClient.ts` (cache policy), routing config (`App.tsx` + `vite.config.ts`), the optimistic mutation pattern.
-- **Does not own:** any per-feature query (those live in `queries/use*.ts`), per-page UI state (lives in components via `useState`).
-- **Public API:** the exported `queryClient`, the `<App />` component composition, and the implicit contract that all mutations follow `cancelQueries → snapshot → optimistic → onError rollback`.
+- **Owns:** `queryClient.ts` (cache policy), routing config (`App.tsx` + `vite.config.ts`), the per-resource query hooks (`src/queries/*`), the `useUserPreferences` hook + localStorage layout, the `useIndexingProgress` event hook, the settings drawer split (`src/components/settings/`).
+- **Does not own:** any per-feature query (those live in `queries/use*.ts`), per-page UI state (lives in components via `useState`), the IPC wire format (delegates to `services/*` + `services/apiError.ts`).
+- **Public API:** the exported `queryClient`, the `<App />` component composition, `useUserPreferences()`, `useIndexingProgress()`, `useRoots()` + add/remove/setEnabled mutations, the implicit contract that all mutations follow `cancelQueries → snapshot → optimistic → onError rollback → onSuccess invalidate`.
 
 ## Current Implemented Reality
 
@@ -28,44 +30,126 @@ new QueryClient({
             retry: false,
         },
     },
-});
+})
 ```
 
-Source: `src/queries/queryClient.ts`. This is an unusually aggressive cache-and-never-refetch policy. Implications:
+`src/queries/queryClient.ts`. Aggressive cache policy because:
 
-- Every `useImages`, `useTags`, etc. query runs **once** per cache key and serves the cached value forever (within the 10-min gc window).
-- Refetching is opt-in — the only refetch path is explicit `queryClient.invalidateQueries(...)`, which appears in exactly one place (`pages/[...slug].tsx:114` on modal close).
-- `staleTime: Infinity` means optimistic updates are the *only* way data becomes fresh after a mutation — there is no background revalidation safety net.
-- `retry: false` means a transient IPC failure surfaces immediately as an error rather than retrying.
+- This is a desktop app; there's no "user navigates away and comes back" concept
+- IPC calls are local — no network costs to retry
+- The backend is the single source of truth; staleness happens deterministically (e.g., on `Phase::Ready` from indexing) and is handled with explicit `invalidateQueries`
 
-The `useSemanticSearch` hook overrides these defaults locally (`staleTime: 5min, gcTime: 10min, refetchOnWindowFocus: false`) — semantic results are cached for 5 minutes, after which the same query produces a fresh ONNX inference round trip.
+### Per-resource hook layout
 
-### Routing
-
-```text
-src/App.tsx
-    ──► <BrowserRouter>
-        ──► <QueryClientProvider client={queryClient}>
-            ──► <Routes /> via useRoutes(routes)  with routes = "~react-pages"
-            ──► <div id="measure-root" />        // off-screen div for DOM measurement (currently unused at runtime)
-
-vite.config.ts
-    ──► Pages()  // vite-plugin-pages — auto-generates routes from src/pages/**
+```
+src/queries/
+├── queryClient.ts        — staleTime: Infinity, no auto-refetch
+├── useImages.ts          — useImages + useAssignTagToImage + useRemoveTagFromImage (optimistic)
+├── useTags.ts            — useTags + useCreateTag + useDeleteTag (optimistic)
+├── useRoots.ts           — useRoots + useAddRoot + useRemoveRoot + useSetRootEnabled
+├── useSimilarImages.ts   — useTieredSimilarImages
+└── useSemanticSearch.ts  — 5-min staleTime, 10-min gcTime, debounced from caller
 ```
 
-The catch-all page is `src/pages/[...slug].tsx`. The plugin transforms files in `src/pages/` into a routes config at build time. There is currently exactly one page; adding more would just need new files in `src/pages/`.
+`useSemanticSearch` overrides the global staleTime to 5 minutes — semantic queries are deterministic per-input but the user typically doesn't repeat the exact same query within a session. 5-min stale lets a re-issue of the same query within that window hit cache.
 
-### The `measure-root` div
+### `useImages` query key
 
-`App.tsx:21-31` mounts an absolutely-positioned, off-screen `<div id="measure-root" />` for DOM-element measurement. The `useMeasure` hook in `src/hooks/useMeasure.tsx` is the consumer — but `useMeasure` is **not imported anywhere** in the current code (verified by grep). The div is dead infrastructure for a feature that didn't ship. It has no runtime cost beyond a single DOM node, but it is misleading.
+```ts
+useQuery({
+    queryKey: ["images", tagIds, searchText, matchAllTags, sortMode, shuffleSeed],
+    queryFn: () => fetchImages(tagIds, searchText, matchAllTags),
+    ...
+})
+```
 
-### Optimistic mutation pattern (the convention)
+The cache key includes:
+- `tagIds`: filter state
+- `searchText`: passed for cache differentiation but ignored by backend SQL
+- `matchAllTags`: AND vs OR mode (changes SQL semantics)
+- `sortMode`: applied frontend-side, included so toggling re-fetches and re-applies
+- `shuffleSeed`: bumped on modal close → triggers refetch with new seed for the deterministic shuffle
 
-Three mutations in three files all follow the same shape:
+### `useUserPreferences` localStorage layer
+
+```ts
+export interface UserPreferences {
+    theme: ThemeMode;             // "system" | "dark" | "light"
+    columnCount: number;          // 0 = auto, else 1..8
+    tileMinWidth: number;         // px when columnCount is auto
+    sortMode: SortMode;           // "shuffle" | "name" | "added"
+    tileScale: number;            // multiplier on minItemWidth in auto mode
+    animationLevel: AnimationLevel;  // "off" | "subtle" | "standard"
+    similarResultCount: number;   // 5..75
+    semanticResultCount: number;  // 10..100
+    tagFilterMode: TagFilterMode; // "any" | "all"
+}
+```
+
+`src/hooks/useUserPreferences.ts:19-41`. Defaults:
+
+```ts
+const DEFAULTS: UserPreferences = {
+    theme: "system",
+    columnCount: 0,           // auto
+    tileMinWidth: 236,
+    sortMode: "added",        // not shuffle (Phase 9 default change)
+    tileScale: 1.0,
+    animationLevel: "standard",
+    similarResultCount: 35,
+    semanticResultCount: 50,
+    tagFilterMode: "any",
+};
+```
+
+Persisted to `localStorage["imageBrowserPrefs"]` as JSON. `theme` is also mirrored to `localStorage["theme"]` so `main.tsx` can apply it before React mounts (avoids the FOUC of wrong-theme flash). Schema is loose — newly-added fields land at their defaults via merge with `DEFAULTS` so older saved JSON deserialises cleanly.
+
+System theme support: when `prefs.theme === "system"`, the hook listens to `window.matchMedia("(prefers-color-scheme: dark)")` so macOS auto-dark-mode flips the app theme along with everything else.
+
+### `useIndexingProgress` event hook
+
+```ts
+export function useIndexingProgress(): { progress: IndexingProgress | null }
+```
+
+Subscribes to the `"indexing-progress"` Tauri event via `tauri::event::listen`. Stores the most recent payload in React state. The IndexingStatusPill component consumes this directly. The hook is also responsible for calling `invalidateQueries(["images"])` on `phase === "ready"` so the grid re-fetches with the new images visible.
+
+### `useRoots` + mutations
+
+Mirrors the tag pattern but for the roots collection:
+
+```
+useRoots()                — read-only listing of roots
+useAddRoot()              — optimistic insert + invalidate ["roots"] + ["images"] on success
+useRemoveRoot()           — optimistic remove + invalidate ["roots"] + ["images"] on success
+useSetRootEnabled()       — optimistic toggle + invalidate ["roots"] + ["images"] on success
+```
+
+The `["images"]` invalidation is necessary because root mutations change which images appear in the grid (CASCADE wipe on remove, filter change on enable toggle).
+
+### Settings drawer split (Phase 9 + audit Modularisation finding)
+
+`src/components/settings/` is the split-out drawer. `index.tsx` is the slide-in shell (animation, esc/backdrop dismiss); each section lives in its own file:
+
+```
+src/components/settings/
+├── index.tsx              — Drawer shell (AnimatePresence + slide animation + esc handler)
+├── controls.tsx           — Shared section header + slider/toggle primitives
+├── ThemeSection.tsx       — system / dark / light segmented buttons
+├── DisplaySection.tsx     — column count slider (0=auto, 1..8), tile scale (0.6..2.0), animation level
+├── SearchSection.tsx      — similar / semantic result count sliders, tag filter mode toggle
+├── SortSection.tsx        — shuffle / name / added segmented buttons
+├── FoldersSection.tsx     — list of configured roots with per-row enable/remove + add-folder button
+└── ResetSection.tsx       — "Reset all settings" button → useUserPreferences().resetAll()
+```
+
+Each section consumes `useUserPreferences` (and the roots hooks where applicable) directly so they remain testable in isolation without prop-drilling. Pre-Phase-9 + pre-audit, this was a 466-line single `SettingsDrawer.tsx`.
+
+### Optimistic mutation pattern (canonical)
 
 ```ts
 useMutation({
-    mutationFn: (params) => /* async IPC call */,
+    mutationFn: (params) => /* IPC call via service */,
     onMutate: async (params) => {
         await queryClient.cancelQueries({ queryKey: [...] });
         const prevData = queryClient.getQueryData([...]);
@@ -77,54 +161,62 @@ useMutation({
             queryClient.setQueryData([...], context.prevData);
         }
     },
-    onSuccess: (data) => { /* swap optimistic placeholder for real data — useCreateTag only */ },
+    onSuccess: (data) => { /* swap optimistic placeholder for real data */ },
 });
 ```
 
-Locations: `useImages.ts:23-63` (assign), `useImages.ts:65-97` (remove), `useTags.ts:13-46` (create). See `notes/conventions.md` for the canonical conventions doc.
+Followed by every mutation in the codebase. The reasoning: `staleTime: Infinity` means the only way the UI feels responsive after a mutation is via optimistic updates, and the rollback handles transient IPC failures cleanly.
 
-### Type definitions
+### `services/*` IPC wrappers
 
-`src/types.d.ts` exports four types:
+```
+src/services/
+├── apiError.ts        — ApiError discriminated union + formatApiError + isApiError + isMissingModelError
+├── images.ts          — fetchImages, fetchTieredSimilarImages, semanticSearch, pickScanFolder, setScanRoot, getThumbnailPath
+├── tags.ts            — fetchTags, createTag (default colour), deleteTag
+├── notes.ts           — getImageNotes, setImageNotes
+├── roots.ts           — listRoots, addRoot, removeRoot, setRootEnabled
+└── perf.ts            — isProfilingEnabled, getPerfSnapshot, recordAction (fire-and-forget),
+                          exportPerfSnapshot, perfInvoke (wraps invoke with profiling start/end),
+                          onRenderProfiler (React.Profiler callback)
+```
 
-| Type | Where it appears | Owner |
-|------|------------------|-------|
-| `ImageData` | service-layer raw shape (matches Rust `ImageData` JSON) | backend → service translation |
-| `ImageItem` | UI shape with `url` and `thumbnailUrl` already constructed via `convertFileSrc` | UI components |
-| `Tag` | shared between backend JSON and UI (identical fields) | unified |
-| `SimilarImageItem` | similar/semantic results, includes `score` | similarity surfaces |
-
-The translation from `ImageData` to `ImageItem` happens inside `services/images.ts::fetchImages`. The translation from `SemanticSearchResult` JSON to `SimilarImageItem` happens in `services/images.ts::semanticSearch`.
+Hooks call services; components do not call `invoke` directly. Every catch site uses `formatApiError(e)` for user-visible toasts.
 
 ## Key Interfaces / Data Flow
 
-```text
-QueryClientProvider context
-    ──► useImages, useTags, useSemanticSearch, useTieredSimilarImages — all query hooks share the cache
-    ──► useAssignTagToImage, useRemoveTagFromImage, useCreateTag — all mutations follow the optimistic pattern
+### Inputs
 
-BrowserRouter
-    ──► useRoutes(~react-pages routes)
-    ──► pages/[...slug].tsx (the only page)
-        ──► uses useLocation/useNavigate to drive the URL-as-selectedItem pattern (see search-routing.md)
-```
+- `QueryClientProvider` wrapping `<App />`
+- Tauri IPC events (`indexing-progress`)
+- localStorage (`imageBrowserPrefs`, `theme`)
+- `prefers-color-scheme` media query
+
+### Outputs
+
+- React Query cache state, consumed by hooks throughout the app
+- localStorage writes on every preference change
+- `IndexingProgress` state object updated on every event
+- `<html class="dark">` toggling on theme change
 
 ## Implemented Outputs / Artifacts
 
-- A single `QueryClient` instance shared across the app.
-- Auto-generated routes via vite-plugin-pages.
-- The `measure-root` DOM node (currently unused).
+- 6 query/mutation hook files in `src/queries/`
+- 3 utility hooks in `src/hooks/` (debounce, prefs, indexing-progress)
+- 6 services in `src/services/` (incl. perf + apiError)
+- 7 settings section components + 1 controls primitive + 1 shell (`src/components/settings/`)
+- The implicit "every mutation follows the canonical pattern" contract
+- Tests: `useUserPreferences.test.ts` (132 lines), `services.test.ts` (248 lines)
 
 ## Known Issues / Active Risks
 
 | Risk | Triggered by | Downstream impact |
 |------|--------------|-------------------|
-| `staleTime: Infinity` is unusually aggressive | Any data that changes outside the optimistic-update flow (e.g., a future runtime rescan adds new images) | The cache shows stale data forever. Today's mutations all go through the optimistic pattern, so this is fine; but a runtime rescan would silently fail to surface new images. |
-| `searchText` in `useImages` query key | Every keystroke | Cache miss per keystroke for a backend that ignores the field. Wasted memory. |
-| `zustand` declared, not used | Build-time | ~78 KB of node_modules. Inherited from earlier memory-bank planning that never landed. |
-| `atropos/css` imported in App.tsx | App.tsx:3 | The CSS is imported but the `atropos` runtime is not used (framer-motion does the tilt). The CSS adds a few KB of dead bytes to the bundle. |
-| `measure-root` div + `useMeasure` hook | Build-time | Dead infrastructure. Unmounted, unimported. |
-| `retry: false` | A transient IPC failure (e.g., DB Mutex briefly unavailable due to a long-running command) | Immediate user-visible error rather than transparent retry. |
+| `staleTime: Infinity` means cache can lag if a backend mutation happens outside a frontend mutation | A second app instance edits the DB (today: not possible — single-process), or a manual DB edit | Stale UI until manual invalidation. Acceptable. |
+| `useUserPreferences` writes to localStorage in `update`'s setter | Rapid preference toggling | Each write is sync + small; not a bottleneck. localStorage may be disabled in some WebView modes — falls through to in-memory state silently. |
+| `useIndexingProgress` listens once at mount; if mount races the event, the first event may be missed | Very fast indexing (cache-load-only path on second launch) | Pill might not show. Reproducible if cache-load takes <few ms. Cosmetic. |
+| Settings sections all consume `useUserPreferences` directly | Re-renders on every preference change | Each section subscribes to the whole prefs object; React batches re-renders. Not a measured bottleneck. |
+| `mutation rollback` doesn't refetch | Backend rejection due to staleness | Cache might restore an obsolete entry. `invalidateQueries` on `onSuccess` covers the success path; `onError` doesn't. |
 
 ## Partial / In Progress
 
@@ -132,18 +224,21 @@ None.
 
 ## Planned / Missing / Likely Changes
 
-- Drop the unused `zustand`, `atropos`, and `useMeasure` (this would be a single dead-code-sweep PR).
-- Drop `searchText` from the `useImages` query key.
-- Reconsider the `staleTime: Infinity` default once any data source becomes asynchronous (rescan, watcher, multi-process).
-- Optional: a small `retry: 1` for similarity / semantic queries to absorb transient ONNX session.run hiccups.
+- **Backend-persisted preferences for cross-device sync** if multi-device support is ever added. Today's localStorage-only approach is correct for single-machine.
+- **Settings export/import** so a user can share their pref set or move it between machines.
+- **Granular cache subscription** if a future profiling pass shows the whole-prefs subscription is causing wasteful re-renders.
 
 ## Durable Notes / Discarded Approaches
 
-- **TanStack Query was chosen over zustand-as-store.** The original memory-bank notes mentioned zustand for state management; the actual implementation never imported it. The reasoning is implicit in the code: every piece of "state" the app needs is either server data (handled by Query) or per-page React state (handled by `useState`). There is no genuine global store — the URL is the only cross-component shared identifier (the selected image id), and that lives in `react-router`.
-- **Aggressive staleTime is intentional given the workload.** Image catalogues do not change without explicit user action (no background fetch, no remote source). With `staleTime: Infinity` the app skips needless re-fetches; mutations handle freshness via the optimistic pattern. The trade-off — silent staleness if data changes outside known mutation paths — is acceptable for a single-user local-first app.
-- **The optimistic mutation pattern is the canonical mutation shape**. New mutations should follow the same `cancelQueries → snapshot → optimistic → onError rollback` shape. Documented in `notes/conventions.md`.
-- **vite-plugin-pages is overkill for one route** — but it is forward-looking. Adding a settings page or a tag-management page becomes a single-file change. The trade-off is one extra dependency.
+- **`staleTime: Infinity` + manual invalidation** was a deliberate choice. The alternative — periodic refetch — would re-fire IPC calls without reason. Local IPC is cheap but not free; explicit invalidation is correct.
+- **`zustand` was planned in the original memory-bank but never imported.** TanStack Query handled server state (the bulk of state), `useUserPreferences` handles persisted prefs, and per-component `useState` handles transient UI. No need for a global store.
+- **Settings split into per-section files** because the single `SettingsDrawer.tsx` had grown to 466 lines and several sections were independently changing. Each section now owns its UI + reads `useUserPreferences` directly. Audit Modularisation finding `f041fc9`.
+- **Theme is mirrored to a separate localStorage key** so `main.tsx` can apply it before React mounts. Without this, the app would flash with the wrong theme for a moment on every launch (FOUC).
+- **System theme listener is mounted only when `prefs.theme === "system"`** — no point listening when the user has explicitly forced dark or light.
+- **`useIndexingProgress` invalidates `["images"]` on Phase::Ready** because that's the user-visible "the catalogue may have changed" signal. Invalidating per-progress event would thrash the cache.
+- **Optimistic updates with rollback are mandatory.** Without them, the UI feels stale after every tag/root mutation; with them, the UI feels instant. The rollback covers the rare failure case.
+- **`perfInvoke` is opt-in per call site, not an automatic interceptor.** A global interceptor would profile every IPC including ones we don't care about; the explicit wrapper makes profiling intent visible at each call site.
 
 ## Obsolete / No Longer Relevant
 
-`zustand`, `atropos`, `useMeasure`, the `measure-root` DOM node — all dead, all preserved for now.
+The pre-Phase-9 single `SettingsDrawer.tsx` is gone (split into `settings/`). The pre-Phase-9 default `sortMode === "shuffle"` is gone (now `"added"`). The pre-typed-error `catch(e) { ... }` patterns that interpolated raw strings are gone — every catch site uses `formatApiError(e)`.

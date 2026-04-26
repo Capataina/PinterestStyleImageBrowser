@@ -2,64 +2,63 @@
 
 ## Current Understanding
 
-Several files and dependencies exist in the repo with zero runtime use. None are harmful; together they add ~hundred KB of node_modules + several files of mental overhead. A single dead-code-sweep PR could remove all of them.
+The previous inventory was largely closed by the audit Pass + Phase 2 dead-code sweep. Most flagged items have been removed or wired up. This note now serves as the residual list and the trigger for the next sweep.
 
-## Inventory
+## Resolved (since previous inventory)
 
-### Frontend components (unmounted)
+| Item | Status | When |
+|------|--------|------|
+| `src/components/FullscreenImage.tsx` | Removed | Phase 2 (commit `86df34e`) |
+| `src/components/MasonryItemSelected.tsx` | Removed | Phase 2 |
+| `src/components/MasonrySelectedFrame.tsx` | Removed | Phase 2 |
+| `src/hooks/useMeasure.tsx` | Removed | Phase 2 |
+| `db::delete_tag` (orphaned method) | Wired through `commands::tags::delete_tag` + `useDeleteTag` mutation | Phase 6 |
+| `useSimilarImages` (frontend hook) | Removed (only `useTieredSimilarImages` is used) | Audit dead-code sweep |
+| `ImageData::with_thumbnail` (alternate constructor) | Removed | Audit Dead-Code finding |
+| `add_tag_to_image` plain INSERT (would error on duplicate) | Hardened to `INSERT OR IGNORE` | Phase 6 |
+| Hardcoded `Path::new("test_images")` in `main.rs` | Removed (multi-folder pipeline) | Phase 6 |
+| `unsafe { slice::from_raw_parts(...) }` for embedding BLOB casts (3 sites) | Replaced with `bytemuck::cast_slice` | Audit `0bdb5f4` |
+| Triplicated `normalize_path` closure in `lib.rs` (3 sites) | Extracted into `paths::strip_windows_extended_prefix` | Audit `02b12b9` |
+| Triplicated 3-strategy DB-id lookup blocks (3 sites) | Extracted into `commands::resolve_image_id_for_cosine_path` | Same audit commit |
+| Duplicated `aggregate_image_rows` pattern (4 sites) | Extracted into `db/images_query.rs::aggregate_image_rows` helper | Audit `a30c153` |
+| `[Backend] ...` `println!` logging convention | Replaced wholesale by `tracing::info!` / `debug!` / `warn!` | Phase 6 |
+| `set_scan_root` Tauri command (single-folder model) | Preserved as legacy; multi-folder commands added (`add_root` / `remove_root` / `set_root_enabled`) | Phase 6 |
+| `models/` "user-supplied" assumption | Now auto-downloaded on first launch via `model_download` | Phase 4b |
 
-| File | Why dead |
-|------|----------|
-| `src/components/FullscreenImage.tsx` | Earlier inspect view; replaced by `PinterestModal`. |
-| `src/components/MasonryItemSelected.tsx` | Replaced by inline `isSelected` path inside `MasonryItem`. |
-| `src/components/MasonrySelectedFrame.tsx` | Earlier hero-card frame; replaced by Masonry's hero promotion. |
+## Residual (current dead-code inventory)
 
-Verification: `grep -r "FullscreenImage\|MasonryItemSelected\|MasonrySelectedFrame" src/` returns only the file definitions, no imports. The vault notes also mark these as dead.
+### Backend
 
-### Frontend hooks (unimported)
+| Item | Status | Reason to keep |
+|------|--------|----------------|
+| `Encoder::inspect_model` | Defined; not called from runtime code | Useful for debugging. Could be moved behind `#[cfg(test)]` if not needed in production. |
+| `CosineIndexState.db_path: String` field | Stored in state but the cosine module no longer reads it (audit fix) | Still needed by the indexing pipeline + commands::roots for spawning their own `ImageDatabase`. Could be routed differently and the field dropped, but currently load-bearing. |
+| `Settings::scan_root` field | Read by lib.rs setup callback for legacy migration; cleared after | Required for the one-shot legacy migration path. Cannot be removed until enough time passes that no user has the field populated. Effectively immortal. |
 
-| File | Why dead |
-|------|----------|
-| `src/hooks/useMeasure.tsx` | Mounts a portal into `#measure-root` for DOM measurement. The infrastructure (the `measure-root` div in `App.tsx`) exists but no caller imports the hook. |
+### Frontend
 
-### Backend dead methods
+| Item | Status | Reason to keep |
+|------|--------|----------------|
+| `setIsInspecting` state in `[...slug].tsx` | Verification needed: appears in head section but consumption is not visible | Marked as a Coverage gap in `architecture.md`. Either prune or document the consumption site. |
 
-| Symbol | Why dead |
-|--------|----------|
-| `ImageData::with_thumbnail` (`image_struct.rs:50`) | Alternate constructor; no call sites. The codebase uses `ImageData::new` + manual field assignment everywhere. |
-| `db::delete_tag` | Method exists; not registered in `invoke_handler!`; unreachable from frontend. (Different from "dead" in that the function itself is correct — it just has no caller.) |
+### Dependencies
 
-### Frontend dead query hook
-
-| Symbol | Why dead |
-|--------|----------|
-| `useSimilarImages` (in `src/queries/useSimilarImages.ts`) | Only `useTieredSimilarImages` is imported. The `useSimilarImages` hook still exists and would call the `get_similar_images` Tauri command, but nothing in the frontend invokes it. |
-
-The Tauri command itself (`get_similar_images`) is registered and would respond — only the React hook wrapper is unused.
-
-### Dead npm dependencies
-
-| Package | Status |
-|---------|--------|
-| `zustand` | Declared in `package.json:35`, zero `import` sites in `src/`. Carry-over from earlier memory-bank planning that intended to use Zustand for state. TanStack Query took its place. |
-| `atropos` | `package.json:21`. Imported as CSS in `App.tsx:3` (`atropos/css`) — the runtime is not used. The 3D tilt is implemented with framer-motion (`MasonryItem.tsx`), not atropos. The CSS adds a few KB to the bundle. |
-| `@types/lodash.debounce` | `package.json:20`. Type-only; the actual import is `lodash/debounce` in `Masonry.tsx:4`. Could probably be replaced with `@types/lodash` for consistency, or removed if `lodash`'s own types are good enough. |
+| Package | Status | Reason / action |
+|---------|--------|-----------------|
+| `zustand` | Declared in `package.json`, zero `import` sites in `src/` | Carry-over from earlier memory-bank planning. Safe to remove. |
+| `atropos` | Imported as CSS in `App.tsx` (`atropos/css`); the runtime is not used | The 3D tilt is implemented with framer-motion, not atropos. The CSS adds a few KB. Safe to remove the CSS import + the dep. |
+| `@types/lodash.debounce` | Imported via `lodash/debounce` in `Masonry.tsx` | Type-only. Could swap for `@types/lodash` for consistency, or remove if `lodash`'s own types are good enough. Low priority. |
 
 ## Rationale
 
-Dead code is preserved here as a list of cleanup candidates rather than an urgency. The trade-off:
-
-- **Pro of removing:** smaller node_modules, less code to scan when onboarding, no risk of someone importing a deprecated component.
-- **Con of removing:** if any of these were near-future plans (e.g., a settings page that wants `useMeasure`), removing pre-emptively is rework when they come back.
-
-Today nothing in the active roadmap suggests any of these will be needed. A single sweep PR is fine.
+The bulk of the previous inventory was closed in two waves: Phase 2's dead-code sweep + Phase 6's wiring of orphaned methods + the audit's modularisation/extraction findings. The residual list is small and not urgent.
 
 ## Guiding Principles
 
-- Don't import any of these into new code. If a use case for `useMeasure` or `Atropos` arises, add it back deliberately rather than reviving from corpse.
-- The list above is the canonical inventory; if a sweep PR is opened, this note's "Inventory" section is the source of truth for what to remove.
-- Verify each removal with `grep` before deletion — past sessions have introduced "dead" markers that were actually live.
+- **Don't import any of the removed items into new code.** If a use case for one arises, add it back deliberately rather than reviving from corpse.
+- **The list above is the canonical inventory** — if a small sweep PR is opened, this section is the source of truth for what to remove.
+- **Verify each removal with `Grep` before deletion** — past sessions have introduced "dead" markers that were actually live (e.g., `useSimilarImages` was flagged but a future change might re-import it).
 
 ## Trigger to revisit
 
-If the inventory grows past ~10 items, the sweep should happen — past that point the noise starts to matter. Today's inventory is below that threshold.
+When the residual list grows past ~5 items again, schedule a small sweep PR. Today's residual is below that threshold.

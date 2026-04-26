@@ -129,6 +129,7 @@ pub fn try_spawn_pipeline(
     state: Arc<IndexingState>,
     db_path: String,
     cosine_index: Arc<std::sync::Mutex<CosineIndex>>,
+    cosine_current_encoder: Arc<std::sync::Mutex<String>>,
 ) -> Result<(), IndexingError> {
     // Acquire the single-flight slot atomically.
     if state
@@ -150,7 +151,7 @@ pub fn try_spawn_pipeline(
         }
         let _guard = RunningGuard(state.clone());
 
-        if let Err(e) = run_pipeline_inner(&app, &db_path, &cosine_index) {
+        if let Err(e) = run_pipeline_inner(&app, &db_path, &cosine_index, &cosine_current_encoder) {
             error!("pipeline error: {e}");
             emit(
                 &app,
@@ -167,11 +168,18 @@ pub fn try_spawn_pipeline(
 
 /// The actual pipeline body. Errors propagate up and become a
 /// `Phase::Error` event in the spawning closure.
-#[tracing::instrument(name = "pipeline.run", skip(app, cosine_index))]
+///
+/// `cosine_current_encoder` is the same Arc<Mutex<String>> held by
+/// `CosineIndexState.current_encoder_id` — the pipeline writes into
+/// it after the priority encoder's phase finishes, so the in-memory
+/// cache and the "what's loaded" marker stay in sync without the next
+/// search command needing to repopulate.
+#[tracing::instrument(name = "pipeline.run", skip(app, cosine_index, cosine_current_encoder))]
 fn run_pipeline_inner(
     app: &AppHandle,
     db_path: &str,
     cosine_index: &Arc<std::sync::Mutex<CosineIndex>>,
+    cosine_current_encoder: &Arc<std::sync::Mutex<String>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 0. Try the on-disk cosine cache before doing anything else. On a
     //    typical second-launch with no new images, the cache is fresh
@@ -236,8 +244,8 @@ fn run_pipeline_inner(
     //     a spinner.
     {
         let models_dir = paths::models_dir();
-        let model_path = models_dir.join("model_text.onnx");
-        let tokenizer_path = models_dir.join("tokenizer.json");
+        let model_path = models_dir.join(crate::model_download::CLIP_TEXT_FILENAME);
+        let tokenizer_path = models_dir.join(crate::model_download::CLIP_TOKENIZER_FILENAME);
         if model_path.exists() && tokenizer_path.exists() {
             // Bind the State separately so its lifetime extends across
             // the full block. Inlining `app.state::<TextEncoderState>()
@@ -370,19 +378,32 @@ fn run_pipeline_inner(
     //
     // The encoder phase span lives inside its spawned thread so the
     // perf report still attributes its time correctly.
-    let image_model_path = paths::models_dir().join("model_image.onnx");
+    let image_model_path = paths::models_dir().join(crate::model_download::CLIP_VISION_FILENAME);
     let encoder_handle: Option<thread::JoinHandle<Result<(), String>>> =
         if image_model_path.exists() {
             let app = app.clone();
             let db_path_for_encoder = db_path.to_string();
             let model_path = image_model_path.clone();
+            // Clone the cosine state Arcs into the spawned thread so
+            // it can hot-populate the cache after the priority encoder
+            // finishes — without waiting for the bulk populate at the
+            // end of run_pipeline_inner.
+            let cosine_index_for_encoder = cosine_index.clone();
+            let cosine_current_encoder_for_encoder = cosine_current_encoder.clone();
             Some(thread::spawn(move || {
-                run_encoder_phase(&app, &db_path_for_encoder, &model_path)
+                run_encoder_phase(
+                    &app,
+                    &db_path_for_encoder,
+                    &model_path,
+                    &cosine_index_for_encoder,
+                    &cosine_current_encoder_for_encoder,
+                )
             }))
         } else {
             warn!(
-                "model_image.onnx missing; embeddings will be \
-                 empty until next launch."
+                "{} missing; embeddings will be \
+                 empty until next launch.",
+                crate::model_download::CLIP_VISION_FILENAME
             );
             None
         };
@@ -468,11 +489,41 @@ fn run_pipeline_inner(
         }
     }
 
-    // 7. Repopulate the in-memory cosine cache from the now-fresh
-    //    embeddings, then persist to disk so next-launch starts hot.
-    let _cosine_phase = tracing::info_span!("pipeline.cosine_repopulate").entered();
-    if let Ok(mut idx) = cosine_index.lock() {
-        idx.populate_from_db(&database);
+    // 7. Final safety-net cosine populate.
+    //
+    //    The per-encoder hot-populate inside run_encoder_phase already
+    //    loaded the priority encoder's cache as soon as that encoder's
+    //    phase finished — so by the time we get here, the cache is
+    //    almost always already correct. This block is a safety net for
+    //    two cases:
+    //      (a) priority encoder didn't get a chance to run (e.g. its
+    //          model file was missing — we fall back to CLIP);
+    //      (b) the cache held stale state from a previous session and
+    //          the priority encoder happened to be one we don't run.
+    //
+    //    Either way we resolve the priority + populate for it. This is
+    //    the canonical "what's loaded matches the user's pick" point
+    //    and the only place that triggers `save_to_disk`, so the next
+    //    launch starts hot.
+    let priority = crate::settings::Settings::load()
+        .priority_image_encoder
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "clip_vit_b_32".to_string());
+    let _cosine_phase = tracing::info_span!("pipeline.cosine_repopulate", encoder = %priority).entered();
+    // Lock order: current_encoder_id first, then index — must match
+    // CosineIndexState::ensure_loaded_for to keep the search path
+    // deadlock-free.
+    if let (Ok(mut cur), Ok(mut idx)) =
+        (cosine_current_encoder.lock(), cosine_index.lock())
+    {
+        // Skip the DB read if the per-encoder hot-populate inside
+        // run_encoder_phase already loaded this same encoder — a
+        // common case for the priority encoder.
+        let already_loaded = *cur == priority && !idx.cached_images.is_empty();
+        if !already_loaded {
+            idx.populate_from_db_for_encoder(&database, &priority);
+            *cur = priority.clone();
+        }
         idx.save_to_disk();
     }
     drop(_cosine_phase);
@@ -507,17 +558,26 @@ fn run_encoder_phase(
     app: &AppHandle,
     db_path: &str,
     image_model_path: &Path,
+    cosine_index: &Arc<std::sync::Mutex<CosineIndex>>,
+    cosine_current_encoder: &Arc<std::sync::Mutex<String>>,
 ) -> Result<(), String> {
-    // Encodes through three image encoders sequentially:
-    //   1. CLIP-ViT-B/32 (legacy default, also written to images.embedding
-    //      for backward compatibility with semantic_search's existing
-    //      get_image_embedding call site)
-    //   2. SigLIP-2-Base (new, for users who pick it in Settings)
-    //   3. DINOv2-Small (new, for "View Similar" — image-image specialist)
+    // Encodes through three image encoders sequentially. Order is
+    // dynamic — the user's `priority_image_encoder` setting (if any)
+    // runs FIRST so its embeddings land in the DB ASAP and the cosine
+    // cache hot-populates for it as soon as the phase finishes. The
+    // other two then run in their default order behind it. This
+    // addresses the "I picked DINOv2 but encoding spent 20 minutes on
+    // SigLIP-2 first" UX problem.
+    //
+    // Default order (no priority set, or priority unrecognised):
+    //   1. CLIP-ViT-B/32 (also written to legacy images.embedding for
+    //      back-compat with semantic_search's existing call site)
+    //   2. SigLIP-2-Base
+    //   3. DINOv2-Base
     //
     // Each encoder's results land in the embeddings table keyed by
-    // (image_id, encoder_id), so swapping encoders in Settings doesn't
-    // require re-encoding.
+    // (image_id, encoder_id), so swapping encoders in Settings later
+    // doesn't require re-encoding.
     //
     // Sequential rather than parallel because each encoder is single-
     // threaded ONNX inference — running them all in parallel would
@@ -527,37 +587,83 @@ fn run_encoder_phase(
 
     let database = ImageDatabase::new(db_path).map_err(|e| e.to_string())?;
 
-    // 1. CLIP — legacy column + new embeddings table.
-    run_clip_encoder(app, &database, image_model_path)?;
+    // Read the priority pick once at phase start; ignore None / empty /
+    // unknown so the default order applies as a safe fallback.
+    let priority = crate::settings::Settings::load()
+        .priority_image_encoder
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default();
 
-    // 2. SigLIP-2 — new embeddings table only.
+    // Default order, then move priority to the front (if recognised).
+    let mut order: Vec<&str> = vec!["clip_vit_b_32", "siglip2_base", "dinov2_base"];
+    if let Some(pos) = order.iter().position(|e| *e == priority.as_str()) {
+        let p = order.remove(pos);
+        order.insert(0, p);
+    }
+    info!("encoder order this run: {order:?} (priority={priority:?})");
+
     let siglip2_path = paths::models_dir().join(
         crate::similarity_and_semantic_search::encoder_siglip2::SIGLIP2_IMAGE_MODEL_FILENAME,
     );
-    if siglip2_path.exists() {
-        run_trait_encoder(
-            app,
-            &database,
-            "siglip2_base",
-            || crate::similarity_and_semantic_search::encoder_siglip2::Siglip2ImageEncoder::new(&siglip2_path),
-        )?;
-    } else {
-        warn!("SigLIP-2 image model missing at {}; skipping", siglip2_path.display());
-    }
-
-    // 3. DINOv2 — new embeddings table only.
     let dinov2_path = paths::models_dir().join(
         crate::similarity_and_semantic_search::encoder_dinov2::DINOV2_IMAGE_MODEL_FILENAME,
     );
-    if dinov2_path.exists() {
-        run_trait_encoder(
-            app,
-            &database,
-            "dinov2_small",
-            || crate::similarity_and_semantic_search::encoder_dinov2::Dinov2ImageEncoder::new(&dinov2_path),
-        )?;
-    } else {
-        warn!("DINOv2 image model missing at {}; skipping", dinov2_path.display());
+
+    for encoder_id in order {
+        match encoder_id {
+            "clip_vit_b_32" => {
+                run_clip_encoder(app, &database, image_model_path)?;
+            }
+            "siglip2_base" => {
+                if siglip2_path.exists() {
+                    run_trait_encoder(
+                        app,
+                        &database,
+                        "siglip2_base",
+                        || crate::similarity_and_semantic_search::encoder_siglip2::Siglip2ImageEncoder::new(&siglip2_path),
+                    )?;
+                } else {
+                    warn!("SigLIP-2 image model missing at {}; skipping", siglip2_path.display());
+                    continue; // don't hot-populate for an encoder that didn't run
+                }
+            }
+            "dinov2_base" => {
+                if dinov2_path.exists() {
+                    run_trait_encoder(
+                        app,
+                        &database,
+                        crate::similarity_and_semantic_search::encoder_dinov2::DINOV2_ENCODER_ID,
+                        || crate::similarity_and_semantic_search::encoder_dinov2::Dinov2ImageEncoder::new(&dinov2_path),
+                    )?;
+                } else {
+                    warn!("DINOv2 image model missing at {}; skipping", dinov2_path.display());
+                    continue;
+                }
+            }
+            _ => continue,
+        }
+
+        // Per-encoder hot-populate of the cosine cache. Only fires for
+        // the priority encoder — the cache holds ONE encoder at a time,
+        // and the user's image-image picker drives which one. As soon
+        // as that encoder's phase finishes, image-image becomes
+        // searchable without waiting for the other encoders.
+        //
+        // Lock order MUST match `CosineIndexState::ensure_loaded_for`
+        // (current_encoder_id first, then index). Reversing the order
+        // here would risk a deadlock against a concurrent search call,
+        // and a write-only-to-index-then-id sequence opens a window
+        // where a search reads the old id but the freshly-populated
+        // cache and silently wipes it by repopulating for the old id.
+        if encoder_id == priority {
+            info!("hot-populating cosine cache for priority encoder '{encoder_id}'");
+            if let (Ok(mut cur), Ok(mut idx)) =
+                (cosine_current_encoder.lock(), cosine_index.lock())
+            {
+                idx.populate_from_db_for_encoder(&database, encoder_id);
+                *cur = encoder_id.to_string();
+            }
+        }
     }
 
     Ok(())
@@ -582,25 +688,76 @@ fn run_clip_encoder(
     }
     emit(app, Phase::Encode, 0, total, Some("Encoding (CLIP)".into()));
 
+    let run_started = std::time::Instant::now();
     let mut encoder = ClipImageEncoder::new(model_path).map_err(|e| e.to_string())?;
     const BATCH_SIZE: usize = 32;
     let mut processed = 0usize;
+    let mut succeeded = 0usize;
+    let mut failed_paths: Vec<String> = Vec::new();
+    let mut sample_emitted = false;
     for chunk in needs_embed.chunks(BATCH_SIZE) {
         let batch_paths: Vec<&Path> = chunk.iter().map(|i| Path::new(&i.path)).collect();
-        let embeddings = encoder.encode_batch(&batch_paths).map_err(|e| e.to_string())?;
-        for (image, embedding) in chunk.iter().zip(embeddings.iter()) {
-            // Legacy column (semantic_search still reads this).
-            database
-                .update_image_embedding(image.id, embedding.clone())
-                .map_err(|e| e.to_string())?;
-            // New per-encoder table.
-            database
-                .upsert_embedding(image.id, "clip_vit_b_32", embedding)
-                .map_err(|e| e.to_string())?;
+        match encoder.encode_batch(&batch_paths) {
+            Ok(embeddings) => {
+                // Preprocessing/embedding sample diagnostic — fires
+                // once per encoder run on the first successful batch.
+                // Captures dim, L2 norm, range, NaN count of the first
+                // embedding so the report can show "CLIP first encoded
+                // image: 512-d, norm=1.000, range [-0.18, 0.21], no
+                // NaNs" — pinpoints encoder breakage early.
+                if !sample_emitted {
+                    if let (Some(first_path), Some(first_emb)) =
+                        (chunk.first(), embeddings.first())
+                    {
+                        emit_preprocessing_sample("clip_vit_b_32", &first_path.path, first_emb);
+                        sample_emitted = true;
+                    }
+                }
+                for (image, embedding) in chunk.iter().zip(embeddings.iter()) {
+                    // Legacy column (semantic_search still reads this).
+                    if let Err(e) = database.update_image_embedding(image.id, embedding.clone()) {
+                        failed_paths.push(format!("{}: db legacy write — {e}", image.path));
+                        continue;
+                    }
+                    // New per-encoder table.
+                    if let Err(e) = database.upsert_embedding(image.id, "clip_vit_b_32", embedding) {
+                        failed_paths.push(format!("{}: db per-encoder write — {e}", image.path));
+                        continue;
+                    }
+                    succeeded += 1;
+                }
+            }
+            Err(e) => {
+                // Whole batch failed — record each path as a failure
+                // with the shared error rather than aborting indexing.
+                let err_str = e.to_string();
+                for image in chunk.iter() {
+                    failed_paths.push(format!("{}: encode_batch — {}", image.path, err_str));
+                }
+            }
         }
         processed += chunk.len();
         emit(app, Phase::Encode, processed, total, Some("Encoding (CLIP)".into()));
     }
+
+    // Emit a per-encoder run summary so the report shows
+    // "CLIP attempted 1842, succeeded 1840, failed 2 (sample paths
+    // ...), mean 12.3 ms/image". Failed-path samples turn an opaque
+    // 0.1% failure rate into something a user can diagnose.
+    let elapsed_ms = run_started.elapsed().as_millis() as u64;
+    let mean_per_image_ms = if processed > 0 { elapsed_ms as f64 / processed as f64 } else { 0.0 };
+    crate::perf::record_diagnostic(
+        "encoder_run_summary",
+        serde_json::json!({
+            "encoder_id": "clip_vit_b_32",
+            "attempted": processed,
+            "succeeded": succeeded,
+            "failed": failed_paths.len(),
+            "elapsed_ms": elapsed_ms,
+            "mean_per_image_ms": mean_per_image_ms,
+            "failed_sample": failed_paths.iter().take(10).cloned().collect::<Vec<_>>(),
+        }),
+    );
     Ok(())
 }
 
@@ -627,22 +784,109 @@ where
     let label = format!("Encoding ({encoder_id})");
     emit(app, Phase::Encode, 0, total, Some(label.clone()));
 
+    let run_started = std::time::Instant::now();
     let mut encoder = make_encoder().map_err(|e| e.to_string())?;
     let mut processed = 0usize;
+    let mut succeeded = 0usize;
+    let mut failed_paths: Vec<String> = Vec::new();
+    let mut sample_emitted = false;
     // Trait default `encode_batch` falls back to one-by-one. Future:
     // override per encoder if batching is faster.
     for chunk in needs.chunks(32) {
         let paths: Vec<&StdPath> = chunk.iter().map(|(_, p)| StdPath::new(p)).collect();
-        let embeddings = encoder.encode_batch(&paths).map_err(|e| e.to_string())?;
-        for ((id, _path), embedding) in chunk.iter().zip(embeddings.iter()) {
-            database
-                .upsert_embedding(*id, encoder_id, embedding)
-                .map_err(|e| e.to_string())?;
+        match encoder.encode_batch(&paths) {
+            Ok(embeddings) => {
+                if !sample_emitted {
+                    if let (Some((_, first_path)), Some(first_emb)) =
+                        (chunk.first(), embeddings.first())
+                    {
+                        emit_preprocessing_sample(encoder_id, first_path, first_emb);
+                        sample_emitted = true;
+                    }
+                }
+                for ((id, path), embedding) in chunk.iter().zip(embeddings.iter()) {
+                    if let Err(e) = database.upsert_embedding(*id, encoder_id, embedding) {
+                        failed_paths.push(format!("{}: db write — {e}", path));
+                        continue;
+                    }
+                    succeeded += 1;
+                }
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+                for (_, path) in chunk.iter() {
+                    failed_paths.push(format!("{}: encode_batch — {}", path, err_str));
+                }
+            }
         }
         processed += chunk.len();
         emit(app, Phase::Encode, processed, total, Some(label.clone()));
     }
+
+    // Per-encoder run summary diagnostic — same shape as the CLIP
+    // path. Lets the report show side-by-side cost + failure rates
+    // across CLIP / SigLIP-2 / DINOv2.
+    let elapsed_ms = run_started.elapsed().as_millis() as u64;
+    let mean_per_image_ms = if processed > 0 { elapsed_ms as f64 / processed as f64 } else { 0.0 };
+    crate::perf::record_diagnostic(
+        "encoder_run_summary",
+        serde_json::json!({
+            "encoder_id": encoder_id,
+            "attempted": processed,
+            "succeeded": succeeded,
+            "failed": failed_paths.len(),
+            "elapsed_ms": elapsed_ms,
+            "mean_per_image_ms": mean_per_image_ms,
+            "failed_sample": failed_paths.iter().take(10).cloned().collect::<Vec<_>>(),
+        }),
+    );
     Ok(())
+}
+
+/// Emit a `preprocessing_sample` diagnostic for the first image
+/// encoded by an encoder. Captures embedding-side stats (dim, L2
+/// norm, value range, NaN/Inf counts) — these reflect both the
+/// preprocessing pipeline AND the encoder's output health in one
+/// shot. Cheap (microseconds).
+fn emit_preprocessing_sample(encoder_id: &str, image_path: &str, embedding: &[f32]) {
+    let dim = embedding.len();
+    let nan_count = embedding.iter().filter(|x| x.is_nan()).count();
+    let inf_count = embedding.iter().filter(|x| x.is_infinite()).count();
+    let finite: Vec<f32> = embedding.iter().filter(|x| x.is_finite()).copied().collect();
+    let (min, max, mean, l2_norm) = if finite.is_empty() {
+        (0.0, 0.0, 0.0, 0.0)
+    } else {
+        let min = finite.iter().cloned().fold(f32::INFINITY, f32::min);
+        let max = finite.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mean = finite.iter().sum::<f32>() / finite.len() as f32;
+        let l2 = finite.iter().map(|x| x * x).sum::<f32>().sqrt();
+        (min, max, mean, l2)
+    };
+    let interpretation = if nan_count > 0 || inf_count > 0 {
+        "BROKEN — NaN/Inf in embedding (preprocessing or encoder bug)"
+    } else if l2_norm < 0.01 {
+        "WARNING — near-zero norm; encoder produced degenerate output"
+    } else if (l2_norm - 1.0).abs() < 0.01 {
+        "OK — L2-normalised unit vector"
+    } else {
+        "Non-normalised — cosine still works since math divides by norms"
+    };
+    crate::perf::record_diagnostic(
+        "preprocessing_sample",
+        serde_json::json!({
+            "encoder_id": encoder_id,
+            "first_image_path": image_path,
+            "embedding_dim": dim,
+            "l2_norm": l2_norm,
+            "min": min,
+            "max": max,
+            "mean": mean,
+            "nan_count": nan_count,
+            "inf_count": inf_count,
+            "first_8_dims": embedding.iter().take(8).copied().collect::<Vec<f32>>(),
+            "interpretation": interpretation,
+        }),
+    );
 }
 
 fn emit(

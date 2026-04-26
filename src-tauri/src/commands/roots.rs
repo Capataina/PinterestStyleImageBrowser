@@ -57,6 +57,7 @@ pub fn set_scan_root(
         indexing_state.inner().clone(),
         cosine_state.db_path.clone(),
         cosine_state.index.clone(),
+        cosine_state.current_encoder_id.clone(),
     )
     .map_err(|e| ApiError::Internal(e.to_string()))?;
 
@@ -93,6 +94,7 @@ pub fn add_root(
         indexing_state.inner().clone(),
         cosine_state.db_path.clone(),
         cosine_state.index.clone(),
+        cosine_state.current_encoder_id.clone(),
     )
     .map_err(|e| ApiError::Internal(e.to_string()))?;
 

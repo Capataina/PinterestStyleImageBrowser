@@ -42,9 +42,10 @@ export interface UserPreferences {
    * Encoder used for "View Similar" (image→image) queries.
    * Matches the encoder_id values returned by the backend
    * `list_available_encoders` command.
-   * Default `dinov2_small` per the project-enhancement agent's
-   * recommendation — DINOv2 dominates CLIP for image-image
-   * similarity by 2-5× on benchmarks.
+   * Default `dinov2_base` — DINOv2 dominates CLIP for image-image
+   * similarity by 2-5× on benchmarks. (Was `dinov2_small` in older
+   * builds; that ID is dead post pipeline-version 2 and would route
+   * every "View Similar" click to an empty cosine cache.)
    */
   imageEncoder: string;
   /**
@@ -72,7 +73,7 @@ const DEFAULTS: UserPreferences = {
   similarResultCount: 35,
   semanticResultCount: 50,
   tagFilterMode: "any",
-  imageEncoder: "dinov2_small",
+  imageEncoder: "dinov2_base",
   textEncoder: "clip_vit_b_32",
 };
 
@@ -86,7 +87,16 @@ function loadFromStorage(): UserPreferences {
     const parsed = JSON.parse(raw) as Partial<UserPreferences>;
     // Merge with defaults so newly-added fields land at their defaults
     // rather than undefined.
-    return { ...DEFAULTS, ...parsed };
+    const merged = { ...DEFAULTS, ...parsed };
+    // Migrate legacy encoder IDs that no longer exist in the backend.
+    // Pre pipeline-version-2 saved `dinov2_small` (384-d Small) — that
+    // ID was wiped by the migration and the active encoder is
+    // `dinov2_base` (768-d). Without this remap, returning users keep
+    // dispatching against an empty cosine cache.
+    if (merged.imageEncoder === "dinov2_small") {
+      merged.imageEncoder = "dinov2_base";
+    }
+    return merged;
   } catch {
     return { ...DEFAULTS };
   }

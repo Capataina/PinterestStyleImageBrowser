@@ -110,6 +110,33 @@ impl CosineIndex {
                 "duration_ms": elapsed_ms,
             }),
         );
+
+        // Embedding-quality diagnostics: emit per encoder so the
+        // report shows per-encoder L2-norm distribution, per-dim
+        // sanity stats, NaN/Inf counts, pairwise distance histogram,
+        // and self-similarity check. The pairwise calculation samples
+        // up to 50 embeddings (1225 cosine ops) — fast even on CPU.
+        crate::perf::record_diagnostic(
+            "embedding_stats",
+            serde_json::json!({
+                "encoder_id": encoder_id,
+                "stats": super::diagnostics::embedding_stats(&self.cached_images),
+            }),
+        );
+        crate::perf::record_diagnostic(
+            "pairwise_distance_distribution",
+            serde_json::json!({
+                "encoder_id": encoder_id,
+                "stats": super::diagnostics::pairwise_distance_distribution(&self.cached_images),
+            }),
+        );
+        crate::perf::record_diagnostic(
+            "self_similarity_check",
+            serde_json::json!({
+                "encoder_id": encoder_id,
+                "stats": super::diagnostics::self_similarity_check(&self.cached_images),
+            }),
+        );
     }
 
     /// Populate the in-memory index by SELECTing every embedding in one

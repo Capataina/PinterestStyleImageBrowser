@@ -5,22 +5,47 @@
 //! HEAD-request preflight establishes the aggregate target size; the
 //! indexing thread wires this through to the `indexing-progress` Tauri
 //! event channel so the frontend pill can render a smooth bar across all
-//! three files.
+//! files.
 //!
-//! ## Sources (verified 2026-04-25)
+//! ## Sources (verified 2026-04-26 by parallel research agents)
 //!
-//! - **Image encoder** — Xenova's HuggingFace Optimum ONNX export of
-//!   OpenAI CLIP ViT-B/32. Combined-graph variant with the signature:
-//!     - inputs: `pixel_values` [1,3,224,224], `input_ids` [1,1], `attention_mask` [1,1]
-//!     - output: `image_embeds` [1,512]
+//! All URLs HEAD-checked 200 OK on Hugging Face main; all FP32 (no
+//! quantization). Per-encoder details below.
 //!
-//! - **Text encoder** — sentence-transformers' multilingual CLIP
-//!   (clip-ViT-B-32-multilingual-v1). 50+ languages mapped into the
-//!   shared 512-d CLIP embedding space.
+//! ### CLIP ViT-B/32 (Xenova/clip-vit-base-patch32)
 //!
-//! - **Tokenizer** — the multilingual model's `tokenizer.json`.
+//! - **vision_model.onnx** (~352 MB) — input `pixel_values`
+//!   [1,3,224,224]; output `image_embeds` [1,512]
+//! - **text_model.onnx** (~254 MB) — inputs `input_ids` +
+//!   `attention_mask` [1,77]; output `text_embeds` [1,512]
+//! - **tokenizer.json** (~2 MB) — BPE byte-level, max 77 tokens, pad
+//!   with id 49407, NFC + lowercase + whitespace normalization
+//! - Image preprocessing: resize shortest-edge 224 (bicubic) +
+//!   center-crop 224×224, mean=[0.48145466, 0.4578275, 0.40821073],
+//!   std=[0.26862954, 0.26130258, 0.27577711]
 //!
-//! Total first-launch download: ~1.15 GB.
+//! ### DINOv2-Base (Xenova/dinov2-base) — image-only
+//!
+//! - **model.onnx** (~347 MB) — input `pixel_values`
+//!   [1,3,224,224]; output `last_hidden_state` [1,257,768], CLS
+//!   token = first row
+//! - Image preprocessing: resize shortest-edge 256 (bicubic) +
+//!   center-crop 224×224, ImageNet mean=[0.485, 0.456, 0.406],
+//!   std=[0.229, 0.224, 0.225]
+//!
+//! ### SigLIP-2 Base 256 (onnx-community/siglip2-base-patch16-256-ONNX)
+//!
+//! - **vision_model.onnx** (~372 MB) — input `pixel_values`
+//!   [1,3,256,256]; output `pooler_output` [1,768] (MAP head)
+//! - **text_model.onnx** (~1.13 GB) — input `input_ids` only
+//!   [1,64] int64 (NO attention_mask — fixed-length path); output
+//!   `pooler_output` [1,768]
+//! - **tokenizer.json** (~34 MB) — Gemma SentencePiece, 256k vocab,
+//!   max 64 tokens, pad with id 0, auto-appends EOS
+//! - Image preprocessing: stretched-square resize to 256×256 (bilinear,
+//!   no center-crop), mean=std=[0.5, 0.5, 0.5] → [-1, 1] range
+//!
+//! Total first-launch download: ~2.5 GB.
 
 use std::error::Error;
 use std::fs::{self, File};
@@ -31,25 +56,30 @@ use tracing::{debug, info, warn};
 
 use crate::paths;
 
-use crate::similarity_and_semantic_search::encoder_dinov2;
-// encoder_siglip2 import removed alongside the SigLIP-2 download targets;
-// re-add when verified URLs land.
+use crate::similarity_and_semantic_search::{encoder_dinov2, encoder_siglip2};
 
-/// Image encoder ONNX. Xenova/clip-vit-base-patch32 combined-graph export.
-const IMAGE_MODEL_URL: &str =
-    "https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/main/onnx/model.onnx";
+// =====================================================================
+// CLIP ViT-B/32 (Xenova) — separate vision + text + tokenizer
+// =====================================================================
 
-/// Multilingual text encoder ONNX. sentence-transformers/clip-ViT-B-32-multilingual-v1.
-const TEXT_MODEL_URL: &str =
-    "https://huggingface.co/sentence-transformers/clip-ViT-B-32-multilingual-v1/resolve/main/onnx/model.onnx";
+/// CLIP image encoder ONNX. Separate vision model (no joint graph,
+/// no dummy text inputs) — input `pixel_values`, output `image_embeds`.
+const CLIP_VISION_URL: &str =
+    "https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/main/onnx/vision_model.onnx";
 
-/// Tokenizer for the multilingual text encoder (BERT-like vocab).
-const TOKENIZER_URL: &str =
-    "https://huggingface.co/sentence-transformers/clip-ViT-B-32-multilingual-v1/resolve/main/tokenizer.json";
+/// CLIP text encoder ONNX. OpenAI English-only weights (NOT the
+/// multilingual distillation, which lives in a different embedding
+/// space and broke text-to-image search).
+const CLIP_TEXT_URL: &str =
+    "https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/main/onnx/text_model.onnx";
 
-const IMAGE_MODEL_FILENAME: &str = "model_image.onnx";
-const TEXT_MODEL_FILENAME: &str = "model_text.onnx";
-const TOKENIZER_FILENAME: &str = "tokenizer.json";
+/// CLIP tokenizer (byte-level BPE).
+const CLIP_TOKENIZER_URL: &str =
+    "https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/main/tokenizer.json";
+
+pub const CLIP_VISION_FILENAME: &str = "clip_vision.onnx";
+pub const CLIP_TEXT_FILENAME: &str = "clip_text.onnx";
+pub const CLIP_TOKENIZER_FILENAME: &str = "clip_tokenizer.json";
 
 /// Callback signature for download progress.
 ///
@@ -73,39 +103,53 @@ where
 {
     let models_dir = paths::models_dir();
 
-    // CLIP (legacy default) + SigLIP-2 (new default text+image) +
+    // CLIP (legacy default + reliable text encoder) + SigLIP-2 (new
+    // default text+image, sigmoid loss, better English alignment) +
     // DINOv2 (image-only "View Similar" specialist).
     //
-    // All seven files are downloaded eagerly at first launch so every
+    // All eight files are downloaded eagerly at first launch so every
     // encoder choice in the Settings picker "just works" without
-    // mid-session downloads. Total size on disk: ~2.1GB. The progress
-    // callback shows aggregate bytes across all files for one smooth
-    // determinate bar.
+    // mid-session downloads. Total size on disk: ~2.5GB.
     //
-    // If a URL 404s, the user gets a download error and can update the
-    // const to the right HF path. Each encoder family's URLs live in
-    // its own module (see encoder_siglip2.rs, encoder_dinov2.rs) so
-    // fixes are localised.
+    // Per-file fail-soft: a single 401/404 doesn't abort the batch —
+    // each file's failure is logged with its URL so the user can
+    // identify which one needs a corrected URL. Each encoder family's
+    // URLs live in its own module (encoder_siglip2.rs, encoder_dinov2.rs)
+    // for localised fixes.
     let targets = [
-        // CLIP family (image, text, tokenizer)
-        (IMAGE_MODEL_URL, IMAGE_MODEL_FILENAME),
-        (TEXT_MODEL_URL, TEXT_MODEL_FILENAME),
-        (TOKENIZER_URL, TOKENIZER_FILENAME),
-        // DINOv2 (image only — no text encoder, no tokenizer)
+        // CLIP family — separate vision + text branches (NOT the
+        // combined-graph model, which embeds the multilingual text
+        // tower that misaligns with the image space).
+        (CLIP_VISION_URL, CLIP_VISION_FILENAME),
+        (CLIP_TEXT_URL, CLIP_TEXT_FILENAME),
+        (CLIP_TOKENIZER_URL, CLIP_TOKENIZER_FILENAME),
+        // DINOv2-Base (image only — no text encoder, no tokenizer).
+        // Upgraded from -Small (384-dim → 768-dim, ~4× capacity).
         (
             encoder_dinov2::DINOV2_IMAGE_MODEL_URL,
             encoder_dinov2::DINOV2_IMAGE_MODEL_FILENAME,
         ),
-        // SigLIP-2 entries removed — both attempted URLs (Xenova,
-        // onnx-community) returned 401. Re-add once a verified
-        // ONNX export URL is available. The encoder_siglip2 module
-        // stays compiled (the URLs are still defined as constants
-        // there for future use).
+        // SigLIP-2 — vision + text + tokenizer. Verified working
+        // URL: `onnx-community/siglip2-base-patch16-256-ONNX`. Note
+        // the 256 (not 224) input size and the very large 1.13 GB
+        // text model (Gemma 256k vocab).
+        (
+            encoder_siglip2::SIGLIP2_IMAGE_MODEL_URL,
+            encoder_siglip2::SIGLIP2_IMAGE_MODEL_FILENAME,
+        ),
+        (
+            encoder_siglip2::SIGLIP2_TEXT_MODEL_URL,
+            encoder_siglip2::SIGLIP2_TEXT_MODEL_FILENAME,
+        ),
+        (
+            encoder_siglip2::SIGLIP2_TOKENIZER_URL,
+            encoder_siglip2::SIGLIP2_TOKENIZER_FILENAME,
+        ),
     ];
 
     // Phase 1: figure out which files are missing and how big they are
     // in total. This lets the caller's progress bar be determinate
-    // across the whole 1+GB download rather than per-file.
+    // across the whole 2+GB download rather than per-file.
     let mut to_download: Vec<(&str, &str, u64)> = Vec::new();
     for (url, filename) in targets {
         let dest = models_dir.join(filename);
@@ -293,7 +337,7 @@ mod tests {
 
     #[test]
     fn test_url_constants_are_well_formed() {
-        for url in [IMAGE_MODEL_URL, TEXT_MODEL_URL, TOKENIZER_URL] {
+        for url in [CLIP_VISION_URL, CLIP_TEXT_URL, CLIP_TOKENIZER_URL] {
             assert!(
                 url.starts_with("https://huggingface.co/"),
                 "URL must point at HuggingFace, got {url}"
@@ -306,22 +350,22 @@ mod tests {
     }
 
     #[test]
-    fn test_filenames_match_what_the_rest_of_the_codebase_expects() {
-        // These names are referenced from main.rs (image model) and
-        // lib.rs::semantic_search (text model + tokenizer). If any
-        // filename here changes, those callers break.
-        assert_eq!(IMAGE_MODEL_FILENAME, "model_image.onnx");
-        assert_eq!(TEXT_MODEL_FILENAME, "model_text.onnx");
-        assert_eq!(TOKENIZER_FILENAME, "tokenizer.json");
+    fn test_filenames_are_distinct() {
+        // Each file must have a unique filename — they all land in
+        // the same models_dir. Reusing a filename would silently
+        // overwrite the wrong model.
+        let names = [
+            CLIP_VISION_FILENAME,
+            CLIP_TEXT_FILENAME,
+            CLIP_TOKENIZER_FILENAME,
+        ];
+        let unique: std::collections::HashSet<_> = names.iter().collect();
+        assert_eq!(unique.len(), names.len(), "duplicate filename in CLIP set");
     }
 
     #[test]
     fn test_progress_signature_compiles() {
-        // Compile-time only: ensures the closure shape we pass from
-        // indexing.rs matches what download_models_if_missing expects.
-        // Doesn't actually fetch anything.
         let _f = |_processed: u64, _total: u64, _file: Option<&str>| {};
-        // Confirms F's bounds: Fn(u64, u64, Option<&str>) + Send + Sync
         fn assert_fn<F: Fn(u64, u64, Option<&str>) + Send + Sync>(_: F) {}
         assert_fn(|_a, _b, _c| {});
     }

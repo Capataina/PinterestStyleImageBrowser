@@ -4,15 +4,29 @@
 
 ## Scope / Purpose
 
-Generates and caches small JPEG thumbnails for every image in the database. Stores them on disk as `.thumbnails/thumb_{id}.jpg` and writes the thumbnail path plus original dimensions back to the `images` table for fast frontend layout. The grid does not load full-resolution images — only thumbnails.
+Generates and caches small JPEG thumbnails for every image in the database. Stores them on disk under `Library/thumbnails/root_<id>/thumb_<image_id>.jpg` (per-root subdirectory layout, Phase 9 reorg) and writes the thumbnail path plus original dimensions back to the `images` table for fast frontend layout. The grid does not load full-resolution images — only thumbnails. The full image is loaded only when the modal opens.
+
+Runs in parallel via rayon during the indexing pipeline's Phase::Thumbnail. Single-SELECT path-to-root resolution (audit fix `0bdb5f4`) replaced the previous per-image DB query.
 
 ## Boundaries / Ownership
 
-- **Owns:** thumbnail file naming, dimension math, format choice (JPEG), upscale prevention.
-- **Does not own:** the SQL update itself (delegates to `database`), full-resolution image rendering (frontend swaps to `props.item.url` only when `isSelected`).
-- **Public API:** `ThumbnailGenerator::new(thumbnail_dir, max_width, max_height)`, `generate_thumbnail(image_path, image_id)`, `generate_all_missing_thumbnails(&db)`, `get_thumbnail_path(image_id)`.
+- **Owns:** thumbnail file naming, dimension math, format choice (JPEG), upscale prevention, per-root subdirectory layout.
+- **Does not own:** the SQL update itself (delegates to `db.update_image_thumbnail`), full-resolution image rendering (frontend swaps to `props.item.url` only when `isSelected`), the rayon parallelisation (lives in the indexing pipeline), the per-root subfolder paths (delegates to `paths::thumbnails_dir_for_root(root_id)`).
+- **Public API:** `ThumbnailGenerator::new(thumbnail_dir, max_width, max_height)`, `generate_thumbnail(image_path, image_id, root_id: Option<i64>)`, `get_thumbnail_path(image_id, root_id)`.
 
 ## Current Implemented Reality
+
+### Per-root subfolder layout (Phase 9)
+
+```
+Library/thumbnails/
+  root_1/thumb_42.jpg
+  root_2/thumb_99.jpg
+  root_3/thumb_12.jpg
+  thumb_<id>.jpg                  ← legacy NULL-root_id rows go to the flat layout
+```
+
+Pre-Phase-9 was flat (`thumbnails/thumb_<id>.jpg`), which meant `remove_root` left orphaned files on disk forever. Per-root subfolders make `remove_root`'s cleanup a single `rm -rf` of the subfolder. Legacy un-migrated `root_id = NULL` rows continue writing to the flat layout via `paths::thumbnails_dir()` directly.
 
 ### Sizing math
 
@@ -29,7 +43,7 @@ Source: `thumbnail/generator.rs:97-106`. The `min(1.0)` clamp prevents upscaling
 
 ### Thumbnail dimensions
 
-`main.rs:36-38` instantiates with `max_width=400, max_height=400`. Aspect ratio is preserved.
+The indexing pipeline instantiates with `max_width=400, max_height=400`. Aspect ratio is preserved. Most thumbnails end up around 400×N or N×400.
 
 ### Generation
 
@@ -39,51 +53,80 @@ let (orig_w, orig_h) = (img.width(), img.height());
 if thumbnail_path.exists() {                    // disk cache hit — no work
     return Ok(ThumbnailResult { thumbnail_path, original_width, original_height });
 }
-let (tw, th) = self.calculate_thumbnail_size(orig_w, orig_h);
-let thumbnail = img.thumbnail(tw, th);          // image crate uses Lanczos3 internally
-thumbnail.save_with_format(&thumbnail_path, image::ImageFormat::Jpeg)?;
+let (w, h) = compute_thumbnail_dimensions(orig_w, orig_h, max_width, max_height);
+let thumb = img.thumbnail(w, h);                // image::thumbnail uses Lanczos3
+thumb.save_with_format(&thumbnail_path, ImageFormat::Jpeg)?;
 ```
 
-Source: `thumbnail/generator.rs:55-93`. Note that `image::DynamicImage::thumbnail()` uses Lanczos3 — this is *not* the same as the CLIP preprocessor's `FilterType::Nearest` (see `clip-image-encoder.md`).
+`thumbnail/generator.rs`. The disk-cache short-circuit (`if thumbnail_path.exists()`) makes the indexing pipeline's per-image work near-zero on re-runs against a populated thumbnails directory — only the DB update fires (and only for rows where `thumbnail_path` is still NULL or empty).
 
-### Batch generation
+### Parallel execution
 
-`generate_all_missing_thumbnails` queries `db.get_images_without_thumbnails()`, then loops sequentially. Per image: generate file, call `db.update_image_thumbnail(id, path, w, h)`. Logs progress every 10 images.
+```rust
+// indexing.rs::run_pipeline_inner Phase::Thumbnail
+let path_to_root = database.get_paths_to_root_ids().unwrap_or_default();
+needs_thumbs.par_iter().for_each(|image| {
+    let root_id = path_to_root.get(&image.path).copied().flatten();
+    match thumbnail_generator.generate_thumbnail(Path::new(&image.path), image.id, root_id) {
+        Ok(result) => {
+            if let Err(e) = database.update_image_thumbnail(image.id, &result.thumbnail_path, ...) {
+                warn!("DB update for thumbnail of image {} failed: {e}", image.id);
+            }
+        }
+        Err(e) => warn!("thumbnail generation failed for {}: {e}", image.path),
+    }
+    // emit progress event every ~25 thumbnails (atomic-bucket coalesced)
+});
+```
 
-The loop is **single-threaded**. For 749 images at a few hundred milliseconds each, the initial pass is several minutes.
+Per-image cost is dominated by JPEG decode + encode, which is embarrassingly parallel. The DB write under the mutex is microseconds vs ~100 ms decode/encode, so contention there is negligible. On an M-series chip with 8-12 cores this gives a ~6-10× speedup vs the previous serial loop.
+
+### Single-SELECT path → root_id (audit fix)
+
+```rust
+let path_to_root = database.get_paths_to_root_ids().unwrap_or_default();
+```
+
+Replaces the previous N+1 pattern (`get_root_id_by_path` per image-needing-thumbnail held the DB Mutex 1500 times in rapid succession on a typical first run). The new `get_paths_to_root_ids` returns the entire (path, root_id) map in one query, matching the pattern `cosine.populate_from_db` already uses for embeddings.
+
+`unwrap_or_default()` preserves the previous failure semantic: if the SELECT fails, downstream `generate_thumbnail` falls back to the legacy flat thumbnail directory (root_id None).
 
 ## Key Interfaces / Data Flow
 
-```text
-main.rs (startup)
-    ──► ThumbnailGenerator::new(.thumbnails/, 400, 400)
-    ──► generate_all_missing_thumbnails(&database)
-        ──► db.get_images_without_thumbnails()
-        ──► for each image:
-              generate_thumbnail(path, id)
-                ──► open + decode (one decode per image; full image → memory)
-                ──► if file exists: return early (don't re-encode)
-                ──► else: img.thumbnail(...) + save JPEG
-              db.update_image_thumbnail(id, path, w, h)
+```
+indexing.rs::run_pipeline_inner Phase::Thumbnail:
+  thumbnail_generator = ThumbnailGenerator::new(paths::thumbnails_dir(), 400, 400)?
+  needs_thumbs        = db.get_images_without_thumbnails()?       (LEFT JOIN, returns ImageData)
+  path_to_root        = db.get_paths_to_root_ids()?               (single SELECT)
+  
+  needs_thumbs.par_iter().for_each(|image| {
+      root_id = path_to_root.get(&image.path).copied().flatten()
+      result  = thumbnail_generator.generate_thumbnail(Path::new(&image.path), image.id, root_id)
+      db.update_image_thumbnail(image.id, &result.thumbnail_path, w, h)
+      throttled emit Phase::Thumbnail
+  });
+  emit Phase::Thumbnail final tick
 ```
 
-Output filenames follow `thumb_{id}.jpg` exactly (`generator.rs:51`). The frontend (`services/images.ts:78-80`) reconstructs the same pattern when it needs a thumbnail URL but the backend did not return one.
+Frontend later receives the thumbnail path via `ImageData::thumbnail_path` in `get_images_with_thumbnails`. `convertFileSrc(thumbnail_path)` produces a Tauri asset-protocol URL the WebView can load.
 
 ## Implemented Outputs / Artifacts
 
-- `.thumbnails/thumb_{id}.jpg` files on disk (the directory is created with `fs::create_dir_all` at `ThumbnailGenerator::new`).
-- DB columns `thumbnail_path`, `width`, `height` populated.
-- Frontend `convertFileSrc(thumbnail_path)` produces a `tauri://localhost/...`-style URL the WebView can render directly.
+- One JPEG per image at `Library/thumbnails/root_<id>/thumb_<image_id>.jpg` (or flat for legacy NULL-root_id rows).
+- DB row updated with `thumbnail_path`, `width`, `height` (the dimensions are the *original* image's, not the thumbnail's — used by Masonry for aspect-preserving layout).
+- Tracing span `pipeline.thumbnail_phase` for perf attribution.
+- Throttled `indexing-progress` events every ~25 thumbnails.
 
 ## Known Issues / Active Risks
 
 | Risk | Triggered by | Downstream impact |
 |------|--------------|-------------------|
-| Serial generation | Any first-launch on a large library | Several minutes of single-threaded JPEG encoding before the UI is usable. `rayon::par_iter` would be ~4-8× faster on multi-core. |
-| Disk-cache + DB-row drift | `update_image_thumbnail` fails after the file is written | Next run, `get_images_without_thumbnails` finds the row again, but `if thumbnail_path.exists()` short-circuits the decode/encode. So the regeneration cost is just a `stat()` — not catastrophic, but the DB still gets re-written each launch until the call succeeds. |
-| `.thumbnails/` is repo-relative | Running the app from a different working directory | The thumbnail directory is created where `cargo tauri dev` is run from. A different `cwd` produces a different `.thumbnails/`, and the DB rows still point at the old paths. |
-| Fixed 400×400 cap | A 4K display showing 4-column grid | Each tile may be 600+ pixels wide; thumbnails get scaled up by the browser, looking soft. The cap was chosen for the original 2-column grid scale. |
-| No re-thumbnail on size config change | Changing `max_width/max_height` in `main.rs` | Existing rows keep their old thumbnail dims forever — the cache existence check short-circuits. Only newly-added images get the new size. |
+| Thumbnail decode failure for a corrupt image | A bad `.jpg` byte | Logs warn; DB row stays unmarked; next pipeline run retries. Eventually the row stays orphan-thumbnail and the grid shows no tile (today the frontend falls back to a placeholder). |
+| Per-root subfolder leaks if root removed without going through `remove_root` | A user manually deletes a roots row from the DB | The subfolder isn't `rm -rf`'d. Cosmetic only. |
+| Disk-cache short-circuit assumes `thumbnail_path` matches the file on disk | A user manually deletes the JPEG file | The DB row points at a non-existent path; the WebView gets a 404 / empty asset. The next pipeline run wouldn't re-generate because the row still has `thumbnail_path NOT NULL`. Fix: `get_images_without_thumbnails` could verify `Path::new(&thumbnail_path).exists()` — adds N stat calls but is correct. |
+| Rayon `par_iter().for_each(...)` panics propagate | A panic in `generate_thumbnail` | Rayon catches and re-throws on join; the indexing pipeline body would error out; `Phase::Error` emitted. Whole-pipeline failure for one bad image. |
+| `get_paths_to_root_ids` returns the whole table | Very large libraries (100k+ images) | The HashMap grows to 100k entries; ~10 MB of paths held in memory during the thumbnail phase. Acceptable for the libraries the app realistically targets. |
+| `image::thumbnail` defaults to a fast-but-not-best resize filter | Subtle quality differences vs Lanczos3 | Acceptable for thumbnail-quality previews. The CLIP encoder uses `FilterType::Nearest` (worse) — this isn't the bottleneck. |
 
 ## Partial / In Progress
 
@@ -91,16 +134,20 @@ None.
 
 ## Planned / Missing / Likely Changes
 
-- Parallelise via `rayon` over the iter, sharing the DB Mutex.
-- Configurable target dimensions (likely surfaced in the eventual settings UI).
-- Cache invalidation when scan root changes — today there is none.
+- **Verify thumbnail file existence in `get_images_without_thumbnails`** so manual JPEG deletion triggers regeneration.
+- **WebP / AVIF output** for smaller files at the cost of decode speed in the WebView.
+- **Per-image error recovery in the rayon loop** — wrap each iteration body in `catch_unwind` so one panic doesn't kill the whole pipeline.
+- **Progressive JPEG output** so partial loads show a low-quality preview faster.
 
 ## Durable Notes / Discarded Approaches
 
-- The thumbnail size of 400×400 is hardcoded at the call site (`main.rs:36-38`), not in the generator. This was intentional so a future settings UI could tune it without touching the module.
-- `image::DynamicImage::thumbnail()` and `image::imageops::FilterType::Nearest` (in `encoder.rs`) are different code paths. The thumbnail pipeline correctly uses Lanczos3 for visual quality; the CLIP preprocessor uses Nearest for ML preprocessing — that latter choice is a quality concern flagged separately in `notes/clip-preprocessing-decisions.md`.
-- The cache-check `if thumbnail_path.exists()` at `generator.rs:61-67` is the reason a rerun is fast. Without it, every launch would re-encode every JPEG. The trade-off is: the cache cannot detect file corruption — once the file exists, it is trusted.
+- **400×400 max dimension** is a balance between visual quality on the grid (typical tile is ~250-400 px wide on a 1440p screen) and disk usage (a 400×400 JPEG is ~15-30 KB; 1500 thumbnails ≈ 30 MB).
+- **JPEG over WebP** because every browser/WebView decodes JPEG quickly with no surprises, and the encoder is built into the `image` crate. WebP would save 20-30% of disk but add load overhead in some WebView versions.
+- **Original dimensions stored in DB, not thumbnail dimensions.** Masonry layout uses original aspect ratio (so a 16:9 photo's tile is 16:9-shaped). Storing thumb dimensions would lose the aspect info.
+- **Per-root subfolders are the Phase 9 reorg.** Pre-Phase-9 was flat; root removal left orphan files. Now `remove_root` `rm -rf`s the subfolder. Legacy NULL-root_id rows still write flat — the dual layout is intentional.
+- **The disk-cache short-circuit assumes the file exists if the DB says so.** Trade-off: avoids a stat() per image on warm runs but trusts the DB-vs-disk consistency. The `Planned / Missing` item above proposes verifying.
+- **Rayon over manual thread pools** because the parallelism is per-image (embarrassingly parallel, no inter-task communication) and rayon's work-stealing matches the workload shape perfectly.
 
 ## Obsolete / No Longer Relevant
 
-None.
+The pre-Phase-5 sequential thumbnail loop is gone (now rayon-parallel). The pre-Phase-9 flat layout is gone (now per-root subfolders). The N+1 `get_root_id_by_path` is gone (replaced by `get_paths_to_root_ids`).

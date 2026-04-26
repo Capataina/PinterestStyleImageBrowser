@@ -20,6 +20,7 @@
 //! imports continue to work without any caller changes.
 
 mod cache;
+pub mod diagnostics;
 pub mod index;
 pub(crate) mod math;
 

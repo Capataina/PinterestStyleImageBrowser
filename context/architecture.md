@@ -2,9 +2,9 @@
 
 ## Scope / Purpose
 
-Image Browser is a local-first Tauri 2 desktop application for browsing, tagging, and semantically searching large personal image libraries. A Rust backend handles filesystem scanning, SQLite persistence, thumbnail generation, and ONNX-Runtime CLIP inference for both image embeddings and multilingual text-query embeddings. A React 19 frontend renders a Pinterest-style masonry grid, modal inspector, and tag/search UI. Everything runs offline on consumer hardware with a CPU fallback when CUDA is unavailable.
+Image Browser is a local-first Tauri 2 desktop application for browsing, tagging, semantically searching, and annotating large personal image libraries. The Rust backend handles filesystem scanning, SQLite persistence (WAL), thumbnail generation, ONNX-Runtime inference across **three encoder families** (CLIP ViT-B/32 OpenAI English, DINOv2-Base, SigLIP-2 Base 256), multi-folder lifecycle, a filesystem watcher with orphan detection, an opt-in profiling + domain-diagnostic layer, and first-launch model downloads from HuggingFace. The React 19 frontend renders a Pinterest-style masonry grid, a modal inspector with annotations, a settings drawer (with per-direction encoder picker), a live indexing-status pill, and an optional perf-overlay. Everything runs offline on consumer hardware; backend runs CPU on macOS for ONNX (CoreML produces runtime errors for these models) and tries CUDA on non-macOS, with CPU fallback.
 
-This document is the structural map. Subsystem-level reality lives in `systems/`. Project-level rationale and conventions live in `notes/`.
+This document is the structural map. Subsystem-level reality lives in `systems/`. Project-level rationale and conventions live in `notes/`. Active work plans live in `plans/`.
 
 ## Repository Overview
 
@@ -13,261 +13,394 @@ This document is the structural map. Subsystem-level reality lives in `systems/`
 | Cargo package | `image-browser` v0.1.0, edition 2021 | `src-tauri/Cargo.toml` |
 | Tauri identifier | `com.ataca.image-browser` | `src-tauri/tauri.conf.json` |
 | Frontend bundler | Vite 7 + `vite-plugin-pages` (file-based routing) | `vite.config.ts`, `package.json` |
-| Backend source | 14 Rust files in `src-tauri/src/` | filesystem |
-| Frontend source | 33 TypeScript files in `src/` (20 `.tsx`, 13 `.ts`) | filesystem |
-| Persistence | Single SQLite file `images.db` (3 tables) | `src-tauri/src/db.rs` |
-| ML runtime | `ort = 2.0.0-rc.10` with `cuda` and `download-binaries` features | `src-tauri/Cargo.toml:21` |
-| Image encoder | CLIP ViT-B/32 (512-d output) via ONNX | `src-tauri/src/similarity_and_semantic_search/encoder.rs` |
-| Text encoder | clip-ViT-B-32-multilingual-v1, max_seq_length 128, pure-Rust WordPiece tokenizer | `encoder_text.rs:223-224` |
-| Tauri commands | 8 — see `systems/tauri-commands.md` | `lib.rs:612-621` |
-| Models on disk | `models/model_image.onnx`, `models/model_text.onnx`, `models/tokenizer.json` (not committed; user-supplied) | `lib.rs:121-134`, `main.rs:47` |
+| Backend source | 26 Rust files in `src-tauri/src/` after the modularisation | filesystem |
+| Frontend source | 33 TypeScript files in `src/` (incl. settings/ subcomponents) | filesystem |
+| Persistence | Single SQLite file `Library/images.db`, **WAL journal mode**, 5 tables | `src-tauri/src/db/mod.rs:47-145` |
+| ML runtime | `ort = 2.0.0-rc.10`. CPU on macOS for all three encoder families (CoreML produces runtime inference errors for these graphs); CUDA on non-macOS with CPU fallback. | `src-tauri/Cargo.toml`, encoder source files |
+| Image encoders | **CLIP ViT-B/32** (OpenAI English, separate `vision_model.onnx`, 512-d), **DINOv2-Base** (Meta self-supervised, 768-d, image-only), **SigLIP-2 Base 256** (Google sigmoid loss, 768-d shared text+image space). Picker UI in Settings selects per direction. | `similarity_and_semantic_search/encoder*.rs` |
+| Text encoders | **CLIP ViT-B/32** (OpenAI English, separate `text_model.onnx`, 512-d, BPE 77 tokens, pre-warmed). **SigLIP-2** (Gemma SentencePiece 256k vocab, 64 tokens, NO attention_mask — wired but runtime dispatch through the picker is the remaining gap). | `encoder_text/encoder.rs`, `encoder_siglip2.rs`, `indexing.rs` |
+| Tokenizer | HuggingFace `tokenizers = "0.22.2"` crate handles BPE (CLIP) and SentencePiece (SigLIP-2) uniformly via `tokenizer.json`. The custom Rust WordPiece tokenizer that previously served the multilingual model is gone. | `Cargo.toml` |
+| Tauri commands | **23**, grouped by concern under `commands/` (images, tags, notes, roots, similarity, semantic, profiling, encoders) | `lib.rs::run` invoke_handler |
+| Typed errors | `ApiError` discriminated union; mirrored on the frontend in `services/apiError.ts`. | `commands/error.rs` |
+| Profiling + diagnostics | Opt-in via `--profile` CLI flag. PerfLayer (span timing) + `record_diagnostic` (12 named domain diagnostics). Off by default — zero overhead. | `main.rs`, `perf.rs`, `perf_report.rs`, `cosine/diagnostics.rs` |
+| User state | `<repo>/Library/` in dev (`debug_assertions`); platform app-data dir in release. | `src-tauri/src/paths.rs` |
+| Models on disk | `Library/models/{clip_vision.onnx, clip_text.onnx, clip_tokenizer.json, dinov2_base_image.onnx, siglip2_vision.onnx, siglip2_text.onnx, siglip2_tokenizer.json}` (~2.5 GB total — all FP32, no quantization). Per-encoder fail-soft download. | `src-tauri/src/model_download.rs` |
+| Filesystem watcher | `notify-debouncer-mini`, 5s debounce, recursive on every enabled root | `src-tauri/src/watcher.rs` |
+| Embedding-pipeline migration | `meta(key, value)` table tracks `embedding_pipeline_version`. Bumping the const wipes legacy embeddings on first launch under the new code. Currently version 2. | `db/schema_migrations.rs::migrate_embedding_pipeline_version` |
 
 ## Repository Structure
 
 ```text
 PinterestStyleImageBrowser/
-├── README.md                    # Project intent & milestone roadmap
-├── package.json                 # Frontend deps; React 19, TanStack Query 5, framer-motion, shadcn primitives
-├── tsconfig.json                # @/ alias → /src
-├── vite.config.ts               # Tailwind v4, @vitejs/plugin-react, vite-plugin-pages
-├── images.db                    # Local SQLite (in .gitignore)
-├── components.json              # shadcn-ui registry config
-├── public/                      # Static assets served by Vite
-├── src/                         # Frontend (React)
-│   ├── App.tsx                  # BrowserRouter + QueryClientProvider + Pages routes
-│   ├── main.tsx                 # ReactDOM root, StrictMode
-│   ├── pages/[...slug].tsx      # Single catch-all route — URL slug = selected image id
+├── README.md                   # Project intent & milestone roadmap
+├── package.json                # React 19, TanStack Query 5, framer-motion, lucide-react, shadcn primitives, vitest
+├── tsconfig.json               # @/ alias → /src
+├── vite.config.ts              # Tailwind v4, @vitejs/plugin-react, vite-plugin-pages
+├── vitest.config.ts            # JSDOM env, src/test/setup.ts
+├── components.json             # shadcn-ui registry config
+├── public/                     # Static assets served by Vite
+├── Library/                    # User state (gitignored): images.db, settings.json, cosine_cache.bin,
+│                               # models/, thumbnails/root_<id>/, exports/perf-<unix_ts>/
+├── scripts/                    # Dev tooling (LoL splash downloader for test corpus)
+├── src/                        # Frontend (React)
+│   ├── App.tsx                 # BrowserRouter + QueryClientProvider + Pages routes
+│   ├── main.tsx                # ReactDOM root, theme pre-flush before mount
+│   ├── pages/[...slug].tsx     # Single catch-all route — URL slug = selected image id; owns search-routing
 │   ├── components/
-│   │   ├── Masonry.tsx          # Shortest-column packing; promotes selected hero across up to 3 cols
-│   │   ├── MasonryItem.tsx      # 3D tilt-on-hover via framer-motion + spring
-│   │   ├── MasonryAnchor.tsx    # Absolute-positioned wrapper used by Masonry
-│   │   ├── PinterestModal.tsx   # Fullscreen inspector with prev/next + tag editing
-│   │   ├── SearchBar.tsx        # Single input; #-prefixed tag autocomplete + tag pills
-│   │   ├── TagDropdown.tsx      # Popover combobox (cmdk) with create-tag-on-no-match
-│   │   ├── FullscreenImage.tsx        # DEAD — leftover earlier inspector
-│   │   ├── MasonryItemSelected.tsx    # DEAD — superseded by inline isSelected in MasonryItem
-│   │   ├── MasonrySelectedFrame.tsx   # DEAD — superseded by PinterestModal
-│   │   └── ui/                  # shadcn primitives (badge, button, card, command, dialog, popover, skeleton)
-│   ├── queries/                 # TanStack Query hooks
-│   │   ├── queryClient.ts       # staleTime: Infinity, no auto-refetch — see notes/frontend-query-policy.md
-│   │   ├── useImages.ts         # useImages + useAssignTagToImage + useRemoveTagFromImage (optimistic)
-│   │   ├── useTags.ts           # useTags + useCreateTag (optimistic with id=-1 placeholder)
-│   │   ├── useSimilarImages.ts  # useSimilarImages (DEAD), useTieredSimilarImages (live)
-│   │   └── useSemanticSearch.ts # 5-min staleTime, 10-min gcTime, debounced from caller
-│   ├── services/                # invoke() wrappers — translate Tauri results to UI types
-│   │   ├── images.ts            # fetchImages, semanticSearch, fetchSimilarImages, fetchTieredSimilarImages
-│   │   └── tags.ts              # fetchTags, createTag (default colour #3489eb)
+│   │   ├── Masonry.tsx         # Shortest-column packing; promotes hero across up to 3 cols; sortMode-aware
+│   │   ├── MasonryItem.tsx     # 3D tilt via framer-motion; honours animationLevel pref
+│   │   ├── MasonryAnchor.tsx   # Absolute-positioned wrapper used by Masonry
+│   │   ├── PinterestModal.tsx  # Fullscreen inspector with prev/next, tag editing, notes textarea
+│   │   ├── SearchBar.tsx       # # autocomplete + tag pills + create-tag-on-no-match + delete-tag affordance
+│   │   ├── TagDropdown.tsx     # Popover combobox (cmdk)
+│   │   ├── IndexingStatusPill.tsx  # Floating top-right pill driven by indexing-progress events
+│   │   ├── PerfOverlay.tsx     # Profiling-mode-only diagnostics panel (cmd+shift+P)
+│   │   ├── settings/           # Settings drawer (split per audit finding)
+│   │   │   ├── index.tsx       # Slide-in shell, esc/backdrop dismiss
+│   │   │   ├── controls.tsx    # Shared section header + slider/toggle primitives
+│   │   │   ├── ThemeSection.tsx
+│   │   │   ├── DisplaySection.tsx
+│   │   │   ├── SearchSection.tsx
+│   │   │   ├── SortSection.tsx
+│   │   │   ├── FoldersSection.tsx
+│   │   │   └── ResetSection.tsx
+│   │   └── ui/                 # shadcn primitives — derivative
+│   ├── queries/                # TanStack Query hooks (one file per resource family)
+│   │   ├── queryClient.ts      # staleTime: Infinity, no auto-refetch
+│   │   ├── useImages.ts        # useImages + useAssignTagToImage + useRemoveTagFromImage (optimistic)
+│   │   ├── useTags.ts          # useTags + useCreateTag + useDeleteTag (optimistic)
+│   │   ├── useRoots.ts         # useRoots + add/remove/setEnabled mutations
+│   │   ├── useSimilarImages.ts # useTieredSimilarImages
+│   │   └── useSemanticSearch.ts# 5-min staleTime, 10-min gcTime, debounced from caller
+│   ├── services/               # invoke() wrappers — translate Tauri JSON to UI types via ApiError
+│   │   ├── apiError.ts         # ApiError discriminated union + formatApiError() + isMissingModelError()
+│   │   ├── images.ts           # fetchImages, fetchTieredSimilarImages, semanticSearch, pickScanFolder, setScanRoot, getThumbnailPath
+│   │   ├── tags.ts             # fetchTags, createTag, deleteTag
+│   │   ├── notes.ts            # getImageNotes, setImageNotes
+│   │   ├── roots.ts            # listRoots, addRoot, removeRoot, setRootEnabled
+│   │   └── perf.ts             # isProfilingEnabled, getPerfSnapshot, recordAction, exportPerfSnapshot, perfInvoke wrapper
 │   ├── hooks/
-│   │   ├── useDebouncedValue.ts # 300ms debounce used for search text
-│   │   └── useMeasure.tsx       # DEAD — written, never imported
-│   ├── lib/utils.ts             # cn() helper for shadcn
-│   ├── utils.ts                 # getImageSize() via DOM Image, waitForAllInnerImages()
-│   └── types.d.ts               # ImageData, ImageItem, Tag, SimilarImageItem
-└── src-tauri/                   # Rust backend + Tauri shell
-    ├── Cargo.toml               # ort, rusqlite, tauri, image, ndarray, rand, serde, base64
-    ├── tauri.conf.json          # csp: null, assetProtocol scope ["**"]
-    ├── test_images/             # ~1.5 GB sample dataset (749 jpg)
+│   │   ├── useDebouncedValue.ts  # 300ms debounce
+│   │   ├── useUserPreferences.ts # localStorage-backed prefs (theme, columns, sort, animation, search counts, tagFilterMode)
+│   │   └── useIndexingProgress.ts# Subscribes to the `indexing-progress` Tauri event
+│   ├── lib/utils.ts            # cn() helper for shadcn
+│   ├── utils.ts                # getImageSize() via DOM Image, waitForAllInnerImages()
+│   └── types.d.ts              # ImageData, ImageItem, Tag, Root, SimilarImageItem, SemanticSearchResult
+└── src-tauri/                  # Rust backend + Tauri shell
+    ├── Cargo.toml              # ort, rusqlite, tauri (+plugin-dialog, +plugin-opener), image, ndarray, rand,
+    │                           # rayon, notify, notify-debouncer-mini, ureq, tracing/tracing-subscriber,
+    │                           # bytemuck, dirs, serde
+    ├── tauri.conf.json         # csp: null, assetProtocol scope ["**"]
     └── src/
-        ├── main.rs              # Entry: hardcoded test_images scan → thumbnails → encode → run()
-        ├── lib.rs               # 8 #[tauri::command] handlers + State management + run()
-        ├── db.rs                # ImageDatabase wraps Mutex<rusqlite::Connection>; 3 tables; migration
-        ├── filesystem.rs        # ImageScanner — recursive read_dir + 7-extension whitelist
-        ├── image_struct.rs      # ImageData (id, name, path, tags, thumbnail_path?, width?, height?)
-        ├── tag_struct.rs        # Tag (id, name, color)
+        ├── main.rs             # `--profile` parsing, tracing subscriber + opt-in PerfLayer, DB open + initialize, hands to lib::run
+        ├── lib.rs              # State types (CosineIndexState, TextEncoderState), run(): tauri::Builder.manage(...).setup(legacy migrate +
+        │                       # spawn pipeline + start watcher).invoke_handler![22 commands].run() with on-Exit perf report hook
+        ├── commands/           # Tauri command handlers, grouped by concern (audit modularisation)
+        │   ├── mod.rs          # Re-exports + ImageSearchResult unified struct + resolve_image_id_for_cosine_path helper
+        │   ├── error.rs        # ApiError enum with `#[serde(tag="kind", content="details")]`; From-impls for rusqlite/io/poison
+        │   ├── images.rs       # get_images
+        │   ├── tags.rs         # get_tags, create_tag, delete_tag, add_tag_to_image, remove_tag_from_image
+        │   ├── notes.rs        # get_image_notes, set_image_notes
+        │   ├── roots.rs        # get_scan_root, set_scan_root, list_roots, add_root, remove_root, set_root_enabled
+        │   ├── similarity.rs   # get_similar_images, get_tiered_similar_images
+        │   ├── semantic.rs     # semantic_search
+        │   └── profiling.rs    # is_profiling_enabled, get_perf_snapshot, reset_perf_stats, export_perf_snapshot, record_user_action
+        ├── db/                 # SQLite layer (post-split — was 1.6k-line db.rs)
+        │   ├── mod.rs          # ImageDatabase struct + WAL/NORMAL pragma + foreign_keys=ON + CREATE TABLE flow
+        │   ├── schema_migrations.rs  # 3 idempotent ALTER TABLE migrations (thumbnails, multifolder, notes/orphaned)
+        │   ├── images_query.rs # aggregate_image_rows helper + get_images*, get_paths_to_root_ids, get_pipeline_stats, AND/OR tag SQL
+        │   ├── embeddings.rs   # bytemuck::cast_slice (replaces 3 unsafe blocks); get_all_embeddings (single-SELECT)
+        │   ├── tags.rs         # create/delete/get tags + add/remove join rows
+        │   ├── thumbnails.rs   # update_image_thumbnail, get_image_thumbnail_info
+        │   ├── roots.rs        # roots CRUD + migrate_legacy_scan_root + wipe_images_for_new_root
+        │   ├── notes_orphans.rs# add_image, get/set notes, mark_orphaned (chunked UPDATE for SQLite param limit)
+        │   └── test_helpers.rs # `fresh_db()` for the per-submodule test modules
+        ├── filesystem.rs       # ImageScanner — recursive read_dir + 7-extension whitelist
         ├── thumbnail/
-        │   ├── mod.rs           # pub use generator::ThumbnailGenerator
-        │   └── generator.rs     # 400×400 max, aspect-preserving, JPEG, image::thumbnail() (Lanczos3)
-        └── similarity_and_semantic_search/
-            ├── mod.rs           # Re-exports the 3 submodules
-            ├── encoder.rs       # CLIP image encoder via ort; 224×224, ImageNet-stats, batch=32
-            ├── encoder_text.rs  # multilingual CLIP text encoder + pure-Rust WordPiece tokenizer
-            └── cosine_similarity.rs  # CosineIndex + 3 retrieval modes
+        │   ├── mod.rs          # pub use generator::ThumbnailGenerator
+        │   └── generator.rs    # 400×400 max, aspect-preserving, JPEG; per-root subfolder layout
+        ├── similarity_and_semantic_search/
+        │   ├── mod.rs          # Re-exports the submodules
+        │   ├── encoders.rs     # ImageEncoder + TextEncoder traits — runtime dispatch seam
+        │   ├── encoder.rs      # ClipImageEncoder via ort; 224×224 bicubic-shortest-edge + center-crop,
+        │   │                   # CLIP-native mean/std, separate vision_model.onnx, batch=32, L2-normalize
+        │   ├── encoder_dinov2.rs   # Dinov2ImageEncoder; 224×224 bicubic-shortest-edge-256 + center-crop-224,
+        │   │                       # ImageNet mean/std, CLS-token from last_hidden_state, 768-d output
+        │   ├── encoder_siglip2.rs  # Siglip2ImageEncoder + Siglip2TextEncoder; 256×256 exact-square bilinear
+        │   │                       # + [-1,1] for image; Gemma SP, 64 tokens, NO attention_mask for text;
+        │   │                       # both branches use pooler_output (MAP head), 768-d shared space
+        │   ├── cosine_similarity.rs  # 9-line shim: `pub use crate::similarity_and_semantic_search::cosine::*;`
+        │   ├── cosine/         # Post-split (was 860-line cosine_similarity.rs)
+        │   │   ├── mod.rs      # Module decls + pub use index::CosineIndex
+        │   │   ├── math.rs     # cosine_similarity helper + score_cmp_desc (NaN-aware)
+        │   │   ├── index.rs    # CosineIndex + populate_from_db_for_encoder + 3 retrieval modes
+        │   │   │               # + scratch buffer + select_nth_unstable_by partial sort (2.53× speedup)
+        │   │   │               # + emits cosine_cache_populated, embedding_stats,
+        │   │   │               #   pairwise_distance_distribution, self_similarity_check diagnostics
+        │   │   ├── diagnostics.rs  # 4 stateless helpers: embedding_stats, pairwise_distance_distribution,
+        │   │   │                   # self_similarity_check, score_distribution_stats
+        │   │   └── cache.rs    # Persistent cosine_cache.bin (bincode); load_from_disk_if_fresh checks DB mtime
+        │   └── encoder_text/   # Post-split (was 647-line encoder_text.rs)
+        │       ├── mod.rs      # pub use ClipTextEncoder
+        │       ├── encoder.rs  # ClipTextEncoder via HF tokenizers crate (BPE 49k, max 77 tokens,
+        │       │               # pad with id 49407); ort session (CoreML disabled for transformer ops);
+        │       │               # exposes tokenizer_for_diagnostic() for the tokenizer_output diagnostic
+        │       └── pooling.rs  # normalize, try_extract_single_embedding, mean_pool (ort-free for testability)
+        ├── indexing.rs         # Background pipeline (single-flight AtomicBool); 4 phases + cosine_repopulate; emits IndexingProgress events
+        ├── watcher.rs          # notify-debouncer-mini start; rescan trigger via try_spawn_pipeline (single-flight coalesces bursts)
+        ├── model_download.rs   # First-launch HuggingFace download (image, text, tokenizer); HEAD preflight + chunked GET + progress callback
+        ├── settings.rs         # `Settings { scan_root: Option<PathBuf> }` — legacy single-folder pre-Phase-6
+        ├── paths.rs            # Library/ layout helpers; dev branches on debug_assertions to <repo>/Library/, release uses dirs::data_dir()
+        ├── perf.rs             # PerfLayer (tracing-subscriber Layer), per-span aggregate stats, RawEvent log, JSONL flush thread
+        ├── perf_report.rs      # On-exit markdown report renderer + raw.json
+        ├── image_struct.rs     # ImageData (id, path, tags, thumbnail_path?, w?, h?, notes?, orphaned)
+        ├── tag_struct.rs       # Tag (id, name, color)
+        └── root_struct.rs      # Root (id, path, enabled, added_at)
 ```
 
 ## Subsystem Responsibilities
 
 ```
-                  ┌──────────────────────────────────────────────┐
-                  │              React 19 Frontend               │
-                  │                                              │
-   Browser ──►   pages/[...slug].tsx (search-routing)            │
-                       │   │                                     │
-                       ▼   ▼                                     │
-                 Masonry ◄── SearchBar / PinterestModal /        │
-                 (layout)    TagDropdown (tag-system)            │
-                       │                                         │
-                       ▼                                         │
-                 TanStack Query hooks (frontend-state)           │
-                       │ invoke()                                │
-                  ─────┼─────────  Tauri IPC boundary  ──────────┤
-                       ▼                                         │
-                  ┌─────────────────────────────────────────────┐│
-                  │             Rust Backend                    ││
-                  │                                             ││
-                  │  lib.rs — 8 #[tauri::command] handlers      ││
-                  │     │                                       ││
-                  │     ├─► ImageDatabase  (db.rs)              ││
-                  │     │      └─► SQLite file images.db         │
-                  │     ├─► CosineIndex    (cosine_similarity.rs)│
-                  │     │      └─► in-memory Vec<(PathBuf, Array1<f32>)> populated lazily from DB │
-                  │     └─► TextEncoder    (encoder_text.rs)    ││
-                  │            └─► ONNX Runtime + tokenizer.json││
-                  │                                             ││
-                  │  main.rs — startup pipeline:                ││
-                  │     scan → DB insert → thumbnails → encode  ││
-                  │            (filesystem → db → thumbnail →    │
-                  │             encoder)                        ││
-                  └─────────────────────────────────────────────┘│
+                 ┌────────────────────────────────────────────────┐
+                 │              React 19 Frontend                 │
+                 │                                                │
+   Browser ──►   pages/[...slug].tsx  (search-routing, hotkeys)    │
+                       │   │   │                                   │
+                       │   │   └─► PerfOverlay (--profile only)    │
+                       │   │                                       │
+                       ▼   ▼                                       │
+                 Masonry / SearchBar / PinterestModal /            │
+                 TagDropdown / IndexingStatusPill / settings/      │
+                       │                                           │
+                       ▼                                           │
+                 useUserPreferences (localStorage) +               │
+                 TanStack Query hooks (frontend-state) +           │
+                 useIndexingProgress (Tauri event subscription)    │
+                       │                                           │
+                       │ services/* → invoke() / event listen      │
+                  ─────┼──────── Tauri IPC + event boundary ───────┤
+                       │                                           │
+                       ▼ (typed: ApiError on the wire)             │
+                  ┌─────────────────────────────────────────────┐  │
+                  │             Rust Backend                    │  │
+                  │                                             │  │
+                  │  lib.rs::run — manage state + setup +       │  │
+                  │     invoke_handler![22 commands]            │  │
+                  │     │                                       │  │
+                  │     ├─► commands/  (per-concern)            │  │
+                  │     │      └─► db/  (WAL+NORMAL SQLite)      │ │
+                  │     │      └─► cosine/index + encoder_text   │ │
+                  │     │      └─► perf::record_user_action       │ │
+                  │     │                                       │  │
+                  │     ├─► indexing.rs (background thread)     │  │
+                  │     │      └─► model_download → scan →      │  │
+                  │     │          orphan-mark → thumbnail (rayon)│ │
+                  │     │          → encode → cosine populate +  │ │
+                  │     │          save_to_disk → Phase::Ready  │  │
+                  │     │     emits indexing-progress every step │  │
+                  │     │                                       │  │
+                  │     └─► watcher.rs (notify-debouncer-mini)  │  │
+                  │            └─► every 5s debounce → re-spawn  │ │
+                  │                indexing pipeline (single-    │ │
+                  │                flight coalesces)             │ │
+                  │                                             │  │
+                  │  perf.rs (only mounted on --profile):       │  │
+                  │     PerfLayer aggregates spans               │ │
+                  │     + JSONL timeline + on-exit report.md    │  │
+                  └─────────────────────────────────────────────┘  │
+                                                                   │
+                  ─── disk: <repo>/Library/ in dev ────────────────┘
+                       images.db (WAL), settings.json,
+                       cosine_cache.bin, models/*.onnx,
+                       thumbnails/root_<id>/thumb_<id>.jpg,
+                       exports/perf-<unix_ts>/{timeline.jsonl,
+                                              report.md, raw.json}
 ```
 
 | System | Owns | Source location | Canonical doc |
 |--------|------|-----------------|---------------|
-| `database` | SQLite schema, 3 tables, embedding BLOB encoding, runtime migration | `src-tauri/src/db.rs` | `systems/database.md` |
-| `filesystem-scanner` | Recursive image discovery, 7-extension whitelist | `src-tauri/src/filesystem.rs` | `systems/filesystem-scanner.md` |
-| `thumbnail-pipeline` | 400×400 cached thumbnails on disk + DB row updates | `src-tauri/src/thumbnail/generator.rs` | `systems/thumbnail-pipeline.md` |
-| `clip-image-encoder` | 224×224 preprocess, ONNX inference, 512-d output, batched | `src-tauri/src/similarity_and_semantic_search/encoder.rs` | `systems/clip-image-encoder.md` |
-| `clip-text-encoder` | Pure-Rust WordPiece tokenizer + multilingual CLIP text inference | `encoder_text.rs` | `systems/clip-text-encoder.md` |
-| `cosine-similarity` | In-memory similarity index, 3 retrieval modes (sampled/sorted/tiered) | `cosine_similarity.rs` | `systems/cosine-similarity.md` |
-| `tauri-commands` | 8-command IPC surface, state injection, Windows path normalisation | `lib.rs` | `systems/tauri-commands.md` |
-| `masonry-layout` | Shortest-column packing, hero promotion, 3D tilt | `src/components/Masonry*.tsx` | `systems/masonry-layout.md` |
-| `tag-system` | Tag CRUD, optimistic updates, `#`-autocomplete, create-on-no-match | `src/components/{SearchBar,TagDropdown}.tsx`, `useTags.ts`, `useImages.ts` | `systems/tag-system.md` |
-| `search-routing` | Frontend priority chain: similar > semantic > tag > all | `src/pages/[...slug].tsx` | `systems/search-routing.md` |
-| `frontend-state` | TanStack Query config, vite-plugin-pages, optimistic mutation pattern | `src/queries/queryClient.ts`, `App.tsx`, `vite.config.ts` | `systems/frontend-state.md` |
+| `database` | SQLite schema, 5 tables, WAL+NORMAL pragmas, embedding BLOB encoding (bytemuck), idempotent migrations, AND/OR tag filter SQL, orphan filter, pipeline stats | `src-tauri/src/db/` | `systems/database.md` |
+| `tauri-commands` | 22-command IPC surface, `ApiError` typed-error wire format, `ImageSearchResult` unified shape, lazy text-encoder init, path-prefix normalisation | `src-tauri/src/commands/` | `systems/tauri-commands.md` |
+| `indexing` | Background pipeline (scan → model-download → orphan-mark → thumbnail → encode → cosine-repopulate), single-flight AtomicBool, IndexingProgress events | `src-tauri/src/indexing.rs` | `systems/indexing.md` |
+| `watcher` | `notify-debouncer-mini` recursive watch on every enabled root; 5s debounce → re-spawn pipeline | `src-tauri/src/watcher.rs` | `systems/watcher.md` |
+| `multi-folder-roots` | `roots` table CRUD, enabled toggle, `set_scan_root` vs `add_root` semantics, `migrate_legacy_scan_root`, per-root thumbnail directories | `src-tauri/src/db/roots.rs`, `commands/roots.rs`, `paths::thumbnails_dir_for_root` | `systems/multi-folder-roots.md` |
+| `model-download` | First-launch HuggingFace fetch for `model_image.onnx`, `model_text.onnx`, `tokenizer.json`; HEAD preflight + chunked GET + per-byte progress | `src-tauri/src/model_download.rs` | `systems/model-download.md` |
+| `paths-and-state` | `Library/` directory layout, dev-vs-release branching, settings.json, cosine_cache.bin, exports/, `strip_windows_extended_prefix` | `src-tauri/src/paths.rs`, `settings.rs` | `systems/paths-and-state.md` |
+| `profiling` | `--profile` flag, `PerfLayer` span aggregation, RawEvent log, JSONL flush, on-exit `report.md` renderer, frontend `<PerfOverlay>` + `perfInvoke` + action breadcrumbs | `src-tauri/src/perf.rs`, `perf_report.rs`, `src/components/PerfOverlay.tsx`, `src/services/perf.ts` | `systems/profiling.md` |
+| `filesystem-scanner` | Recursive image discovery, 7-extension whitelist (read by indexing) | `src-tauri/src/filesystem.rs` | `systems/filesystem-scanner.md` |
+| `thumbnail-pipeline` | Aspect-preserving 400×400 cached thumbnails on disk; per-root subfolder layout; rayon-parallel | `src-tauri/src/thumbnail/generator.rs` | `systems/thumbnail-pipeline.md` |
+| `clip-image-encoder` | OpenAI CLIP ViT-B/32 separate `vision_model.onnx`; bicubic-shortest-edge-224 + center-crop, CLIP-native mean/std, 512-d L2-normalised, batched | `src-tauri/src/similarity_and_semantic_search/encoder.rs` | `systems/clip-image-encoder.md` |
+| `clip-text-encoder` | OpenAI English CLIP separate `text_model.onnx`; HF `tokenizers` crate BPE (max 77 tokens, pad id 49407), 512-d L2-normalised, lazy + pre-warm init | `similarity_and_semantic_search/encoder_text/` | `systems/clip-text-encoder.md` |
+| `dinov2-encoder` | DINOv2-Base (Meta self-supervised); image-only; bicubic-shortest-edge-256 + center-crop-224, ImageNet mean/std, CLS-token from `last_hidden_state[:,0,:]`, 768-d L2-normalised | `src-tauri/src/similarity_and_semantic_search/encoder_dinov2.rs` | `systems/dinov2-encoder.md` |
+| `siglip2-encoder` | SigLIP-2 Base 256 (Google sigmoid loss); image+text in shared 768-d space; image: 256×256 exact-square bilinear + [-1,1]; text: Gemma SP 64 tokens NO attention_mask; both use `pooler_output` (MAP head). Text-branch picker dispatch is partially wired. | `src-tauri/src/similarity_and_semantic_search/encoder_siglip2.rs` | `systems/siglip2-encoder.md` |
+| `cosine-similarity` | In-memory similarity index, `select_nth_unstable_by` partial-sort (2.53× speedup), reusable scratch buffer, persistent disk cache | `similarity_and_semantic_search/cosine/` | `systems/cosine-similarity.md` |
+| `masonry-layout` | Shortest-column packing, hero promotion, 3D tilt, sortMode-aware, dimensions sourced from backend (no DOM image-load round-trip) | `src/components/Masonry.tsx`, `MasonryItem.tsx`, `MasonryAnchor.tsx` | `systems/masonry-layout.md` |
+| `tag-system` | Tag CRUD + delete (now wired), optimistic mutations, AND/OR filter mode toggle, `#` autocomplete, create-on-no-match | `src/components/{SearchBar,TagDropdown}.tsx`, `useTags.ts`, `useImages.ts` | `systems/tag-system.md` |
+| `search-routing` | Frontend priority chain: similar > semantic > tag > all; debounced semantic; selectedItem now resolved against `displayImages` (audit fix) | `src/pages/[...slug].tsx` | `systems/search-routing.md` |
+| `frontend-state` | TanStack Query config, settings/ subdirectory, `useUserPreferences` localStorage layer, `useIndexingProgress` event hook, `useRoots` mutations | `src/queries/`, `src/hooks/`, `src/components/settings/` | `systems/frontend-state.md` |
 
 ## Dependency Direction
 
 ```
         main.rs (binary entry)
-            │ initialises in order
+            │ parse --profile, init tracing + opt-in PerfLayer,
+            │ open SQLite + initialize (WAL/NORMAL/foreign_keys)
             ▼
-  filesystem ──► database ◄────────────────┐
-                    ▲                      │
-                    │                      │
-        thumbnail ──┤                      │
-                    │                      │
-   image-encoder ──┤                       │
-                    │                      │
-                    │   reads BLOBs        │
-   cosine-similarity ──── populate_from_db │  (also opens its own DB connection — see surprising-connections in notes)
-                    ▲                      │
-                    │                      │
-   text-encoder ────┘                      │
-                                           │
-                         lib.rs::run() ────┘
-                              │ tauri::Builder + .manage(state)
-                              ▼
-                  8 #[tauri::command] handlers
-                              │ invoke() over Tauri IPC
-                              ▼
-                  React frontend (services → queries → components)
+    db ◄─────────────────────────────────────────────────┐
+     ▲                                                    │
+     │                                                    │
+   filesystem ────► (called by indexing)                  │
+   thumbnail ─────► (called by indexing) ─reads/writes──► │
+   image-encoder ─► (called by indexing) ─writes──────►   │
+   text-encoder ──► (called by commands::semantic) ─reads►│
+   cosine/index ──► (called by commands::similarity +     │
+                    semantic, populated by indexing) ────►│
+   model-download► (called by indexing)                   │
+   paths ─────────► (called by everything reading state)  │
+   settings ──────► (called by lib.rs setup for legacy migration)
+   perf ──────────► (mounted only when --profile set)     │
+   indexing ──────► spawns thread, calls every encoder/   │
+                    thumbnail/db/cosine module in order,  │
+                    holds Arc<Mutex<CosineIndex>> + Arc<  │
+                    IndexingState> + AppHandle for events │
+   watcher ───────► triggers indexing::try_spawn_pipeline │
+                    on debounced filesystem events         │
+                                                          │
+                  lib.rs::run ◄──────────────────────────┘
+                       │ tauri::Builder.manage(db, cosine_state,
+                       │   text_encoder_state, indexing_state, watcher_state)
+                       │ .setup(legacy migrate + spawn pipeline + start watcher)
+                       │ .invoke_handler![22 commands]
+                       │ .run(|_,e| if Exit && profiling { render_session_report })
+                       ▼
+                  Frontend (services → queries → components)
 ```
 
 Key directional rules observed in code:
 
-- `database` is depended on by every other backend system. It has no inverse dependencies.
-- `cosine-similarity::populate_from_db` does **not** receive `&ImageDatabase`; it constructs a second `ImageDatabase` from a stored `db_path` string (`cosine_similarity.rs:27`). This is a documented coupling smell — see `systems/cosine-similarity.md` Risks and `notes/path-and-state-coupling.md`.
-- `filesystem`, `thumbnail`, and `encoder` modules each only know about `database`; they do not depend on each other. The pipeline ordering lives in `main.rs`.
-- The frontend has no knowledge of which ONNX models exist or how cosine works — only the 8-command IPC surface plus the JSON shapes the commands return.
+- **`db` is the only sink** every backend module writes to or reads from. It has no inverse dependencies.
+- **`cosine::populate_from_db` now takes `&ImageDatabase`** (audit finding `ae0006d`/`5c2b0f6`) and uses the single-SELECT `get_all_embeddings` — no second connection, no per-row lookup.
+- **`Arc<Mutex<CosineIndex>>` is intentionally cloned across thread boundaries** — the indexing thread (background) and the Tauri-managed `CosineIndexState` (foreground commands) both hold clones pointing at the same in-memory cache. This is what lets a finished pipeline-encode immediately make new embeddings available to the next semantic search.
+- **`indexing.rs` and `watcher.rs` are coupled through `IndexingState` (single-flight AtomicBool)** — rapid filesystem events that try to spawn a second pipeline get `Err(AlreadyRunning)` back and silently coalesce.
+- **`profiling` is not in the normal data path.** When `--profile` is absent, `PerfLayer` never registers, all `#[tracing::instrument]` overhead reduces to one tracing dispatch per call (the env filter passes the spans but no aggregator builds them), the frontend `PerfOverlay` never mounts, and `record_user_action` is a no-op. All profiling-related code paths stay cold.
+- **`commands` returns `Result<T, ApiError>`** for every handler. The frontend deserialises `{ kind, details }` and branches on kind in `formatApiError`. Strings on the wire still parse via the legacy fallback.
+- **Frontend services never call `invoke()` directly** — they wrap it in functions that translate Tauri JSON into UI types. Hooks call services; components call hooks.
 
 ## Core Execution / Data Flow
 
-### Startup pipeline (`main.rs`)
+### Startup pipeline (`main.rs` → `lib.rs::run` → `indexing.rs::run_pipeline_inner`)
 
 ```
-1. Parse hardcoded scan path                  Path::new("test_images")        main.rs:24
-2. Open SQLite + ensure schema                ImageDatabase::new + initialize main.rs:26-28; db.rs:21-58
-3. Run migration if needed                    PRAGMA table_info → ALTER TABLE db.rs:62-81
-4. Recursive scan + insert paths              ImageScanner::scan_directory   filesystem.rs:22-41
-5. Generate missing thumbnails                ThumbnailGenerator::generate_all_missing_thumbnails
-6. Encode missing embeddings (batch=32)       Encoder::encode_all_images_in_database  encoder.rs:256
-7. Hand control to Tauri runtime              image_browser_lib::run         main.rs:52
-   └─► tauri::Builder.manage(db, cosine_state, text_encoder_state).invoke_handler!(...)
+1. Parse --profile flag                            main.rs:22
+2. Init tracing subscriber (PerfLayer only on --profile) main.rs:48-79
+3. Open SQLite handle + initialize                 main.rs:89-91, db/mod.rs:47-145
+   • PRAGMA journal_mode=WAL
+   • PRAGMA synchronous=NORMAL
+   • PRAGMA foreign_keys=ON
+   • CREATE TABLE roots / images / tags / images_tags
+   • Run 3 migrations (thumbnails, multifolder, notes/orphaned)
+4. Hand to image_browser_lib::run(db, db_path)     main.rs:93
+5. tauri::Builder .manage(...).setup(|app| {       lib.rs:82-170
+   5a. Legacy migration: settings.json::scan_root → roots row
+   5b. indexing::try_spawn_pipeline(...)  ← background thread
+   5c. watcher::start(every enabled root, recursive)
+}).invoke_handler![22 commands].build().run(|e| if Exit && profiling { render_session_report })
+
+Background pipeline (indexing.rs::run_pipeline_inner) runs while UI is interactive:
+  i.    Try to load cosine_cache.bin                   indexing.rs:182-189; cosine/cache.rs
+  ii.   model_download::download_models_if_missing     indexing.rs:217 (HEAD preflight + chunked GET + progress)
+  iii.  Pre-warm text encoder (ONNX session + tokenizer) indexing.rs:232-259
+  iv.   Open second ImageDatabase (rusqlite supports concurrent connections; WAL keeps reads non-blocking)
+  v.    Phase::Scan: walk every enabled root, INSERT OR IGNORE, mark_orphaned per root
+  vi.   Phase::Thumbnail: rayon par_iter, single-SELECT path_to_root_ids, write to thumbnails/root_<id>/
+  vii.  Phase::Encode: batches of 32, CLIP image encoder, write embedding BLOB
+  viii. cosine::populate_from_db (single SELECT) + cosine::save_to_disk
+  ix.   Phase::Ready emitted with final image count
 ```
 
-Steps 4-6 are idempotent: each query (`get_images_without_thumbnails`, `get_images_without_embeddings`) only returns rows missing the relevant artefact. A re-launch on an already-indexed database is fast.
+Each phase emits an `indexing-progress` Tauri event so the frontend `IndexingStatusPill` renders a live status. Steps v, vi, vii are idempotent — re-launches on a populated DB are fast because `INSERT OR IGNORE` skips known paths and `get_images_without_*` only returns rows missing the relevant artefact.
 
 ### Runtime: image grid load
 
 ```
-Frontend                           Backend
-──────                             ──────
-useImages({tagIds, searchText})
-  └─► fetchImages(tagIds, searchText)
+Frontend                              Backend
+──────                                ──────
+useImages({tagIds, searchText, matchAllTags, sortMode, shuffleSeed})
+  └─► fetchImages(tagIds, searchText, matchAllTags)
         └─► invoke("get_images")
-                                    db.get_images_with_thumbnails
-                                      └─► SQL: LEFT JOIN images_tags + tags
-                                      └─► aggregate tag rows → Vec<ImageData>
-                                      └─► rand::rng() shuffle  (db.rs:496-499)
-        ◄─── Vec<ImageData> (JSON)
-  └─► map to ImageItem with convertFileSrc()
-TanStack Query caches by ["images", tagIds, searchText]
-Masonry receives items; computes shortest-column packing
+                                       db.get_images_with_thumbnails(tagIds, "", matchAllTags)
+                                         └─► aggregate_image_rows helper (audit finding)
+                                         └─► WHERE root enabled AND NOT orphaned
+                                         └─► AND/OR semantic via match_all_tags
+                                         └─► Stable sort by id (was random shuffle pre-Phase-9)
+        ◄─── Vec<ImageData> (typed wire: Result<_, ApiError>)
+  └─► map to ImageItem with convertFileSrc(thumbnail_path)
+TanStack Query caches by ["images", tagIds, searchText, matchAllTags]
+Frontend may apply session-seeded shuffle if sortMode === "shuffle"
+Masonry receives items; computes shortest-column packing using backend-supplied (w, h)
 ```
 
-### Runtime: similarity search (image-clicked path)
+### Runtime: semantic search end-to-end (chosen Dependency Chain Trace)
 
-```
-User clicks tile → URL becomes "/{id}/" via react-router
-useEffect in [...slug] → setSelectedItem
-useTieredSimilarImages(id) → invoke("get_tiered_similar_images")
-
-Backend:
-  cosine_state.lock() → if cached_images.is_empty(), populate_from_db
-  db.get_image_embedding(id)  ──► reinterpret BLOB as Vec<f32>
-  CosineIndex::get_tiered_similar_images(query)
-    └─► sort all by cosine descending
-    └─► sample 5 random per tier × 7 tiers (0-5%, 5-10%, ..., 40-50%)
-    └─► return up to 35 (PathBuf, score) tuples
-  Map paths → DB ids via 3-strategy normalize_path fallback (lib.rs:308-371)
-  Return Vec<SimilarImage> JSON
-
-Frontend:
-  fetchTieredSimilarImages → for each, getImageSize from thumbnail (DOM Image)
-  displayImages becomes the similar set; Masonry re-renders with selectedItem promoted
-```
-
-### Runtime: semantic search end-to-end (the chosen Dependency Chain Trace)
-
-This is the obligation's chosen critical path because it crosses the most boundaries:
+This is the obligation's chosen critical path because it crosses the most boundaries (UI, debounce, IPC, mutex, ONNX, mutex, math, mutex, DB, IPC, render):
 
 ```
 [1] User types into SearchBar → useState(searchText)
-        ──► useDebouncedValue(searchText, 300)            src/pages/[...slug].tsx:26
-[2] shouldUseSemanticSearch test:
-        text non-empty AND not "#" prefix AND no selected item   pages/[...slug].tsx:32-33
-[3] useSemanticSearch(query, 50) → useQuery
-        queryKey: ["semantic-search", query, 50]
-        staleTime 5min, gcTime 10min                       useSemanticSearch.ts:21-23
-[4] semanticSearch(query, 50) →
-        invoke("semantic_search", { query, topN: 50 })     services/images.ts:198-228
+        ──► useDebouncedValue(searchText, 300)               src/pages/[...slug].tsx:84
+[2] shouldUseSemanticSearch test (non-empty, no #, no selection) pages/[...slug].tsx:90
+[3] useSemanticSearch(query, prefs.semanticResultCount) → useQuery
+        queryKey ["semantic-search", query, top_n]; staleTime 5min, gcTime 10min
+[4] semanticSearch(query, top_n)
+        invoke("semantic_search", { query, topN })           services/images.ts
         ─── Tauri IPC boundary ───
-[5] lib.rs::semantic_search:
-      • lock TextEncoderState mutex; lazy-init if encoder is None  lib.rs:114-142
-        - validates models/model_text.onnx exists
-        - validates models/tokenizer.json exists
-        - constructs TextEncoder + SimpleTokenizer
-      • encoder.encode(query)                              lib.rs:148
-        └─► encoder_text.rs:253-...
-            └─► tokenizer: split_whitespace → WordPiece
-                (try original case → lowercase fallback)
-            └─► pad/truncate to max_seq_length=128
-            └─► ort session.run(input_ids, attention_mask)
-            └─► extract output (try sentence_embedding/text_embeds/...)
-            └─► mean-pool fallback for [seq_len, 768] shapes
-            └─► returns Vec<f32> length 512
-      • lock CosineIndexState mutex
-      • if cached_images empty, populate_from_db          lib.rs:162-169
-        └─► opens NEW ImageDatabase(db_path)
-        └─► db.get_all_images() → for each, db.get_image_embedding(id)
-        └─► skip rows with no embedding or empty embedding
-        └─► add to in-memory cached_images vec
-      • CosineIndex::get_similar_images_sorted(query, 50, None)  lib.rs:174
-        └─► cosine for every cached image, sort desc, take 50 (no random sampling — sorted variant)
-      • For each result path: 3-strategy DB lookup with Windows-prefix stripping  lib.rs:182-221
-      • For each id: db.get_image_thumbnail_info → enrich result with thumbnail_path/w/h
+[5] commands::semantic::semantic_search:                     commands/semantic.rs
+      • text_encoder_state.encoder.lock()  → ApiError::Cosine on poison
+      • Lazy init (RARE — pre-warmed in pipeline):
+          if !clip_text.onnx exists ⇒ ApiError::TextModelMissing(path)   ← TYPED, frontend can branch
+          if !clip_tokenizer.json exists ⇒ ApiError::TokenizerMissing(path)
+          ClipTextEncoder::new(model_path, tokenizer_path)   // HF tokenizers crate inside
+      • Diagnostic emit BEFORE inference (no-op if profiling off):
+          tokenizer_for_diagnostic().encode(query, true)
+          → record_diagnostic("tokenizer_output", { raw_query, decoded_tokens, token_ids,
+                                                     attention_mask_sum, max_seq_length=77,
+                                                     interpretation: "OK" / "WARNING" / "ERROR" })
+      • encoder.encode(query)                              encoder_text/encoder.rs
+        └─► tokenizer: HF tokenizers BPE + RobertaProcessing → pad/truncate to 77 with id 49407
+        └─► ort session.run(input_ids: int64[1,77], attention_mask: int64[1,77])
+        └─► extract output (try text_embeds → pooler_output → sentence_embedding)
+        └─► L2-normalize via super::pooling::normalize
+        └─► returns Vec<f32> length 512
+      • Always force CLIP cosine cache:
+          cosine_state.ensure_loaded_for(&db, "clip_vit_b_32")  → ApiError::Cosine on poison
+          (Triggers populate_from_db_for_encoder if cache holds a different encoder.
+           That populate emits cosine_cache_populated + embedding_stats +
+           pairwise_distance_distribution + self_similarity_check diagnostics.)
+      • get_similar_images_sorted(query, top_n, None)
+        └─► scratch.clear() + similarity for every cached image (no PathBuf clone in inner loop)
+        └─► select_nth_unstable_by (partial sort) — 2.53× faster than full sort at n=10000
+        └─► take top_n, sort the returned slice
+      • Compute query L2 norm + range + NaN/Inf counts (for query_embedding diagnostic)
+      • all_images = db.get_all_images().ok()  (cached once)
+      • For each result path:
+          resolve_image_id_for_cosine_path(&db, &path, all_images.as_deref())
+            └─► strip \\?\ prefix via paths::strip_windows_extended_prefix (Cow, no alloc on common path)
+            └─► db.get_image_id_by_path(normalised) → Some((id, normalised))
+            └─► fallback: same lookup against raw path
+            └─► fallback: walk all_images comparing canonical forms
+        Resolution misses are tracked into a `resolution_misses` Vec<String> for the diagnostic.
+      • For each resolved id: db.get_image_thumbnail_info → enrich ImageSearchResult
+        Thumbnail-info misses tracked into thumb_misses counter.
+      • record_diagnostic("search_query", {
+          type: "semantic", encoder_id: "clip_vit_b_32", top_n, query_text, cosine_cache_size,
+          query_embedding: { dim, l2_norm, min, max, nan_count, inf_count, interpretation },
+          raw_results: [{path, score}, ...],
+          score_distribution: cosine::diagnostics::score_distribution_stats(&raw_scores),
+          path_resolution_outcomes: { raw_count, resolved_count, missed_count,
+                                       thumbnail_misses, missed_paths_sample }
+        })
         ─── Tauri IPC return ───
-[6] services/images.ts maps results → SimilarImageItem with convertFileSrc
-[7] pages/[...slug].tsx::displayImages branch 2 fires; Masonry renders sorted result list
+[6] services/images.ts catch site uses formatApiError(e); typed kinds get specific UI affordances
+[7] pages/[...slug].tsx::displayImages branch fires semantic; Masonry renders sorted result list
 ```
 
 **Boundary failure semantics for this chain:**
@@ -275,97 +408,160 @@ This is the obligation's chosen critical path because it crosses the most bounda
 | Step | Failure | Behaviour |
 |------|---------|-----------|
 | [1]-[3] | Empty query | `enabled` flag is false; query never runs |
-| [3] | Hash-prefixed query | `shouldUseSemanticSearch` is false; routes through tag filter instead |
-| [5] lazy init | model_text.onnx missing | Returns `Err` with explicit path; frontend shows generic "Search failed. Make sure the text model is available." |
-| [5] populate_from_db | DB cannot open | `expect("failed to init db")` — **panics** the command (Mutex poisoned for the rest of the session) |
-| [5] cosine sort | Cached vec empty | Returns empty `Vec`; not an error |
-| [5] DB id lookup | None of the 3 strategies match | Result is filtered out via `filter_map`; user silently gets fewer results |
-| [6]-[7] | Mutation fails | Optimistic update is rolled back via `onError` snapshot restore |
+| [3] | Hash-prefixed query | `shouldUseSemanticSearch` is false; routes through tag filter |
+| [5] mutex lock | Mutex poisoned | `From<PoisonError> for ApiError` ⇒ `ApiError::Cosine("mutex poisoned: ...")` returned via `?` |
+| [5] lazy init | model_text.onnx missing | `ApiError::TextModelMissing(path)` — frontend can call `isMissingModelError` and trigger re-download flow |
+| [5] tokenizer.json missing | Same — `ApiError::TokenizerMissing(path)` |
+| [5] ONNX run | Session error | `ApiError::Encoder("encode query: ...")` |
+| [5] populate_from_db | DB read error | `populate_from_db` swallows the error and logs (cache stays empty); the next `get_similar_images_sorted` returns Vec::new(). Non-fatal. |
+| [5] DB id resolve | None of 3 strategies match | Silently filtered out — user gets fewer results, no error |
+| [6]-[7] | Mutation fails | Optimistic update rolled back via `onError` snapshot restore (tag mutations only) |
 
-The chain crosses 4 process boundaries (UI → IPC → DB → ONNX) and 2 synchronisation boundaries (TextEncoder mutex, CosineIndex mutex). Both mutexes are held for the duration of the operation — concurrent semantic searches serialise.
+The chain crosses 4 process boundaries (UI → IPC → DB → ONNX) and 2 synchronisation boundaries (TextEncoder mutex, CosineIndex mutex). Both mutexes are held for the duration of the operation — concurrent semantic searches serialise. The DB mutex is acquired briefly for `get_all_images` and `get_image_thumbnail_info` calls under WAL, so foreground reads don't block the background indexing thread's writes.
 
 ## Inter-System Relationships
 
-This table satisfies the inter-system relationship mapping obligation. Each row cites the two systems, the mechanism, and the failure consequence.
+This table satisfies the inter-system relationship mapping obligation. With 17 system files the floor is `min(17, C(17,2)=136) = 17`.
 
 | # | A | B | Mechanism | What breaks if it fails |
 |---|---|---|-----------|-------------------------|
-| 1 | filesystem-scanner | database | Scanner returns `Vec<String>`; `add_image` does `INSERT OR IGNORE` per path. `db.rs:88-94` | A scan with permission errors propagates up via `?`; partial scans leave DB partially populated but the `INSERT OR IGNORE` is idempotent on retry. |
-| 2 | database | thumbnail-pipeline | Pipeline reads via `get_images_without_thumbnails` (`db.rs:339`), writes back via `update_image_thumbnail` (`db.rs:381`). | If `update_image_thumbnail` fails for an image, the file is generated but the DB row stays unmarked, so it will be regenerated next launch (but the generator's `if thumbnail_path.exists()` short-circuit at `generator.rs:61` prevents wasted work). |
-| 3 | database | clip-image-encoder | Encoder reads via `get_images_without_embeddings` (`db.rs:208`), writes via `update_image_embedding` (`db.rs:249`) which `unsafe`-casts `Vec<f32>` to `&[u8]`. | A schema change to the embedding column shape would silently break round-tripping (no length check on store; length-mod-4 check on retrieval at `db.rs:294-307`). |
-| 4 | database | cosine-similarity | `populate_from_db(db_path: &str)` opens a **second** `ImageDatabase` connection from the stored path (`cosine_similarity.rs:27`). It does not borrow the existing `&ImageDatabase`. | Surprising connection — listed in `notes/path-and-state-coupling.md`. If `db_path` is wrong, the cosine index silently populates from a different database. |
-| 5 | clip-text-encoder | cosine-similarity | Text embedding (`Vec<f32>` length 512) is fed into `get_similar_images_sorted` as `Array1::from_vec` (`lib.rs:173-174`). Both encoders produce the same-dim space — that is the point of multilingual CLIP. | Dimension mismatch (e.g., model swap) panics on `ndarray` cosine math at runtime (`a.dot(b)` requires matching shapes). |
-| 6 | tauri-commands | database | Every command takes `State<'_, ImageDatabase>` injected via `tauri::Builder::manage(db)` (`lib.rs:609`). | If `manage(db)` is omitted, every command fails IPC at registration time. Sole owner of the connection is the Tauri runtime. |
-| 7 | tauri-commands | cosine-similarity | Commands take `State<'_, CosineIndexState>` (`lib.rs:38-41`). The index is `Mutex<CosineIndex>` plus a `db_path: String`. | If a panic ever occurs while holding the cosine mutex, every subsequent similarity query fails with `Mutex poisoned`. |
-| 8 | tauri-commands | clip-text-encoder | `semantic_search` takes `State<'_, TextEncoderState>` whose inner is `Mutex<Option<TextEncoder>>` — lazy because the model is large. (`lib.rs:45-47`, init at `lib.rs:114-142`.) | Same poison-on-panic risk as #7. Lazy init means a missing `tokenizer.json` only manifests on the first semantic search, not at app startup. |
-| 9 | search-routing | tauri-commands | Frontend `pages/[...slug].tsx` invokes 3 commands (`get_images`, `get_tiered_similar_images`, `semantic_search`) and chooses outputs by priority (`pages/[...slug].tsx:71-99`). | If any command's JSON shape changes without a TS update, the priority union silently falls back to whichever branch did succeed. |
-| 10 | masonry-layout | search-routing | Masonry receives `displayImages: ImageItem[]` from routing's union; `selectedItem` is also passed in to drive hero promotion. (`Masonry.tsx:17-22`, used at `pages/[...slug].tsx:259-265`.) | If the selected id is not in `displayImages` (e.g., because the user navigated to a semantic-search result and that id is not in `images.data`), `selectedItem` is `null` and the hero card is not promoted. This is the "Selection lookup fails against semantic results" UX bug noted in the LifeOS Gaps doc. |
-| 11 | tag-system | database | Tags use `tags` and `images_tags` join tables (`db.rs:39-57`). Filter is OR-semantic (`tag_id IN (?, ?)` with `EXISTS`). Tag deletion is implemented in `db.rs:105-111` but **not registered** in `invoke_handler!`. | OR vs AND semantics is a product decision worth flagging because the README ambiguously implies AND. Deletion gap means typo tags accumulate forever via the UI. |
-| 12 | frontend-state | search-routing + tag-system + masonry | `queryClient.ts` sets `staleTime: Infinity` — caches never go stale automatically. Refetching is done via explicit `invalidateQueries` (e.g., on modal close — `[...slug].tsx:114`). | A stale-but-cached image set after a tag mutation would show wrong tags on stale rows. Optimistic updates handle the common case, but cross-cache-key staleness is possible. See `notes/frontend-query-policy.md`. |
+| 1 | filesystem-scanner | indexing | `ImageScanner::scan_directory(&Path) -> Result<Vec<String>>` called per enabled root inside the pipeline | A scan with a permission error logs warn and the pipeline continues with whatever was collected before — partial scans are OK because `INSERT OR IGNORE` is idempotent on retry. |
+| 2 | indexing | database | Pipeline drives `add_image`, `get_images_without_thumbnails`, `update_image_thumbnail`, `get_images_without_embeddings`, `update_image_embedding`, `mark_orphaned`. `get_paths_to_root_ids` is single-SELECT (audit `0bdb5f4`). | If the DB Mutex contends, the pipeline blocks. WAL means foreground reads still work; foreground writes serialise. |
+| 3 | indexing | thumbnail-pipeline | Pipeline holds a `ThumbnailGenerator` and rayon-pars the `needs_thumbs` list, looking up each image's `root_id` from the pre-fetched map | A thumbnail decode failure logs and the row stays unmarked — next pipeline run retries it. |
+| 4 | indexing | clip-image-encoder | Pipeline `run_clip_encoder` instantiates `ClipImageEncoder::new(clip_vision.onnx)` and batches via `encode_batch(&[Path])` (size 32). Writes BOTH the legacy `images.embedding` BLOB and the per-encoder `embeddings(image_id, "clip_vit_b_32", ...)` row per image. | If `clip_vision.onnx` is missing the encode phase is skipped (`warn` logged). Non-fatal — semantic search just returns fewer results. |
+| 5 | indexing | clip-text-encoder | Pipeline pre-warms the text encoder (`ClipTextEncoder::new(clip_text.onnx, clip_tokenizer.json)` and stows in `TextEncoderState` Mutex) so the first user-visible semantic search doesn't pay 1-2 s of model-load time | If pre-warm fails (logged warn), the lazy init path in `commands::semantic` covers it on first use. |
+| 6 | indexing | cosine-similarity | Pipeline calls `cosine.populate_from_db(&ImageDatabase)` then `cosine.save_to_disk()` after every encode pass; `Arc<Mutex<CosineIndex>>` is shared between indexing thread + Tauri-managed `CosineIndexState`. Per-encoder cache loads happen via `ensure_loaded_for(&db, encoder_id)` from command handlers. | If the cosine cache file is corrupted, `load_from_disk_if_fresh` silently skips and the next populate fully rebuilds. |
+| 6a | indexing | dinov2-encoder | Pipeline `run_trait_encoder("dinov2_base", Dinov2ImageEncoder::new)` runs after CLIP, encodes images that lack a `dinov2_base` row in the embeddings table. ImageNet preprocessing distinct from CLIP's. | If model file missing, that encoder's pass skips with `warn`; other encoders unaffected. Per-encoder fail-soft. |
+| 6b | indexing | siglip2-encoder (image branch) | Pipeline `run_trait_encoder("siglip2_base", Siglip2ImageEncoder::new)` runs after DINOv2. 256×256 exact-square preprocessing distinct from CLIP/DINOv2. | Same fail-soft behaviour. |
+| 6c | siglip2-encoder (text branch) | commands::semantic | NOT YET WIRED to the picker dispatch — `commands::semantic::semantic_search` still hardcodes `ClipTextEncoder`. The picker UI shows an "experimental" warning. | When wired: text query → SigLIP-2 text encoder → cosine against the SigLIP-2 image-cache namespace. |
+| 7 | indexing | watcher | Both share `Arc<IndexingState>` (single-flight `AtomicBool`). Watcher debounce-callback calls `try_spawn_pipeline` which returns `Err(AlreadyRunning)` if a run is in flight — second event is silently coalesced. | If single-flight breaks, two pipelines could run concurrently, double-writing the same paths. WAL + `INSERT OR IGNORE` makes this safe but wastes CPU. |
+| 8 | indexing | model-download | Pipeline phase 1 calls `download_models_if_missing(progress_cb)`; missing files fetched from HuggingFace with HEAD preflight + chunked GET; progress flows back via callback into `Phase::ModelDownload` events | Network failure logs `warn` and continues with whatever models exist. Encode/text-encoder phases gate on `path.exists()`. |
+| 9 | watcher | tauri::AppHandle | Watcher closure captures `app.clone()` so it can call `try_spawn_pipeline` and emit `indexing-progress`. Handle stashed in `Arc<Mutex<Option<WatcherHandle>>>` so dropping it cancels every watch. | Dropping the handle (e.g., recreating watcher on root change) cancels active watches — currently the watcher is NOT rebuilt on `add_root`/`remove_root`, so new roots aren't watched until next launch. Documented gap. |
+| 10 | multi-folder-roots | thumbnail-pipeline | Each thumbnail lands in `paths::thumbnails_dir_for_root(root_id)`; `remove_root` `rm -rf`s the per-root subfolder (best-effort, warn-on-fail) | Without per-root layout, root removal would orphan thumbnail files forever. Legacy rows with `root_id = NULL` still write to the flat layout. |
+| 11 | multi-folder-roots | database | `roots` table; `images.root_id INTEGER REFERENCES roots(id) ON DELETE CASCADE`; `PRAGMA foreign_keys=ON` was the explicit fix that made CASCADE actually fire | Disabling FK pragma silently turns CASCADE into a no-op — orphan image rows accumulate. |
+| 12 | tauri-commands | ApiError + frontend apiError.ts | Wire format pinned by `#[serde(tag="kind", content="details")]`. Frontend `ApiError` discriminated union mirrors the kinds; `formatApiError(unknown)` covers ApiError + legacy strings + Error instances | Adding a backend variant without updating the TS union triggers no runtime error — the default case in `formatApiError` handles unknown kinds gracefully. |
+| 13 | tauri-commands | cosine-similarity + clip-text-encoder | `commands::similarity` and `commands::semantic` lock `CosineIndexState.index` (Mutex) and `TextEncoderState.encoder` (Mutex<Option<...>>) via `?` (uses `From<PoisonError>` impl) | Mutex poison surfaces as `ApiError::Cosine`; user can retry — the next call relocks fresh. |
+| 14 | profiling | every instrumented system | `tracing::info_span!` and `#[tracing::instrument]` on commands, indexing phases, model_download, watcher events, cosine retrievals. Spans collected by `PerfLayer` only when `--profile` is set. | Without `--profile`, span construction still happens (env filter passes) but the aggregator never registers — overhead is one tracing dispatch per call, no allocation. |
+| 15 | profiling | frontend overlay + perfInvoke | `is_profiling_enabled` command resolved at mount; `<PerfOverlay>` mounts only if true; `recordAction` calls into `record_user_action` which appends to the timeline only when profiling is on; `perfInvoke` wraps Tauri `invoke` with a `React.Profiler`-style start/end emit | Without profiling, all React profiling-related state is dead — `useState(profiling)` is `false` and every gated branch short-circuits. |
+| 16 | search-routing | tauri-commands | `pages/[...slug].tsx` invokes `get_images`, `get_tiered_similar_images`, `semantic_search` and chooses outputs by priority (similar > semantic > tag > all). Selection lookup now uses `displayImages` not `images.data` (audit fix `9d04f69`) | If a backend command's JSON shape changes without a TS update, the priority union silently falls back to whichever branch did succeed. |
+| 17 | masonry-layout | search-routing + database | Masonry receives `displayImages: ImageItem[]` from routing, plus `selectedItem` for hero promotion. Tile dimensions now come from the DB row (audit `fb23bdb` — was DOM-Image round-trip). | If `width/height` are NULL (legacy un-thumbnailed rows), Masonry falls back to a default aspect ratio. |
+| 18 | tag-system | database | Tags use `tags` and `images_tags` tables; `add_tag_to_image` is `INSERT OR IGNORE` (Phase 6 hardening). `delete_tag` is now wired through `commands::tags::delete_tag` (audit Phase 6). AND/OR controlled by `match_all_tags: bool` parameter on `get_images_with_thumbnails`. | A typo'd tag now has a UI delete affordance; before this commit it accumulated forever. |
+| 19 | frontend-state | search-routing + tag-system + masonry + indexing | `queryClient.ts` sets `staleTime: Infinity` — caches never auto-stale. `useIndexingProgress` fires `invalidateQueries(["images"])` on `Phase::Ready`. Tag mutations use `invalidateQueries` after success. | A stale cache after a tag mutation would show wrong tags; `onSuccess` invalidation handles this. Cross-cache-key staleness still possible if a future feature mutates state without invalidating. |
+| 20 | paths-and-state | database + thumbnail + cosine + model-download + perf + settings | `paths::*_dir()` helpers are the single source for every disk path. Dev branches on `cfg(debug_assertions)` to `<repo>/Library/`; release falls back to `dirs::data_dir()/com.ataca.image-browser/`. | If `paths::app_data_dir()` returns the wrong directory (e.g., a future macOS sandbox change), every state file goes to the wrong place. The dev build's `unwrap_or_else(PathBuf::from("."))` makes silent failures more likely. |
+| 21 | settings (legacy) | multi-folder-roots | One-shot: lib.rs setup callback reads `settings.json::scan_root`; if present, calls `db.migrate_legacy_scan_root(path)` and clears the field so it doesn't re-migrate | If the user manually edits settings.json after migration, the legacy field could re-trigger; `migrate_legacy_scan_root` is idempotent (existing path → no-op). |
+| 22 | profiling | every encoder + indexing + cosine + commands | `record_diagnostic(name, payload)` writes a `RawEvent::Diagnostic` to the perf log. 17 call sites across `commands/` (4), `indexing.rs` (3 — 2 in encoder loops, 1 in run summaries), `lib.rs` (2 — startup_state + cosine_math_sanity), `cosine/index.rs` (4 — cache_populated + 3 quality stats). When `--profile` is absent, every call is a no-op. | If `record_diagnostic` panicked, every encoder/cosine/command site would propagate. The body uses no `?` operators and no allocs that can panic, so the no-op-when-disabled fast path is hot. |
+| 23 | cosine-similarity diagnostics | profiling | The 4 stateless helpers in `cosine/diagnostics.rs` (`embedding_stats`, `pairwise_distance_distribution`, `self_similarity_check`, `score_distribution_stats`) compute domain-specific stats and return `serde_json::Value` payloads. They are called from `cosine/index.rs::populate_from_db_for_encoder` and from `commands::similarity` / `commands::semantic` to enrich the `search_query` diagnostic. | If a helper panics on a malformed cache (NaN-only embeddings, empty cache), the encoder's populate pass would still succeed but the diagnostic payload would be missing. Today the helpers handle empty cases with explicit early returns. |
+| 24 | embedding-pipeline migration | every encoder + cosine cache | `db/schema_migrations.rs::migrate_embedding_pipeline_version` runs once after the embeddings table is created. When `meta.embedding_pipeline_version < CURRENT_PIPELINE_VERSION`, wipes legacy CLIP + dinov2_small embeddings so the next indexing pass re-encodes under the new pipelines. SigLIP-2 rows aren't wiped (no prior data). | If the version constant is bumped without code-side preprocessing changes, embeddings are wiped and re-encoded with no quality change — wasteful but not broken. Bump must be paired with a real pipeline change. |
+| 25 | tauri-commands | encoders.rs | `list_available_encoders` Tauri command serves the static `ENCODERS: &[EncoderInfo]` list (3 entries: clip_vit_b_32, siglip2_base, dinov2_base) to the frontend EncoderSection picker. Each entry carries id, display_name, description, dim, supports_text, supports_image. | EncoderInfo struct is mirrored as a TS interface in `EncoderSection.tsx`. Adding a backend entry without updating the picker UI's option-rendering logic surfaces as the option being available but with empty rationale text. |
 
-12 entries documented; floor is 11. Obligation cleared.
+25 entries documented; floor of 19 cleared. Obligation cleared.
 
 ## Critical Paths and Blast Radius
 
-The semantic-search end-to-end chain in §"Core Execution / Data Flow" is the longest. Two adjacent critical paths share most of its segments:
+The semantic-search end-to-end chain is the longest. Adjacent critical paths share most of its segments:
 
 | Operation | Chain length | Shared with semantic? | Unique segment |
 |-----------|--------------|----------------------|----------------|
-| Tiered similar (image clicked) | UI → IPC → DB → CosineIndex → DB → IPC → UI | yes (through cosine + DB) | Tiered tier sampling (`cosine_similarity.rs:295-330`) instead of sorted top-N |
-| Tag filter image load | UI → IPC → DB → IPC → UI | partial (DB only) | `EXISTS ... IN (...)` SQL filter (`db.rs:438-444`) |
-| Tag mutation | UI → optimistic UI → IPC → DB → IPC → cache rollback-or-no-op | partial (DB only) | TanStack Query rollback dance |
+| Tiered similar (image clicked) | UI → IPC → DB → CosineIndex (tiered sampling) → DB (id resolve + thumbnail info) → IPC → UI | yes (cosine + DB) | 7-tier within-tier sampling (`cosine/index.rs` `get_tiered_similar_images`) |
+| Tag filter image load | UI → IPC → DB (LEFT JOIN with EXISTS-IN or GROUP BY HAVING for AND) → IPC → UI | partial (DB only) | AND vs OR SQL branch (`db/images_query.rs::get_images_with_thumbnails`) |
+| Tag mutation | UI → optimistic UI → IPC → DB → IPC → invalidateQueries / rollback | partial (DB only) | TanStack Query rollback dance |
+| Background indexing | indexing thread → model_download (HTTP) → text encoder pre-warm → DB scan → DB orphan-mark → rayon thumbnail → CLIP encode batches → cosine populate + save_to_disk | shares cosine + DB serialisation | Single-flight via AtomicBool; events emitted per phase |
+| Filesystem watcher rescan | notify event → 5s debounce → try_spawn_pipeline → (single-flight may decline) → indexing pipeline | shares indexing + DB | Coalescing of bursts via single-flight |
 
-All three chains share the **DB Mutex<Connection>** as a global serialisation point. A long-running command holds the DB mutex for its full duration; concurrent UI actions queue.
+All chains share the **DB connection mutexes** (foreground via `ImageDatabase`, background via the indexing thread's separate connection). WAL keeps reads non-blocking under the writer; the foreground reads through its mutex still serialise across foreground commands.
 
-The CosineIndex Mutex is the second serialisation point — **all** similarity-driven operations queue through it.
+The **CosineIndex Arc<Mutex<...>>** is the second serialisation point — every similarity-driven operation queues, *and* the indexing pipeline's cosine-repopulate phase contends with active queries. In practice the contention is bounded because the indexing thread holds the lock briefly (one populate + one save) while queries hold it for the full sort + sample.
+
+The **TextEncoder Mutex<Option<...>>** serialises every concurrent semantic search (rare). Lazy init was preserved even after pre-warm because pre-warm can fail (model file missing during indexing) and the lazy path still works on first user query.
 
 ## State Ownership
 
 | State | Owner | Sharing pattern | Risk |
 |-------|-------|-----------------|------|
-| `images.db` (SQLite) | `ImageDatabase` instance held by Tauri State | Single connection wrapped in `Mutex<Connection>`. Cosine module opens a **second** connection (read-only in practice, but not enforced). | Two connections to the same SQLite file works because rusqlite allows it, but it splits the lock and means cache invariants live entirely outside SQLite. |
-| `CosineIndex.cached_images` | `CosineIndexState.index: Mutex<CosineIndex>` | Lazy-populated on first similarity/semantic query; **not invalidated** when new embeddings are added at runtime. | Once runtime rescan/encoding ships, this becomes a real bug. Today it cannot happen because there is no runtime rescan. |
-| `TextEncoder` | `TextEncoderState.encoder: Mutex<Option<TextEncoder>>` | Lazy-loaded on first semantic search. | Heavy resource (ONNX session). Once loaded it lives until process exit. |
-| Frontend image cache | TanStack QueryClient cache | Invalidated explicitly on modal close (`[...slug].tsx:114`); staleTime is Infinity otherwise. | Tag-mutation rollback covers the common case; broader cross-key invalidation is manual. |
-| `selectedItem`, `searchText`, `searchTags` | React useState in `pages/[...slug].tsx` | Single render owner; URL slug is the source of truth for selection (parsed in `useEffect`). | URL → state lookup uses `images.data` — fails for selections that arrived via semantic-search (see #10 in the relationship table). |
+| `Library/images.db` | `ImageDatabase` instance held by Tauri State (foreground) + a second `ImageDatabase` constructed inside the indexing thread (background) | Two connections to the same WAL'd file. WAL mode means foreground reads don't block background writes. | Without WAL the indexing pipeline would block UI reads for the duration of every batch encode. |
+| `CosineIndex.cached_images` | `CosineIndexState.index: Arc<Mutex<CosineIndex>>` | Cloned across boundary: indexing thread + Tauri-managed state hold the same Arc. | The cache is invalidated on `set_scan_root` / `add_root` / `remove_root` / `set_root_enabled` (`commands::roots`) by clearing `cached_images` directly. Without that, root changes would leak old embeddings into queries. |
+| `TextEncoder` | `TextEncoderState.encoder: Mutex<Option<TextEncoder>>` | Pre-warmed by indexing thread; lazy fallback in `commands::semantic`. | Heavy resource (ONNX session). Once loaded, lives until process exit. |
+| `IndexingState.is_running` | `Arc<IndexingState>` (`AtomicBool`) | Tauri-managed + every command that triggers an index + watcher closure. RAII guard ensures the bool clears even if the pipeline panics. | If a command spawns a pipeline without the AtomicBool dance, two could run concurrently (would still be safe due to idempotent ops, but wasteful). |
+| `WatcherHandle` slot | `Arc<Mutex<Option<WatcherHandle>>>` | Tauri-managed; setup callback fills it. Currently never refreshed when roots change. | Newly-added roots are not watched until the next launch. Documented gap. |
+| `cosine_cache.bin` | `paths::cosine_cache_path()` (file on disk) | Written by `cosine.save_to_disk` after every successful encode pass; loaded in `try_spawn_pipeline` if fresher than DB | Stale cache (older than DB file) is silently skipped on load — no-op, falls through to populate_from_db. |
+| `PROFILING_ENABLED` + `PERF_STATS` | Process-global `OnceLock`s in `perf.rs` | Set once in main; read everywhere | Setting twice is silently ignored (intentional). Reading before set returns the OnceLock's default. |
+| Frontend image cache | TanStack QueryClient cache | Invalidated on indexing-progress `Phase::Ready`, on modal close (with shuffleSeed bump for the shuffle sortMode), and on tag mutations. staleTime is Infinity otherwise. | Tag-mutation rollback covers the common case; broader cross-key invalidation is manual. |
+| `useUserPreferences` (theme, columns, sortMode, animation, search counts, tagFilterMode) | `localStorage["imageBrowserPrefs"]` + React state | Theme is also mirrored to `localStorage["theme"]` so `main.tsx` can apply it before React mounts (avoids FOUC) | localStorage may be disabled in some WebView modes — falls through to defaults. |
+| `selectedItem`, `searchText`, `searchTags`, `settingsOpen`, `perfOpen` | React useState in `pages/[...slug].tsx` | Single render owner; URL slug is the source of truth for selection | Selection lookup now resolves against `displayImages` (audit fix `9d04f69`), so semantic-search-result clicks no longer fail silently. |
+
+## Reading Guide
+
+For a future session asking "where do I learn about X?":
+
+| Goal | Read these in order |
+|------|---------------------|
+| Understand the whole repo from scratch | `architecture.md` → `notes.md` → `systems/database.md` → `systems/tauri-commands.md` → `systems/indexing.md` |
+| Add a new Tauri command | `systems/tauri-commands.md` → `commands/error.rs` (ApiError patterns) → `notes/conventions.md` (lock pattern + From-impls) |
+| Modify the indexing pipeline | `systems/indexing.md` → `systems/multi-folder-roots.md` → `systems/watcher.md` → `systems/cosine-similarity.md` (cache invalidation) |
+| Add a new SQL table or column | `systems/database.md` § Migrations → `db/schema_migrations.rs` |
+| Improve semantic search quality | `systems/clip-text-encoder.md` → `systems/siglip2-encoder.md` → `systems/cosine-similarity.md` → `notes/preprocessing-spatial-coverage.md` (open architectural concern about CLIP/DINOv2 center-crop dropping edge content) |
+| Add or modify an encoder | The relevant `systems/{clip-image,clip-text,dinov2,siglip2}-encoder.md` → `systems/model-download.md` (URL/filename) → `commands/encoders.rs` (picker entry) → `db/schema_migrations.rs` (bump `CURRENT_PIPELINE_VERSION` if preprocessing changes invalidate prior data) |
+| Read or extend the diagnostic system | `systems/profiling.md` § Domain diagnostics → `notes/conventions.md` § Domain diagnostics via `record_diagnostic` |
+| Profile a performance regression | `systems/profiling.md` (run with `--profile`, read `Library/exports/perf-<unix_ts>/report.md`) |
+| Wire a new frontend pref | `systems/frontend-state.md` → `src/hooks/useUserPreferences.ts` → relevant `settings/*Section.tsx` |
 
 ## Structural Notes / Current Reality
 
-This section captures the structural-level realities a reader needs to know before making changes.
-
-- **The repo last shipped on 2026-03-04.** Roughly 7 weeks dormant as of 2026-04-25. Treat the codebase as feature-complete-for-personal-use rather than under active development. The next session is likeliest to be a foundation pass (folder picker + tracing + path normalisation + dead-code sweep) before any new feature work.
-- **The default scan path is hardcoded to `test_images/`** (`main.rs:24`). The README claims a folder picker exists. It does not. Closing this gap is the single biggest unlock from "demo" to "tool" — see `systems/filesystem-scanner.md`.
-- **CLIP models are not committed.** `models/model_image.onnx`, `models/model_text.onnx`, and `models/tokenizer.json` must be supplied by the user. The README claims models are "bundled" — they are not in the repo. A fresh clone does not produce a working app.
-- **Two warnings the linter would surface but should be treated as justified:** `src/components/` and `src/queries/` are not name-matched to a system file because the system files use topical names (`masonry-layout`, `tag-system`, `search-routing`, `frontend-state`) rather than directory names. Coverage is real; the substring match in `lint_context.py` cannot see it.
-- **`zustand` is declared in `package.json` but never imported.** Memory-bank residue — TanStack Query took its place. See `notes/dead-code-inventory.md`.
-- **Three Tauri-managed `Mutex` singletons** (`ImageDatabase`, `CosineIndexState`, `TextEncoderState`) serialise all backend operations. Concurrent commands queue. For the current single-user UI this is fine; future "preload similar for hovered tile" or background work would contend.
-- **The `images.db` SQLite file lives at the repo root** (relative path `"../images.db"` from `src-tauri/`'s working directory — `db.rs:84-86`). It is `.gitignore`'d. The `.thumbnails/` cache directory is created next to wherever the app's `cwd` is.
-- **CUDA fallback is theoretical in dev, real in release.** The author observed via inline benchmarks that debug builds use CPU even when CUDA is "enabled," and release builds use the GPU. Inference speed varies by ~10× between the two — meaningful for end-user perception but not a correctness issue.
-- **The `assetProtocol` security scope is `["**"]`** with `csp: null` (`tauri.conf.json:21-26`). Fine for a single-user local tool that only ever loads its own bundled HTML; dangerous if the WebView is ever pointed at untrusted content. Worth narrowing if the app shape changes.
+- **The repo is being driven hard.** Between 2026-04-25 and 2026-04-26, the project landed Phase 4 (folder picker), Phase 5 (async indexing pipeline), Phase 6 (CLIP quality + tracing + multi-folder), Phase 7 (filesystem watcher + orphans), Phase 9 (settings drawer + per-root thumbnails), Phase 11 (annotations + AND/OR tag filter), the entire profiling system, a 23-finding code-health audit (every finding shipped), the multi-encoder picker (Phases 1-3), and the encoder-pipeline overhaul (separate-graph CLIP, DINOv2-Base swap, SigLIP-2 wiring, 12-diagnostic system). Treat "active" sections of system docs as truly active.
+- **The Tauri command count grew from 8 → 23.** The newest addition is `list_available_encoders` (serves the picker UI). Every command returns `Result<T, ApiError>` (except 3 profiling commands still on `Result<_, String>`).
+- **Three encoder families are live.** CLIP ViT-B/32 (OpenAI English, 512-d, both branches), DINOv2-Base (Meta self-supervised, 768-d, image-only), SigLIP-2 Base 256 (Google sigmoid loss, 768-d shared image+text — but text-branch picker dispatch is partially wired). Each has its own preprocessing pipeline matching its training-time stats; mixing preprocessing across encoders silently degrades embedding quality with no error signal.
+- **The `models/` directory is now auto-populated.** First launch downloads ~2.5 GB from HuggingFace with live progress; the Indexing pill renders MB/MB. Per-file fail-soft: a single 401/404 doesn't abort the batch.
+- **Embedding-pipeline migration v2 wipes legacy CLIP + dinov2_small embeddings on first launch under the current code** — the next indexing pass re-encodes everything cleanly. Bump the version constant for any future preprocessing change that invalidates prior data.
+- **The diagnostic system is the primary signal for encoder/search quality issues** — 12 named diagnostics including embedding L2-norm distribution, pairwise distance histogram, self-similarity sanity check, score distribution stats, tokenizer output, encoder run summary, preprocessing sample, cross-encoder comparison, cosine math sanity. All are no-ops without `--profile`. See `systems/profiling.md` § Domain diagnostics.
+- **User state lives under `<repo>/Library/` in dev**, NOT in the platform app data dir. Release builds fall back to `~/Library/Application Support/com.ataca.image-browser/` on macOS via `dirs::data_dir()`. This is for project-local visibility — see `systems/paths-and-state.md`.
+- **WAL is on.** Two SQLite connections coexist (foreground via `ImageDatabase`, background via the indexing thread's `ImageDatabase::new(db_path)`). Reads never block writes.
+- **Three Tauri-managed `Mutex` singletons + two Arcs** serialise backend operations:
+  - `Mutex<rusqlite::Connection>` inside `ImageDatabase` (per connection)
+  - `Arc<Mutex<CosineIndex>>` shared between indexing thread + `CosineIndexState`
+  - `Mutex<Option<TextEncoder>>` inside `TextEncoderState`
+  - `Arc<IndexingState>` (`AtomicBool`) for single-flight
+  - `Arc<Mutex<Option<WatcherHandle>>>` for the watcher slot
+- **CoreML is enabled for the image encoder on macOS** but explicitly disabled for the text encoder — transformer ops are poorly supported by CoreML and produced runtime inference errors. CUDA is target-gated on non-macOS builds; both fall back to CPU.
+- **The `assetProtocol` security scope is `["**"]`** with `csp: null`. Fine for a single-user local tool that only ever loads its own bundled HTML; flagged as a hardening target in `enhancements/recommendations/08-tauri-csp-asset-scope-hardening.md`.
+- **Profiling is opt-in via `--profile`.** When absent, every profiling code path (PerfLayer, PerfOverlay mount, action breadcrumbs, cmd+shift+P shortcut, on-exit report) is dormant.
+- **Filesystem watcher does not currently rebuild on `add_root` / `remove_root`.** New roots aren't watched until the next launch. Documented gap, low priority because the indexing pipeline that those commands trigger covers the immediate rescan.
 
 ## Coverage
 
-This subsection enumerates what was actually inspected during this upkeep run, satisfying the knowledge-gap obligation.
+This subsection enumerates what was inspected during this upkeep run, satisfying the knowledge-gap obligation.
 
-### Inspected in full
+### Inspected in full this run (2026-04-26 evening)
 
-- All 14 Rust source files: `main.rs`, `lib.rs`, `db.rs`, `filesystem.rs`, `image_struct.rs`, `tag_struct.rs`, `thumbnail/mod.rs`, `thumbnail/generator.rs`, `similarity_and_semantic_search/mod.rs`, `similarity_and_semantic_search/encoder.rs`, `similarity_and_semantic_search/cosine_similarity.rs`, plus partial read of `encoder_text.rs` (lines 1-300; struct + tokenizer + encoder constructor + encode method, including pooling fallback logic).
-- Backend config: `src-tauri/Cargo.toml`, `src-tauri/tauri.conf.json`.
-- Frontend config: `package.json`, `vite.config.ts`, `tsconfig.json` (top-level read).
-- Frontend source: `src/App.tsx`, `src/main.tsx`, `src/pages/[...slug].tsx`, `src/components/Masonry.tsx`, `src/components/MasonryItem.tsx`, `src/components/SearchBar.tsx`, `src/components/PinterestModal.tsx`, `src/components/TagDropdown.tsx`, all 5 files in `src/queries/`, `src/services/images.ts`, `src/services/tags.ts`, `src/types.d.ts`, `src/utils.ts`.
-- Git history: `git log --format=fuller --since='180 days ago'` — bodies of the 16 most recent commits inspected.
+- **Encoder rewrites this session**: `encoder.rs` (CLIP image — full rewrite to separate vision_model.onnx + canonical preprocessing + L2-normalize), `encoder_text/encoder.rs` (CLIP text — full rewrite to HF tokenizers + OpenAI English text_model + max 77 + pad 49407), `encoder_dinov2.rs` (full rewrite to DINOv2-Base + canonical resize-256 + center-crop-224 + ImageNet stats + CLS slice), `encoder_siglip2.rs` (full rewrite to onnx-community URL + 256×256 stretch + Gemma SP + pooler_output + no attention_mask).
+- **Diagnostic infrastructure**: `cosine/diagnostics.rs` (new — 4 stateless helpers), `cosine/index.rs` (added 4 diagnostic emissions), `lib.rs` (added cosine_math_sanity startup diagnostic), `commands/semantic.rs` (added tokenizer_output + query_embedding + score_distribution + path_resolution_outcomes diagnostics), `commands/similarity.rs` (added score_distribution + path_resolution + cross_encoder_comparison once-per-session).
+- **Migration system**: `db/schema_migrations.rs` (added migrate_embedding_pipeline_version + meta table), `db/mod.rs` (wired the migration after embeddings table create).
+- **Encoder picker**: `commands/encoders.rs` (re-added SigLIP-2; updated DINOv2 to Base/768-d).
+- **Model download**: `model_download.rs` (new URLs/filenames for all 8 files; per-file fail-soft).
+- **Indexing**: `indexing.rs` (encoder loops gained encoder_run_summary + preprocessing_sample emissions; switched DINOv2 references to use the new constant).
 
-### Noted but not read in full
+### Inspected in this upkeep pass (just now, for documentation)
 
-- `src-tauri/src/similarity_and_semantic_search/encoder_text.rs:301-end` — TextEncoder `encode` method tail (output extraction past the first 4 attempt names) and `mean_pool` helper. The first 300 lines covered the obligation-relevant rationale (tokenizer case handling, max_seq_length=128).
-- `src/components/ui/{badge,button,card,command,dialog,popover,skeleton}.tsx` — shadcn/ui primitives; derivative.
-- `src/components/MasonryAnchor.tsx`, `src/components/FullscreenImage.tsx`, `src/components/MasonryItemSelected.tsx`, `src/components/MasonrySelectedFrame.tsx` — anchor is small wrapper logic; the latter three are unmounted dead components per the cross-LifeOS Gaps doc, with status confirmed by import-graph absence.
-- `src/hooks/useMeasure.tsx`, `src/hooks/useDebouncedValue.ts` — the latter is used at `pages/[...slug].tsx:26`; the former has no import sites and is dead.
-- `src/lib/utils.ts` — single `cn()` helper.
+- All system docs in `context/systems/` for staleness assessment.
+- `notes.md`, all 8 notes files (after creating preprocessing-spatial-coverage.md, updating clip-preprocessing-decisions.md).
+- `context/architecture.md`, `context/plans/perf-diagnostics.md`.
+- `git status` + `git log --oneline -10` to confirm uncommitted vs committed scope.
 
-### Inferred from structure only
+### Noted but not read in full this run
 
-- `models/*.onnx` and `models/tokenizer.json` — not committed (only `.gitkeep`-shaped placeholders or absent). Existence and shape inferred from how `lib.rs:120-134` validates them.
-- `.thumbnails/` directory — only the naming convention `thumb_{id}.jpg` is observed (`generator.rs:51`). Directory contents not enumerated.
-- `test_images/` — only the count (749 images per LifeOS doc; `test_scan_directory_finds_all_images` test asserts `len() == 4` which contradicts current state and will fail under `cargo test`).
-- `package-lock.json` — not read; relied on `package.json`.
+- `src-tauri/src/db/{tags,thumbnails,roots,notes_orphans,test_helpers}.rs` — small files unchanged this session; behaviour assumed unchanged from prior upkeep notes.
+- `src-tauri/src/{filesystem,paths,settings,perf_report}.rs` and the `commands/{images,tags,notes,profiling,roots}.rs` set — unchanged this session.
+- Frontend changes from this session (`src/components/settings/EncoderSection.tsx` — read at session start to understand the picker; not re-inspected).
+- `commands/profiling.rs`, `perf.rs` (line 100+), `perf_report.rs` past the diagnostic-rendering area.
+
+### Inferred from structure / source comments only
+
+- The exact serde shape of the `RawEvent::Diagnostic { ts_ms, diagnostic, payload }` variant in `perf.rs` — inferred from the section comment in conventions plus the diagnostic emission sites.
+- Frontend behaviour around the encoder picker — inferred from EncoderSection.tsx read at session start; the actual TanStack Query / IPC path was not re-traced.
+- `src/components/ui/*.tsx` (shadcn primitives) — derivative; not read.
+
+### Verification questions deferred to next session
+
+- Does the SigLIP-2 text encoder's ONNX I/O signature match what `Siglip2TextEncoder::encode` expects when actually called against a real model file? The prior research pass verified the signature externally; we haven't run a smoke test against the downloaded file.
+- Does the embedding-pipeline migration trigger reliably on a fresh DB (no `meta` row at all)? Tests pass for the `meta` table create + insert path; the "stored is None" branch is exercised by the test suite indirectly via `fresh_db()`.
+- Will the cross_encoder_comparison diagnostic's per-other-encoder temporary `CosineIndex` build complete in reasonable time on a 10k-image library? The estimated 50-200ms × encoders is from the prior research pass — not measured.
+- Does the dim mismatch from prior `dinov2_small` rows existing in the embeddings table create any issue at startup before the migration runs? The migration runs inside `initialize()` so the cache should never see them — but worth confirming on a real upgrade scenario.

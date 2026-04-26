@@ -55,6 +55,24 @@ export function EncoderSection() {
     };
   }, []);
 
+  // Push the current image-encoder pick to the backend on mount + on
+  // change. The backend reads `priority_image_encoder` from settings.json
+  // at the start of every indexing pipeline run; having it match what
+  // the picker shows means the next pipeline (or the next watcher
+  // rescan) runs the user's encoder FIRST and hot-populates the cosine
+  // cache for it as soon as that phase finishes — instead of always
+  // running CLIP → SigLIP-2 → DINOv2 in fixed order.
+  useEffect(() => {
+    invoke("set_priority_image_encoder", { id: prefs.imageEncoder }).catch(
+      (e) => {
+        // Non-fatal: an unknown id at the backend (e.g. encoder removed
+        // between releases) just means the pipeline falls back to its
+        // default ordering. Log so the failure isn't silent in dev.
+        console.warn("set_priority_image_encoder failed:", e);
+      },
+    );
+  }, [prefs.imageEncoder]);
+
   // Validate the saved encoder choice against the live options. Cleans
   // up stale localStorage entries (e.g. the user picked SigLIP-2 in a
   // previous session, then we removed it from the available list when

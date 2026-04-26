@@ -19,8 +19,9 @@ import { SettingsDrawer } from "@/components/settings";
 import { PerfOverlay } from "@/components/PerfOverlay";
 import { isProfilingEnabled, recordAction, onRenderProfiler } from "@/services/perf";
 import { useQueryClient } from "@tanstack/react-query";
-import { FolderOpen, Settings as SettingsIcon } from "lucide-react";
-import { pickScanFolder, setScanRoot } from "@/services/images";
+import { FolderPlus, Settings as SettingsIcon } from "lucide-react";
+import { pickScanFolder } from "@/services/images";
+import { useAddRoot, useRoots } from "@/queries/useRoots";
 import { useUserPreferences } from "@/hooks/useUserPreferences";
 import { getImageNotes, setImageNotes } from "@/services/notes";
 
@@ -38,6 +39,8 @@ export default function Home() {
   const [profiling, setProfiling] = useState(false);
   const [perfOpen, setPerfOpen] = useState(false);
   const { prefs } = useUserPreferences();
+  const { data: roots } = useRoots();
+  const addRootMutation = useAddRoot();
 
   // Resolve the profiling flag once at mount. When set, auto-open the
   // overlay so the user doesn't have to discover the cmd+shift+P
@@ -357,24 +360,32 @@ export default function Home() {
             </div>
             <button
               type="button"
-              title="Choose image folder"
-              aria-label="Choose image folder"
+              title="Add image folder"
+              aria-label="Add image folder"
               className="flex shrink-0 items-center gap-2 rounded-full bg-secondary text-secondary-foreground px-4 py-3 text-sm font-medium transition-colors hover:bg-accent"
               onClick={async () => {
                 try {
                   const folder = await pickScanFolder();
                   if (!folder) return; // user cancelled
-                  await setScanRoot(folder);
+                  // Pre-empt the backend UNIQUE constraint with a friendly
+                  // message. The backend still rejects duplicates as a
+                  // safety net (the cache could be stale on cold start).
+                  if (roots?.some((r) => r.path === folder)) {
+                    window.alert("That folder is already in your library.");
+                    return;
+                  }
+                  recordAction("folder_add", { path: folder, via: "topbar" });
+                  await addRootMutation.mutateAsync(folder);
                 } catch (err) {
                   console.error("Folder picker failed:", err);
                   window.alert(
-                    `Could not set folder: ${err instanceof Error ? err.message : String(err)}`
+                    `Could not add folder: ${err instanceof Error ? err.message : String(err)}`
                   );
                 }
               }}
             >
-              <FolderOpen className="h-4 w-4" />
-              <span className="hidden md:inline">Choose folder</span>
+              <FolderPlus className="h-4 w-4" />
+              <span className="hidden md:inline">Add folder</span>
             </button>
 
             <button

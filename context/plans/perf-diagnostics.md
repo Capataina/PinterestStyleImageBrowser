@@ -290,21 +290,76 @@ the threshold. Acts as a regression canary.
 | Phase | Scope | Status |
 |---|---|---|
 | 0 | Plan document | **(this file)** |
-| 1 | tracing-instrument all key functions | **(planned)** |
-| 2 | perf::Layer that collects samples + aggregates | **(planned)** |
-| 3 | get_perf_snapshot Tauri command | **(planned)** |
-| 4 | In-app overlay component, cmd+shift+P toggle | **(planned)** |
-| 5 | Frontend perfInvoke + React Profiler integration | **(planned)** |
-| 6 | JSONL flush + rotation | **(planned)** |
-| 7 | System-level sampling (RSS, threads) | **(planned)** |
-| 8 | CLI dump tool (`cargo run --bin perfdump`) | **(deferred)** |
+| 1 | tracing-instrument all key functions | **(implemented — commits `5910966`, `7e49b75`, `6e27245`; see `systems/profiling.md` § Tracing instrumentation coverage)** |
+| 2 | perf::Layer that collects samples + aggregates | **(implemented — `src-tauri/src/perf.rs`)** |
+| 3 | get_perf_snapshot Tauri command | **(implemented — `commands/profiling.rs`)** |
+| 4 | In-app overlay component, cmd+shift+P toggle | **(implemented — `src/components/PerfOverlay.tsx` + `pages/[...slug].tsx` shortcut handler)** |
+| 5 | Frontend perfInvoke + React Profiler integration | **(implemented — `src/services/perf.ts::perfInvoke`, `onRenderProfiler`; commit `ee8c5d6`)** |
+| 6 | JSONL flush + rotation | **(implemented for flush — `perf::spawn_flush_thread`, `perf_report::render_session_report`; rotation NOT implemented — see "Still pending" below)** |
+| 7 | System-level sampling (RSS, threads) | **(NOT implemented — see "Still pending" below)** |
+| 8 | CLI dump tool (`cargo run --bin perfdump`) | **(deferred — out of scope)** |
 | 9 | tracing-tracy integration for live viz | **(deferred — optional)** |
-| 10 | Cargo benches for pure-fn hot paths | **(deferred)** |
+| 10 | Cargo benches for pure-fn hot paths | **(deferred — separate concern)** |
 
-Phases 1-4 are the floor for the user's request — they cover every
-backend operation with timing + give the user a UI to see it. Phases
-5-7 add frontend coverage and persistence. 8-10 are nice-to-haves
-that wait until we have data to inform them.
+Phases 1-5 are fully shipped — the user's `--profile` mode produces
+the on-exit `report.md` + `raw.json` + `timeline.jsonl` artefacts
+documented in `systems/profiling.md`. Phase 6 partially landed; Phase
+7 hasn't started.
+
+## Still pending
+
+- **Per-DB-method instrumentation** (Phase 1 carry-over) — currently only
+  the IPC layer has spans; per-`db.*` method timings aren't separately
+  attributed. Adding `db.<method_name>` spans would let the perf report
+  show per-DB-method time inside an IPC.
+- **Timeline rotation** (Phase 6) — long sessions produce a single
+  unbounded `timeline.jsonl`. Rotating at e.g. 100 MB or 1-hour
+  boundaries would prevent the file from growing forever in
+  always-on profiling sessions.
+- **System-level sampling** (Phase 7) — RSS / heap / thread count
+  every 1s. Today's metrics are span-based only; resource-pressure
+  signals are missing. Not a blocker until a real memory issue surfaces.
+- **Session-diff tooling** — two `raw.json` snapshots could be diffed
+  programmatically to surface "this regressed by 30 ms p95 between
+  commits A and B." Today this requires manual comparison.
+
+These are tracked here rather than as separate plan files because
+they're incremental extensions of the shipped system, not a new
+feature. When one becomes urgent, lift it into its own plan file or
+just implement it inline.
+
+---
+
+## Domain diagnostics (added 2026-04-26)
+
+This plan was originally about **span-timing** profiling. A second
+layer landed on top of it: **domain diagnostics** — `record_diagnostic(name, payload)`
+calls that emit structured `serde_json::Value` snapshots into the
+same RawEvent log as spans. The on-exit `perf_report.rs` renders them
+in a dedicated `## Diagnostics` section grouped by name.
+
+12 diagnostics shipped: `startup_state`, `cosine_math_sanity`,
+`cosine_cache_populated`, `embedding_stats`,
+`pairwise_distance_distribution`, `self_similarity_check`,
+`encoder_run_summary`, `preprocessing_sample`, `tokenizer_output`,
+`search_query` (with nested `query_embedding`, `score_distribution`,
+`path_resolution_outcomes` blocks), `cross_encoder_comparison`.
+
+Spans answer "how long?". Diagnostics answer "what was the system
+actually doing?" — embedding L2 norms, tokenizer output, score
+distributions, encoder run summaries, cross-encoder rankings.
+
+Full catalogue + emission patterns + `record_diagnostic` API live in
+`systems/profiling.md` § Domain diagnostics. The convention is
+captured in `notes/conventions.md` § Domain diagnostics via
+`record_diagnostic`. The four stateless helpers used by both
+`cosine/index.rs` and `commands/*` live in
+`src-tauri/src/similarity_and_semantic_search/cosine/diagnostics.rs`.
+
+Status: **shipped** as part of the 2026-04-26 encoder pipeline
+overhaul. Treated as a complete capability, not a phase — bumps to
+the catalogue land via direct edits to the relevant code path +
+`systems/profiling.md`, not via this plan file.
 
 ---
 

@@ -25,6 +25,17 @@ pub struct Settings {
     /// no folder has been picked yet — first-launch state.
     #[serde(default)]
     pub scan_root: Option<PathBuf>,
+
+    /// Encoder ID the user has picked for image→image similarity. Read
+    /// by the indexing pipeline so the priority encoder runs FIRST
+    /// (before the others), and so the cosine cache is hot-populated
+    /// for it as soon as that encoder's phase finishes — instead of
+    /// only at the end of all three phases. Frontend writes via the
+    /// `set_priority_image_encoder` Tauri command whenever the user
+    /// changes the picker. None means "no preference, run in default
+    /// order with CLIP first".
+    #[serde(default)]
+    pub priority_image_encoder: Option<String>,
 }
 
 impl Settings {
@@ -81,10 +92,30 @@ mod tests {
     fn test_round_trip_with_scan_root() {
         let s = Settings {
             scan_root: Some(PathBuf::from("/tmp/example")),
+            ..Settings::default()
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(back.scan_root, Some(PathBuf::from("/tmp/example")));
+    }
+
+    #[test]
+    fn test_priority_encoder_round_trip() {
+        let s = Settings {
+            priority_image_encoder: Some("dinov2_base".into()),
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.priority_image_encoder, Some("dinov2_base".into()));
+    }
+
+    #[test]
+    fn test_priority_encoder_default_is_none() {
+        // Without an explicit user pick, the field must default to
+        // None so the pipeline falls back to its default ordering.
+        let s = Settings::default();
+        assert!(s.priority_image_encoder.is_none());
     }
 
     #[test]

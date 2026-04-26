@@ -1,42 +1,68 @@
 use ort::{session::Session, value::Tensor};
 use std::{error::Error, path::Path};
+use tokenizers::Tokenizer;
 use tracing::{debug, info, warn};
 
-use super::pooling::{normalize, try_extract_single_embedding};
-use super::tokenizer::SimpleTokenizer;
+use super::pooling::normalize;
 // Trait import aliased to avoid the name collision with our concrete
 // struct ClipTextEncoder. The trait lives in the sibling encoders
 // module and is what the runtime dispatches against.
 use crate::similarity_and_semantic_search::encoders::TextEncoder as TextEncoderTrait;
 
 // CoreML is intentionally NOT used for the text encoder on macOS.
-// The multilingual CLIP text model is a transformer (DistilBERT-based,
-// 383 nodes); CoreML can only execute ~17 of those nodes natively and
-// falls back to CPU for the rest. We measured 6-15s of upfront CoreML
-// graph-analysis cost per session-create, plus partition management
-// overhead at run time — all for a worse runtime than plain CPU.
+// The OpenAI CLIP text model is a transformer (12-layer, 8-head); CoreML's
+// transformer node coverage is poor and its session-create overhead (6-15s)
+// dominates the actual inference cost. Plain CPU is faster end-to-end.
 //
-// Image encoder (encoder.rs) keeps CoreML because CLIP's CNN-heavy
-// graph is what CoreML is good at — there it's a 5-10x win.
+// Image encoder (encoder.rs) keeps its accelerator hook because CLIP's
+// CNN-heavy graph is what CoreML is good at — there it's a 5-10× win.
 
 #[cfg(not(target_os = "macos"))]
 use ort::execution_providers::CUDAExecutionProvider;
 
-/// Text encoder for CLIP-based semantic search.
-/// Uses the multilingual CLIP model (clip-ViT-B-32-multilingual-v1) to encode text
-/// into the same 512-dimensional embedding space as images.
+/// Text encoder for OpenAI CLIP ViT-B/32 (English-only).
+///
+/// Uses the SEPARATE `text_model.onnx` from
+/// `Xenova/clip-vit-base-patch32` — NOT the multilingual distillation
+/// (`sentence-transformers/clip-ViT-B-32-multilingual-v1`) we shipped
+/// previously. The multilingual model is in a different embedding
+/// space than the image encoder; using it for text→image search
+/// produced effectively-random rankings, which is the bug class
+/// "blue fish → Tristana" was an example of.
+///
+/// Tokenization: byte-level BPE via the HuggingFace `tokenizers`
+/// crate. The `tokenizer.json` carries the full normalization +
+/// special-tokens contract; `tokenizers` handles it all uniformly.
+///
+/// Inputs:
+///   - `input_ids` [1, 77] int64 — ONLY input. The Xenova
+///     `text_model.onnx` export bakes the causal/padding mask into
+///     the graph from the input_ids themselves (it knows the pad
+///     token is 49407 = EOS, and treats positions after the first
+///     EOS as padding). Passing `attention_mask` errors with
+///     "Invalid input name: attention_mask" at session.run time.
+///     We still pad with id 49407 to fixed length 77; the model
+///     handles the mask internally.
+/// Output: `text_embeds` [1, 512] f32 (post-projection, post-LN)
+/// L2-normalised before returning.
 pub struct ClipTextEncoder {
     session: Session,
-    tokenizer: SimpleTokenizer,
+    tokenizer: Tokenizer,
     max_seq_length: usize,
+    pad_token_id: i64,
 }
+
+/// OpenAI CLIP padding token. Verified from `Xenova/clip-vit-base-patch32`
+/// `tokenizer_config.json`: `pad_token = <|endoftext|>` with id 49407.
+const CLIP_PAD_TOKEN_ID: i64 = 49407;
+const CLIP_MAX_SEQ_LENGTH: usize = 77;
 
 impl ClipTextEncoder {
     /// Create a new ClipTextEncoder from ONNX model and tokenizer files.
     ///
     /// # Arguments
-    /// * `model_path` - Path to the ONNX text model (e.g., "models/model_text.onnx")
-    /// * `tokenizer_path` - Path to the tokenizer.json file (e.g., "models/tokenizer.json")
+    /// * `model_path` - Path to the ONNX text model (e.g., `clip_text.onnx`)
+    /// * `tokenizer_path` - Path to the tokenizer.json file (BPE)
     #[cfg(target_os = "macos")]
     fn build_session_with_accel(model_path: &Path) -> Result<Session, Box<dyn Error>> {
         // macOS: text encoder runs CPU-only because CoreML coverage is
@@ -57,21 +83,19 @@ impl ClipTextEncoder {
     }
 
     pub fn new(model_path: &Path, tokenizer_path: &Path) -> Result<Self, Box<dyn Error>> {
-        info!("=== Initializing text encoder ===");
+        info!("=== Initializing CLIP text encoder (OpenAI English) ===");
         debug!("Model path: {:?}", model_path);
         debug!("Tokenizer path: {:?}", tokenizer_path);
 
-        // Load the tokenizer
-        info!("Loading tokenizer...");
-        let tokenizer = SimpleTokenizer::from_file(tokenizer_path)?;
-        info!("Tokenizer loaded ({} tokens)", tokenizer.vocab.len());
+        // Load tokenizer via the canonical HF crate. Handles BPE merges,
+        // NFC normalization, lowercase, special-token wrapping, etc.
+        info!("Loading BPE tokenizer...");
+        let tokenizer = Tokenizer::from_file(tokenizer_path)
+            .map_err(|e| format!("CLIP tokenizer load failed: {e}"))?;
+        info!("Tokenizer loaded");
 
         // Build the ONNX session with the platform-appropriate
-        // execution provider, falling back to CPU on any error. Same
-        // story as the image encoder: ort lets the provider registration
-        // succeed even when the EP isn't actually available, so we
-        // can't claim "running on CoreML" or "running on CUDA" with
-        // confidence. We just log what we tried.
+        // execution provider, falling back to CPU on any error.
         let session = match Self::build_session_with_accel(model_path) {
             Ok(s) => s,
             Err(e) => {
@@ -80,14 +104,24 @@ impl ClipTextEncoder {
             }
         };
 
-        // The multilingual CLIP model uses max_seq_length of 128
-        let max_seq_length = 128;
-
         Ok(ClipTextEncoder {
             session,
             tokenizer,
-            max_seq_length,
+            max_seq_length: CLIP_MAX_SEQ_LENGTH,
+            pad_token_id: CLIP_PAD_TOKEN_ID,
         })
+    }
+
+    /// Borrow the tokenizer for the `tokenizer_output` diagnostic.
+    /// Returns the raw HF Tokenizer — callers can use `.encode(text, true)`
+    /// to get IDs + tokens without running ONNX inference.
+    pub fn tokenizer_for_diagnostic(&self) -> &Tokenizer {
+        &self.tokenizer
+    }
+
+    /// Configured max_seq_length (77 for OpenAI CLIP).
+    pub fn max_seq_length(&self) -> usize {
+        self.max_seq_length
     }
 
     /// Inspect the model's input and output names (useful for debugging)
@@ -103,63 +137,67 @@ impl ClipTextEncoder {
         }
     }
 
+    /// Tokenize + pad/truncate to `max_seq_length`. Returns the
+    /// fixed-length `input_ids` only — the Xenova `text_model.onnx`
+    /// export does not accept an attention_mask input (the mask is
+    /// derived inside the graph from the pad-token positions).
+    fn tokenize_and_pad(&self, text: &str) -> Result<Vec<i64>, Box<dyn Error>> {
+        let encoded = self
+            .tokenizer
+            .encode(text, true)
+            .map_err(|e| format!("CLIP tokenize failed: {e}"))?;
+        let mut ids: Vec<i64> = encoded.get_ids().iter().map(|&i| i as i64).collect();
+
+        // Truncate or pad to exactly max_seq_length. Pad token = 49407
+        // (= EOS = endoftext in OpenAI CLIP). The model recognises
+        // these padding positions internally.
+        if ids.len() > self.max_seq_length {
+            ids.truncate(self.max_seq_length);
+        } else {
+            let pad_count = self.max_seq_length - ids.len();
+            ids.extend(std::iter::repeat(self.pad_token_id).take(pad_count));
+        }
+        Ok(ids)
+    }
+
     /// Encode a text string into a 512-dimensional embedding vector.
     ///
-    /// # Arguments
-    /// * `text` - The text to encode (supports 50+ languages)
-    ///
     /// # Returns
-    /// A 512-dimensional normalized embedding vector
+    /// A 512-dimensional L2-normalised embedding vector.
     #[tracing::instrument(name = "clip.encode_text", skip(self, text), fields(query_len = text.len()))]
     pub fn encode(&mut self, text: &str) -> Result<Vec<f32>, Box<dyn Error>> {
-        // Tokenize the text
-        let (mut input_ids, mut attention_mask) = self.tokenizer.encode(text, true);
+        let input_ids = self.tokenize_and_pad(text)?;
 
-        // Pad or truncate to max_seq_length
-        self.pad_or_truncate(&mut input_ids, self.tokenizer.pad_token_id());
-        self.pad_or_truncate(&mut attention_mask, 0);
-
-        // Create tensors with shape [1, max_seq_length]
+        // Create the input tensor with shape [1, max_seq_length].
         let input_ids_tensor: Tensor<i64> =
             Tensor::from_array(([1usize, self.max_seq_length], input_ids))?;
-        let attention_mask_tensor: Tensor<i64> =
-            Tensor::from_array(([1usize, self.max_seq_length], attention_mask))?;
 
-        // Run inference
+        // OpenAI CLIP text_model.onnx (Xenova export):
+        //   input:  input_ids ONLY — see the type-level comment above
+        //           for why attention_mask is not accepted here.
+        //   outputs: text_embeds [1, 512] (post-projection), last_hidden_state
         let outputs = self.session.run(ort::inputs![
-            "input_ids" => input_ids_tensor,
-            "attention_mask" => attention_mask_tensor
+            "input_ids" => input_ids_tensor
         ])?;
 
-        // Try different possible output names for the text embedding
-        // Common names: "text_embeds", "sentence_embedding", "last_hidden_state", "pooler_output"
-        let output_names = [
-            "sentence_embedding",
-            "text_embeds",
-            "pooler_output",
-            "last_hidden_state",
-        ];
+        // Try `text_embeds` first (joint-space, post-projection). Fall
+        // back to other names if a future export renames the output.
+        let extract = |name: &str| -> Option<Vec<f32>> {
+            outputs.get(name).and_then(|t| {
+                t.try_extract_tensor::<f32>()
+                    .ok()
+                    .map(|(_, view)| view.to_vec())
+            })
+        };
+        let raw = extract("text_embeds")
+            .or_else(|| extract("pooler_output"))
+            .or_else(|| extract("sentence_embedding"))
+            .ok_or("CLIP text: no recognised output name (expected text_embeds)")?;
 
-        let mut embedding: Option<Vec<f32>> = None;
-
-        for name in output_names {
-            if let Some(tensor) = outputs.get(name) {
-                let (_shape, data_view) = tensor.try_extract_tensor::<f32>()?;
-                let data = data_view.to_vec();
-
-                if let Some(emb) = try_extract_single_embedding(data, self.max_seq_length) {
-                    embedding = Some(emb);
-                    break;
-                }
-            }
-        }
-
-        let embedding = embedding.ok_or("Could not extract embedding from model output")?;
-
-        // Normalize the embedding (CLIP embeddings should be unit vectors)
-        let normalized = normalize(&embedding);
-
-        Ok(normalized)
+        // L2-normalise so cosine is well-conditioned. The Xenova
+        // text_model.onnx outputs the post-projection embedding
+        // without normalization.
+        Ok(normalize(&raw))
     }
 
     /// Encode multiple texts in a batch (more efficient for multiple queries)
@@ -170,281 +208,68 @@ impl ClipTextEncoder {
 
         let batch_size = texts.len();
 
-        // Tokenize all texts
         let mut all_input_ids: Vec<i64> = Vec::with_capacity(batch_size * self.max_seq_length);
-        let mut all_attention_masks: Vec<i64> =
-            Vec::with_capacity(batch_size * self.max_seq_length);
 
         for text in texts {
-            let (mut input_ids, mut attention_mask) = self.tokenizer.encode(text, true);
-
-            self.pad_or_truncate(&mut input_ids, self.tokenizer.pad_token_id());
-            self.pad_or_truncate(&mut attention_mask, 0);
-
-            all_input_ids.extend(input_ids);
-            all_attention_masks.extend(attention_mask);
+            let ids = self.tokenize_and_pad(text)?;
+            all_input_ids.extend(ids);
         }
 
-        // Create batch tensors
         let input_ids_tensor: Tensor<i64> =
             Tensor::from_array(([batch_size, self.max_seq_length], all_input_ids))?;
-        let attention_mask_tensor: Tensor<i64> =
-            Tensor::from_array(([batch_size, self.max_seq_length], all_attention_masks))?;
 
-        // Run inference
         let outputs = self.session.run(ort::inputs![
-            "input_ids" => input_ids_tensor,
-            "attention_mask" => attention_mask_tensor
+            "input_ids" => input_ids_tensor
         ])?;
 
-        // Extract embeddings
-        let output_names = ["sentence_embedding", "text_embeds", "pooler_output"];
+        let extract = |name: &str| -> Option<(Vec<usize>, Vec<f32>)> {
+            outputs.get(name).and_then(|t| {
+                t.try_extract_tensor::<f32>().ok().map(|(shape, view)| {
+                    let s: Vec<usize> = shape.iter().map(|d| *d as usize).collect();
+                    (s, view.to_vec())
+                })
+            })
+        };
+        let (shape, data) = extract("text_embeds")
+            .or_else(|| extract("pooler_output"))
+            .ok_or("CLIP text batch: no recognised output name")?;
 
-        for name in output_names {
-            if let Some(tensor) = outputs.get(name) {
-                let (shape, data_view) = tensor.try_extract_tensor::<f32>()?;
-                let data = data_view.to_vec();
-
-                // Expected shape: [batch_size, 512]
-                if shape.len() == 2 && shape[1] == 512 {
-                    let mut embeddings = Vec::with_capacity(batch_size);
-                    for i in 0..batch_size {
-                        let start = i * 512;
-                        let end = start + 512;
-                        let emb = normalize(&data[start..end].to_vec());
-                        embeddings.push(emb);
-                    }
-                    return Ok(embeddings);
-                }
+        // Expected shape: [batch_size, 512]
+        if shape.len() == 2 && shape[1] == 512 {
+            let mut embeddings = Vec::with_capacity(batch_size);
+            for i in 0..batch_size {
+                let start = i * 512;
+                let end = start + 512;
+                embeddings.push(normalize(&data[start..end].to_vec()));
             }
+            return Ok(embeddings);
         }
 
-        Err("Could not extract batch embeddings from model output".into())
-    }
-
-    /// Pad or truncate a vector to max_seq_length
-    fn pad_or_truncate(&self, vec: &mut Vec<i64>, pad_value: i64) {
-        if vec.len() > self.max_seq_length {
-            vec.truncate(self.max_seq_length);
-        } else {
-            vec.resize(self.max_seq_length, pad_value);
-        }
+        Err(format!(
+            "CLIP text batch: unexpected output shape {:?}, expected [batch, 512]",
+            shape
+        )
+        .into())
     }
 }
 
 /// Implement the new trait via delegation to the inherent methods.
 /// This is the seam that lets the runtime hold a `Box<dyn TextEncoder>`
-/// containing either ClipTextEncoder, the upcoming SigLIP2-Text
-/// encoder, or any future text encoder.
+/// containing either ClipTextEncoder, the SigLIP2-Text encoder, or
+/// any future text encoder.
 impl TextEncoderTrait for ClipTextEncoder {
     fn encode(&mut self, text: &str) -> Result<Vec<f32>, Box<dyn Error>> {
         ClipTextEncoder::encode(self, text)
     }
     fn embedding_dim(&self) -> usize {
-        // Multilingual CLIP-ViT-B/32 always outputs 512-d.
+        // OpenAI CLIP-ViT-B/32 outputs 512-d (text_config.hidden_size
+        // and projection_dim are both 512).
         512
     }
     fn id(&self) -> &'static str {
         // Used as the database column suffix and the user-facing
         // label. Stable forever — changing this would orphan
         // existing embedding rows.
-        "clip_multilingual_v1"
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn get_test_encoder() -> Option<ClipTextEncoder> {
-        let model_path = Path::new("models/model_text.onnx");
-        let tokenizer_path = Path::new("models/tokenizer.json");
-
-        if !model_path.exists() || !tokenizer_path.exists() {
-            println!("Model or tokenizer not found, skipping test");
-            return None;
-        }
-
-        ClipTextEncoder::new(model_path, tokenizer_path).ok()
-    }
-
-    fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-        let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-        let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-        let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if norm_a > 0.0 && norm_b > 0.0 {
-            dot / (norm_a * norm_b)
-        } else {
-            0.0
-        }
-    }
-
-    #[test]
-    fn test_inspect_model() {
-        if let Some(encoder) = get_test_encoder() {
-            encoder.inspect_model();
-        }
-    }
-
-    #[test]
-    fn test_encode_simple_text() {
-        let Some(mut encoder) = get_test_encoder() else {
-            return;
-        };
-
-        let embedding = encoder.encode("a photo of a dog").unwrap();
-
-        // Should be 512 dimensions
-        assert_eq!(embedding.len(), 512, "Embedding should be 512-dimensional");
-
-        // Should be normalized (unit vector)
-        let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!(
-            (norm - 1.0).abs() < 0.01,
-            "Embedding should be normalized, got norm: {}",
-            norm
-        );
-
-        // Values should be finite
-        for val in &embedding {
-            assert!(val.is_finite(), "All values should be finite");
-        }
-
-        println!("Embedding norm: {}", norm);
-        println!("First 10 values: {:?}", &embedding[..10]);
-    }
-
-    #[test]
-    fn test_encode_multilingual() {
-        let Some(mut encoder) = get_test_encoder() else {
-            return;
-        };
-
-        // Test different languages
-        let texts = [
-            ("English", "a dog"),
-            ("German", "ein Hund"),
-            ("Spanish", "un perro"),
-            ("French", "un chien"),
-            ("Japanese", "犬"),
-            ("Chinese", "狗"),
-        ];
-
-        for (lang, text) in texts {
-            let embedding = encoder.encode(text);
-            assert!(
-                embedding.is_ok(),
-                "Failed to encode {} text: {}",
-                lang,
-                text
-            );
-            let emb = embedding.unwrap();
-            assert_eq!(emb.len(), 512, "{} embedding should be 512-dim", lang);
-            println!("✓ {} ('{}') encoded successfully", lang, text);
-        }
-    }
-
-    #[test]
-    fn test_similar_concepts_close_embeddings() {
-        let Some(mut encoder) = get_test_encoder() else {
-            return;
-        };
-
-        let dog = encoder.encode("a dog").unwrap();
-        let puppy = encoder.encode("a puppy").unwrap();
-        let cat = encoder.encode("a cat").unwrap();
-        let car = encoder.encode("a car").unwrap();
-
-        let sim_dog_puppy = cosine_similarity(&dog, &puppy);
-        let sim_dog_cat = cosine_similarity(&dog, &cat);
-        let sim_dog_car = cosine_similarity(&dog, &car);
-
-        println!("dog <-> puppy: {:.4}", sim_dog_puppy);
-        println!("dog <-> cat:   {:.4}", sim_dog_cat);
-        println!("dog <-> car:   {:.4}", sim_dog_car);
-
-        // Dog and puppy should be more similar than dog and car
-        assert!(
-            sim_dog_puppy > sim_dog_car,
-            "Dog-puppy ({:.4}) should be more similar than dog-car ({:.4})",
-            sim_dog_puppy,
-            sim_dog_car
-        );
-    }
-
-    #[test]
-    fn test_encode_consistency() {
-        let Some(mut encoder) = get_test_encoder() else {
-            return;
-        };
-
-        let text = "a beautiful sunset over the ocean";
-        let emb1 = encoder.encode(text).unwrap();
-        let emb2 = encoder.encode(text).unwrap();
-
-        // Same text should produce identical embeddings
-        let similarity = cosine_similarity(&emb1, &emb2);
-        assert!(
-            (similarity - 1.0).abs() < 1e-5,
-            "Same text should produce identical embeddings, got similarity: {}",
-            similarity
-        );
-    }
-
-    #[test]
-    fn test_encode_batch() {
-        let Some(mut encoder) = get_test_encoder() else {
-            return;
-        };
-
-        let texts = ["a dog", "a cat", "a car"];
-        let batch_embeddings = encoder.encode_batch(&texts).unwrap();
-
-        assert_eq!(batch_embeddings.len(), 3);
-
-        // Compare with individual encodings
-        for (i, text) in texts.iter().enumerate() {
-            let individual = encoder.encode(text).unwrap();
-            let batch = &batch_embeddings[i];
-
-            let similarity = cosine_similarity(&individual, batch);
-            assert!(
-                similarity > 0.99,
-                "Batch and individual encoding should match for '{}', got similarity: {}",
-                text,
-                similarity
-            );
-        }
-    }
-
-    #[test]
-    fn test_encoding_speed() {
-        use std::time::Instant;
-
-        let Some(mut encoder) = get_test_encoder() else {
-            return;
-        };
-
-        let text = "a photo of a dog playing in the park";
-
-        // Warm up
-        let _ = encoder.encode(text);
-
-        // Time 10 encodings
-        let start = Instant::now();
-        for _ in 0..10 {
-            let _ = encoder.encode(text).unwrap();
-        }
-        let elapsed = start.elapsed();
-
-        let avg_ms = elapsed.as_millis() as f64 / 10.0;
-        println!("Average encoding time: {:.2}ms", avg_ms);
-
-        // Should be reasonably fast (< 500ms per encoding on CPU)
-        assert!(
-            avg_ms < 500.0,
-            "Encoding should be < 500ms, got {:.2}ms",
-            avg_ms
-        );
+        "clip_vit_b_32"
     }
 }

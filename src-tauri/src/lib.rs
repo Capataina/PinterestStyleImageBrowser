@@ -99,7 +99,7 @@ pub struct TextEncoderState {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run(db: ImageDatabase, db_path: String) {
-    use commands::encoders::list_available_encoders;
+    use commands::encoders::{list_available_encoders, set_priority_image_encoder};
     use commands::images::{get_images, get_pipeline_stats};
     use commands::notes::{get_image_notes, set_image_notes};
     use commands::profiling::{
@@ -194,6 +194,43 @@ pub fn run(db: ImageDatabase, db_path: String) {
                             }),
                         );
                     }
+
+                    // Cosine math sanity check — synthetic vectors with
+                    // known expected outputs. If this ever returns a
+                    // surprising number, EVERY semantic-search /
+                    // similarity result downstream is suspect because
+                    // the math itself is broken. Cheap (~µs).
+                    {
+                        use ndarray::Array1;
+                        use crate::similarity_and_semantic_search::cosine::CosineIndex;
+                        let a = Array1::from_vec(vec![1.0_f32, 0.0, 0.0]);
+                        let b = Array1::from_vec(vec![0.0_f32, 1.0, 0.0]);
+                        let c = Array1::from_vec(vec![1.0_f32, 0.0, 0.0]);
+                        let d = Array1::from_vec(vec![-1.0_f32, 0.0, 0.0]);
+                        let zero = Array1::from_vec(vec![0.0_f32, 0.0, 0.0]);
+                        let high_dim_a: Array1<f32> = Array1::from_vec((0..512).map(|i| (i as f32).sin()).collect());
+                        let high_dim_b: Array1<f32> = Array1::from_vec((0..512).map(|i| (i as f32).cos()).collect());
+
+                        let orthogonal = CosineIndex::cosine_similarity(&a, &b);
+                        let parallel = CosineIndex::cosine_similarity(&a, &c);
+                        let opposite = CosineIndex::cosine_similarity(&a, &d);
+                        let zero_vec = CosineIndex::cosine_similarity(&a, &zero);
+                        let dim_mismatch = CosineIndex::cosine_similarity(&a, &high_dim_a);
+                        let high_dim_random = CosineIndex::cosine_similarity(&high_dim_a, &high_dim_b);
+
+                        perf::record_diagnostic(
+                            "cosine_math_sanity",
+                            serde_json::json!({
+                                "orthogonal_3d":   { "got": orthogonal,    "expected": 0.0,  "passes": orthogonal.abs() < 1e-5 },
+                                "parallel_3d":     { "got": parallel,      "expected": 1.0,  "passes": (parallel - 1.0).abs() < 1e-5 },
+                                "opposite_3d":     { "got": opposite,      "expected": -1.0, "passes": (opposite + 1.0).abs() < 1e-5 },
+                                "zero_vector_3d":  { "got": zero_vec,      "expected": 0.0,  "passes": zero_vec.abs() < 1e-5 },
+                                "dim_mismatch":    { "got": dim_mismatch,  "expected": 0.0,  "passes": dim_mismatch.abs() < 1e-5, "note": "3-d vs 512-d should return 0 via guard, not panic" },
+                                "high_dim_random": { "got": high_dim_random, "expected_range": "[-0.1, 0.1] for sin/cos quasi-orthogonal", "passes": high_dim_random.abs() < 0.2 },
+                                "interpretation": "All passes=true means cosine math is correct — bad search results are an encoder/data issue, not math.",
+                            }),
+                        );
+                    }
                 }
 
                 // One-shot legacy migration: if the user upgraded from
@@ -237,6 +274,7 @@ pub fn run(db: ImageDatabase, db_path: String) {
                     indexing_state.clone(),
                     db_path.clone(),
                     cosine_index.clone(),
+                    current_encoder_id.clone(),
                 ) {
                     error!("could not spawn indexing pipeline: {e}");
                 }
@@ -263,6 +301,7 @@ pub fn run(db: ImageDatabase, db_path: String) {
                         db_path,
                         indexing_state,
                         cosine_index,
+                        current_encoder_id.clone(),
                     );
                     if let Ok(mut slot) = watcher_state.lock() {
                         *slot = handle;
@@ -275,6 +314,7 @@ pub fn run(db: ImageDatabase, db_path: String) {
             get_images,
             get_pipeline_stats,
             list_available_encoders,
+            set_priority_image_encoder,
             get_tags,
             create_tag,
             delete_tag,

@@ -1,111 +1,168 @@
 # clip-text-encoder
 
-*Maturity: working*
+*Maturity: comprehensive*
 
 ## Scope / Purpose
 
-Encodes a text query into the same 512-dimensional embedding space as the image encoder, so that cosine similarity between a text embedding and image embeddings retrieves semantically matching images. Uses the multilingual CLIP variant (`clip-ViT-B-32-multilingual-v1`) — typing in any of 50+ languages produces an embedding that aligns with image content. Includes a pure-Rust WordPiece tokenizer that loads from a HuggingFace `tokenizer.json`, avoiding any C tokenizer dependency.
+Encodes a text query into the same 512-dimensional embedding space as `clip-image-encoder` so cosine similarity between a text embedding and image embeddings retrieves semantically matching images. Uses **OpenAI English-only CLIP ViT-B/32** via the separate `text_model.onnx` from `Xenova/clip-vit-base-patch32`, with byte-level BPE tokenization via the HuggingFace `tokenizers` crate.
+
+The previous text encoder used the multilingual distillation `clip-ViT-B-32-multilingual-v1`. Even though that model nominally outputs into "the same 512-d CLIP space," its embedding distribution is materially different from OpenAI CLIP's image branch — distilled cross-lingual training shifted the text-side representations. The result was effectively-random text-to-image rankings (the "blue fish → Tristana" failure mode). Switching to OpenAI English fixes that at the cost of dropping multilingual support.
 
 ## Boundaries / Ownership
 
-- **Owns:** the WordPiece tokenizer logic, vocabulary loading, special-token handling, sequence padding/truncation, multi-name output extraction, mean-pooling fallback.
-- **Does not own:** the in-memory similarity index (delegates to `cosine-similarity`), the lazy-init lifecycle (lives in `tauri-commands` via `TextEncoderState`).
-- **Public API:** `SimpleTokenizer::from_file(path)`, `TextEncoder::new(model_path, tokenizer_path)`, `encode(text)`, `inspect_model`.
+- **Owns:** ONNX session lifecycle (CPU-only), HF `tokenizers` crate integration (load BPE from tokenizer.json), pad/truncate to 77 tokens with id 49407, multi-output-name extraction with fallback, L2-normalize at output, the `tokenizer_for_diagnostic()` accessor used by the `tokenizer_output` perf diagnostic.
+- **Does not own:** the in-memory similarity index (delegates to `cosine-similarity`), the lazy-init lifecycle (lives in `tauri-commands` via `TextEncoderState`), the pre-warm path (lives in `indexing.rs::run_pipeline_inner`), the model file on disk (delegates to `paths::models_dir()` + `model_download::CLIP_TEXT_FILENAME` / `CLIP_TOKENIZER_FILENAME`).
+- **Public API:** `ClipTextEncoder::new(model_path, tokenizer_path)`, `encode(text) -> Result<Vec<f32>>`, `encode_batch(texts)`, `inspect_model`, `tokenizer_for_diagnostic() -> &Tokenizer`, `max_seq_length() -> usize`. Implements the `TextEncoder` trait.
 
 ## Current Implemented Reality
 
-### Tokenizer (pure-Rust WordPiece)
+### Submodule layout
 
-Loads `tokenizer.json` and reads:
-- `model.vocab` → `HashMap<String, i64>`
-- `added_tokens[*]` → also added to vocab
-- Special tokens: `[CLS]=101`, `[SEP]=102`, `[PAD]=0`, `[UNK]=100` (defaults; overridden if present in vocab).
+```
+src-tauri/src/similarity_and_semantic_search/encoder_text/
+├── mod.rs        — pub mod encoder + pooling; pub use encoder::ClipTextEncoder
+├── encoder.rs    — ClipTextEncoder struct, new(), encode(), encode_batch(), tokenize_and_pad,
+│                    all encoder tests; CoreML-disabled rationale comments
+└── pooling.rs    — normalize, try_extract_single_embedding, mean_pool helpers (ort-free)
+```
 
-Tokenisation is whitespace-split → per-word WordPiece longest-match-from-the-front. The first piece of a word stands alone; subsequent pieces get the `##` prefix. Source: `encoder_text.rs:113-170`.
+The pre-2026-04-26 `tokenizer.rs` (custom WordPiece + case-fallback for the multilingual vocab) was deleted when the OpenAI BPE swap landed — the `tokenizers` crate handles BPE/WordPiece/SentencePiece uniformly via tokenizer.json, removing the need for custom Rust tokenizer code in this project. The crate had been a dependency since the SigLIP-2 work but is now used by both text encoders.
 
-### Case handling — the durable rationale
+### Tokenizer (HuggingFace `tokenizers` crate, BPE byte-level)
 
-The multilingual tokenizer.json declares `lowercase: false`, but the vocabulary is mixed: some entries are stored lowercase, others in original case. The `tokenize_word` function tries the original case first, then a lowercase fallback before falling back to `[UNK]`. (`encoder_text.rs:113-156`.)
+Loads `clip_tokenizer.json` via `Tokenizer::from_file`. The JSON carries the full normalization + special-tokens contract:
+- NFC + collapse-whitespace + lowercase normalizers
+- BPE byte-level model with 49408-entry vocab
+- RobertaProcessing post-processor wraps with `<|startoftext|>` (id 49406) ... `<|endoftext|>` (id 49407)
+- `<|endoftext|>` doubles as both pad and unk token
 
-This was added in commit `930f1fc` (2025-12-17) — message: "Enhanced SimpleTokenizer to try both original and lowercase forms for WordPiece vocab lookup, improving multilingual support." Without this fallback, queries that happened to be uppercase or capitalised would tokenize to mostly `[UNK]` and produce useless embeddings.
+Padding is NOT done by the tokenizer — the encoder's `tokenize_and_pad` truncates or extends to exactly 77 tokens, padding with id 49407 and zeroing the attention_mask for pad positions:
 
-### Model session
+```rust
+fn tokenize_and_pad(&self, text: &str) -> Result<(Vec<i64>, Vec<i64>), Box<dyn Error>> {
+    let encoded = self.tokenizer.encode(text, true)?;       // adds BOS/EOS
+    let mut ids: Vec<i64> = encoded.get_ids().iter().map(|&i| i as i64).collect();
+    let mut mask: Vec<i64> = encoded.get_attention_mask().iter().map(|&m| m as i64).collect();
+    if ids.len() > 77 {
+        ids.truncate(77); mask.truncate(77);
+    } else {
+        let pad_count = 77 - ids.len();
+        ids.extend(std::iter::repeat(49407).take(pad_count));
+        mask.extend(std::iter::repeat(0_i64).take(pad_count));
+    }
+    Ok((ids, mask))
+}
+```
+
+### Encoder session — CoreML disabled
 
 ```rust
 Session::builder()
-    .with_execution_providers([CUDAExecutionProvider::default().build()])  // try CUDA
-    .commit_from_file(model_path)                                          // CPU fallback in `Err` arm
+    // CoreML EP intentionally NOT used. Transformer ops on CoreML produce
+    // runtime inference errors. CPU is the only supported EP for the text encoder.
+    .commit_from_file(model_path)
 ```
 
-Same fallback shape as `clip-image-encoder`. The text model is loaded lazily — see `tauri-commands` and `lib.rs:114-142`.
+The text encoder loads in 1–2 s on first construction and is held for the lifetime of the app. Pre-warm by the indexing pipeline avoids paying this cost on the user's first semantic search.
 
-### Sequence handling
+### Encode flow
 
 ```text
-encode(text):
-    (input_ids, attention_mask) = tokenizer.encode(text, add_special_tokens=true)
-    pad_or_truncate(input_ids, pad=tokenizer.pad_token_id())
-    pad_or_truncate(attention_mask, pad=0)
-    # both are now exactly length 128 (max_seq_length)
-
-    Tensor::from_array(([1, 128], input_ids))
-    Tensor::from_array(([1, 128], attention_mask))
-
-    Session::run(input_ids, attention_mask)
-
-    output_names = ["sentence_embedding", "text_embeds", "pooler_output", "last_hidden_state"]
-    for name in output_names:
-        if name in outputs:
-            data = outputs[name].try_extract_tensor::<f32>().to_vec()
-            if data.len() == 512:
-                return data
-            elif data.len() == max_seq_length * 768:
-                # mean pool over sequence (DistilBERT-style backbone)
-                return mean_pool(data, hidden_size=768)
-            elif data.len() >= 512:
-                # Take first 512 dims as a degraded fallback
-                ...
-    return Err  # if nothing matched
+encode(text: &str) -> Result<Vec<f32>>:
+    (input_ids, attention_mask) = tokenize_and_pad(text)    // both length 77
+    
+    outputs = ort.session.run(input_ids: int64[1,77], attention_mask: int64[1,77])
+    
+    // Try output names in order; return first match's vector:
+    for name in ["text_embeds", "pooler_output", "sentence_embedding"]:
+        if let Some(out) = outputs.get(name):
+            raw = out.try_extract_tensor::<f32>().to_vec()   // expected length 512
+            break
+    
+    return Err("CLIP text: no recognised output name") if no match
+    return normalize(raw)                                    // L2-normalize
 ```
 
-The four output names are tried in order because `clip-ViT-B-32-multilingual-v1` exports vary across versions and converters — sometimes the output is named `sentence_embedding`, sometimes `text_embeds`, etc. The mean-pool branch handles the case where the model returns a `[seq_len, hidden_size]` shape that needs to be pooled into a single 768-vector. (Read `encoder_text.rs:282-...` for the full attempt order.)
+The output-name iteration covers Xenova's standard `text_embeds` plus likely fallbacks for future model swaps.
 
-### `max_seq_length`
+### Pre-warm
 
-Hardcoded to 128 (`encoder_text.rs:223-224`) per the multilingual CLIP card. Anything longer is truncated.
+```rust
+// indexing.rs::run_pipeline_inner Phase 1b
+let text_encoder_state = app.state::<TextEncoderState>();
+if let Ok(mut lock) = text_encoder_state.encoder.lock() {
+    if lock.is_none() {
+        let model_path = models_dir.join(model_download::CLIP_TEXT_FILENAME);
+        let tokenizer_path = models_dir.join(model_download::CLIP_TOKENIZER_FILENAME);
+        if model_path.exists() && tokenizer_path.exists() {
+            match ClipTextEncoder::new(&model_path, &tokenizer_path) {
+                Ok(encoder) => *lock = Some(encoder),
+                Err(e) => warn!("text encoder pre-warm failed: {e}"),
+            }
+        }
+    }
+}
+```
+
+The user's first semantic search doesn't pay 1–2 s of model-load time. Pre-warm runs as soon as the indexing pipeline confirms both files exist on disk; the lazy-init path in `commands::semantic` is preserved as a fallback for the case where pre-warm failed (model still downloading on a fresh first launch).
+
+### `tokenizer_for_diagnostic()`
+
+The semantic_search command (in `commands::semantic`) calls this accessor to expose the tokenizer for the `tokenizer_output` perf diagnostic. The diagnostic captures the raw query + its decoded tokens + attention mask sum BEFORE running ONNX inference, so the on-exit profiling report can show "user typed 'blue fish' → tokens [`<|startoftext|>`, `blue</w>`, `fish</w>`, `<|endoftext|>`], 4 real tokens out of 77 max" — pinpoints tokenizer breakage (everything → `<unk>`, query truncated mid-content, vocab mismatch) without needing a separate logging hook in the encoder.
 
 ## Key Interfaces / Data Flow
 
 ```text
-tauri::semantic_search
-    ──► (lazy init on first call)
-        TextEncoder::new(models/model_text.onnx, models/tokenizer.json)
-    ──► encoder.encode(query)
-        ──► SimpleTokenizer::encode (WordPiece + case fallback)
-        ──► pad_or_truncate to length 128
-        ──► Session::run
-        ──► extract by name + shape, mean-pool if needed
-        ──► Vec<f32> length 512
-    ──► Array1::from_vec(text_embedding)
-    ──► CosineIndex::get_similar_images_sorted(...)
+commands::semantic::semantic_search:
+    text_encoder_state.encoder.lock()
+        if pre-warmed: skip init
+        else if model + tokenizer files exist: ClipTextEncoder::new(...)
+        else: return ApiError::TextModelMissing(path) or ApiError::TokenizerMissing(path)
+    
+    // Diagnostic emission BEFORE inference (cost: microseconds):
+    let tok = encoder.tokenizer_for_diagnostic();
+    let encoded = tok.encode(query, true)?;
+    perf::record_diagnostic("tokenizer_output", json!({...}))
+    
+    encoder.encode(query) → Vec<f32> length 512
+    
+        ┌──────── encoder.rs::tokenize_and_pad ────┐
+        │ Tokenizer::encode (BPE byte-level)       │
+        │ pad/truncate to 77 with id 49407         │
+        └──────────────────────────────────────────┘
+        
+        ┌──────── encoder.rs ────────────────────┐
+        │ ort.session.run                        │
+        │   inputs: input_ids, attention_mask    │
+        └────────────────────────────────────────┘
+        
+        ┌──────── pooling.rs ────────────────────┐
+        │ try_extract_single_embedding (text_embeds → pooler_output → ...) │
+        │ normalize (L2)                                                   │
+        └──────────────────────────────────────────────────────────────────┘
+    
+    → Vec<f32> length 512
+    → fed to cosine.get_similar_images_sorted as Array1::from_vec(...)
 ```
-
-The encoder is held inside `Mutex<Option<TextEncoder>>` — see `tauri-commands.md` for the lazy-init protocol.
 
 ## Implemented Outputs / Artifacts
 
-- 512-d `Vec<f32>` per query.
-- Console log of `Loaded vocabulary with N tokens` and the special-token ids on first load (`encoder_text.rs:60-64`).
+- `Library/models/clip_text.onnx` (~254 MB) loaded at first construction.
+- `Library/models/clip_tokenizer.json` (~2 MB) parsed at first construction.
+- `Vec<f32>` length 512 per `encode(query)` call (L2-normalised).
+- Encoder unit tests in `encoder.rs`.
 
 ## Known Issues / Active Risks
 
 | Risk | Triggered by | Downstream impact |
 |------|--------------|-------------------|
-| Tokenizer is whitespace-only | A query with no spaces (e.g., `LLMresearch` or CJK languages without explicit whitespace separators) | The whole sequence becomes a single "word" and WordPiece longest-match operates on the full string. This works reasonably for CJK because the vocab includes single-character entries, but it is not how the reference Python tokenizer handles tokenisation pre-CJK. |
-| Hardcoded special-token ids when vocab lookup fails | A non-standard tokenizer.json that omits `[CLS]`, `[SEP]`, `[PAD]`, or `[UNK]` | Falls back to ids `101`, `102`, `0`, `100` which match BERT-family conventions but may be wrong for other models. |
-| First-call latency | First semantic search of a session | Several seconds — model load + tokenizer parse + (in dev) CPU fallback. The user sees no progress indicator beyond "Searching for ..." spinner. |
-| Generic error message at the IPC boundary | Any failure in this module | Frontend shows "Search failed. Make sure the text model is available." regardless of whether it is a tokenizer load error, a CUDA initialisation hiccup, a missing output name, or a session.run failure. The actual `Err` is logged to stdout but not surfaced. |
-| Mutex poisoning is unrecoverable | Any panic while holding `TextEncoderState.encoder.lock()` | Subsequent semantic searches all fail with `Mutex poisoned`. App restart is the only recovery. |
+| English-only — multilingual queries fall back to BPE chunking and produce poor embeddings | User typing in non-English | Embeddings are still produced but quality is poor for the chosen language. Documented trade-off vs the prior multilingual model's misalignment problem. SigLIP-2 (which has a 256k Gemma vocab) is the better pick for non-English; tracked in `notes/preprocessing-spatial-coverage.md`. |
+| CoreML EP cannot be used | macOS attempt to enable it for performance | Silent inference errors. CPU-only is documented in source comments and not to be reverted. |
+| Model load is 1–2 s | First semantic search on a launch where pre-warm failed | Lazy fallback covers it; user sees a brief loading state on first query of the session. |
+| `max_seq_length = 77` truncation | Long queries (>~12 words) lose meaning past 77 tokens including BOS/EOS | This is OpenAI CLIP's training-time cap; raising it would require re-training the projection. Acceptable for typical "find sunset photos" queries. |
+| Mutex around `Option<ClipTextEncoder>` serialises every semantic search | Concurrent UI semantic queries | Today's UI doesn't generate parallel semantic searches. |
+| Unknown model output names produce a hard error | Swapping in a model variant with a non-standard output name | Encoder errors on first encode with `ApiError::Encoder("CLIP text: no recognised output name")`. |
+| Mutex poison (panic during encode) | Any panic in the encode path | `ApiError::Cosine("mutex poisoned: ...")` returned via `From<PoisonError>`. The naming is misleading but the recovery path is the same: restart. |
 
 ## Partial / In Progress
 
@@ -113,17 +170,19 @@ None.
 
 ## Planned / Missing / Likely Changes
 
-- Better tokenisation for languages without whitespace word boundaries — at minimum, document the limitation; ideally, plug in a per-language pre-tokeniser.
-- Surface the actual `Err` string back to the frontend (replace the generic "Search failed" message).
-- Persist the loaded tokenizer (it is small) across runs; or pre-build the vocab lookup at compile time if the tokenizer.json is bundled.
-- Optional: support a query-language hint to override the case-handling strategy when the user explicitly knows what they typed.
+- **Re-add multilingual support via SigLIP-2's text branch** — SigLIP-2 uses a Gemma 256k SentencePiece vocab and has materially better cross-lingual coverage. The runtime can dispatch text queries to whichever encoder the user picked; the picker UI already supports per-direction encoder selection.
+- **Smart per-query encoder routing** — long-term, route descriptive/scenery queries to SigLIP-2 (better English-text alignment + full-image coverage) and short concept queries to CLIP. Open architectural concern in `notes/preprocessing-spatial-coverage.md`.
+- **Better unknown-output diagnostic** — list which output names were tried in the error message, so swapping in a new model surfaces the issue immediately.
 
 ## Durable Notes / Discarded Approaches
 
-- **Pure-Rust WordPiece was chosen over the `tokenizers` crate** — the `Cargo.toml` has a comment block explaining: "Tokenizer is now implemented in pure Rust within encoder_text.rs / No external tokenizer dependency needed!" The motivation is dependency hygiene: the `tokenizers` crate has C build dependencies that complicated cross-compilation. The pure-Rust implementation handles WordPiece correctly for the multilingual vocab in use; it does not handle BPE or SentencePiece, which is fine because the model uses WordPiece.
-- **Multi-name output extraction is intentional** (`encoder_text.rs:282-...`). Different ONNX exports of the same model name the output differently. Trying four names in order avoids a re-export every time the upstream model gets re-converted by a different tool.
-- **Mean-pool fallback for `[seq_len, hidden_size]`** is the DistilBERT-style backbone behaviour. The OpenAI CLIP text encoder usually returns a pooled output already, but multilingual exports sometimes return the full hidden states and require explicit pooling. The fallback path keeps the encoder model-agnostic.
+- **Multilingual distillation is gone because its embedding space was misaligned with the image branch.** The model's training distilled cross-lingual representations on top of a frozen-but-shifted text projection, producing 512-d vectors that nominally lived in "CLIP space" but in practice ranked text→image cosines essentially randomly. Verified by the report.md diagnostic dumps that motivated the swap.
+- **HF `tokenizers` crate over custom Rust WordPiece.** The custom WordPiece tokenizer worked for the multilingual vocab but couldn't handle BPE's merge tables. Pulling the `tokenizers` crate as a dependency (already present for SigLIP-2's SentencePiece) eliminates ~150 lines of custom code and handles all three tokenizer families uniformly.
+- **CoreML is disabled because transformer ops produce wrong outputs, not crashes.** Re-enabling without verifying every op is silent corruption waiting to happen.
+- **L2-normalize at output is required** — Xenova's text_model.onnx outputs the post-projection embedding without normalization. Cosine works without it but pre-normalising makes the embeddings interchangeable.
+- **Pad token 49407 = `<|endoftext|>` = EOS.** OpenAI CLIP reuses the EOS token id for padding. This is a deliberate quirk of the trained model — using a separate pad token would produce embeddings the model was never trained on.
+- **Lazy + pre-warm coexistence** is intentional — pre-warm covers the common case, lazy covers the edge cases (pre-warm failed because the model was still downloading). The double-init protection costs nothing because the lock check `is_none()` short-circuits when pre-warm succeeded.
 
 ## Obsolete / No Longer Relevant
 
-None.
+The 647-line single-file `encoder_text.rs` is gone (split during the audit). The custom `SimpleTokenizer` (WordPiece + case-fallback) is gone. The multilingual `clip-ViT-B-32-multilingual-v1` model and its vocab — invalidated by the embedding-pipeline migration (DB version 2). The `[Backend]` println logging convention — replaced by `tracing` during Phase 6.

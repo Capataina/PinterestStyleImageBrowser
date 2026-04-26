@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::State;
 use tracing::{debug, info, warn};
 
@@ -5,6 +6,105 @@ use crate::commands::{resolve_image_id_for_cosine_path, ApiError, ImageSearchRes
 use crate::db::ImageDatabase;
 use crate::perf;
 use crate::CosineIndexState;
+
+/// Has the once-per-session cross-encoder comparison fired yet?
+/// Cross-encoder comparison is expensive (builds a temporary
+/// CosineIndex per other encoder) — we only want one snapshot per
+/// session to compare encoder rankings side-by-side. Subsequent
+/// View-Similar calls skip the comparison cost.
+static CROSS_ENCODER_RAN: AtomicBool = AtomicBool::new(false);
+
+/// Run the cross-encoder comparison diagnostic for an image-image
+/// query. For each *other* available encoder, builds a temporary
+/// CosineIndex from that encoder's embeddings, runs top-5 against
+/// the query image's embedding in that encoder's space, and emits
+/// a single diagnostic with all encoders' top-5 results side-by-side.
+///
+/// Lets the user answer "would DINOv2 have ranked these images
+/// differently than CLIP did?" without manually switching encoders
+/// and re-running the search.
+fn run_cross_encoder_comparison(
+    db: &ImageDatabase,
+    image_id: i64,
+    active_encoder: &str,
+) {
+    use crate::similarity_and_semantic_search::cosine::CosineIndex;
+    use ndarray::Array1;
+    use std::path::PathBuf;
+
+    let started = std::time::Instant::now();
+    // Active encoders only — `dinov2_small` is the legacy 384-d ID
+    // that was migrated away in pipeline-version 2 (rows wiped). Including
+    // it here would log a noise `cosine_cache_populated: count=0` per
+    // "View Similar" click and waste a populate roundtrip.
+    let all_encoders = ["clip_vit_b_32", "dinov2_base", "siglip2_base"];
+    let exclude_path: Option<PathBuf> = db
+        .get_all_images()
+        .ok()
+        .and_then(|imgs| imgs.into_iter().find(|i| i.id == image_id).map(|i| PathBuf::from(i.path)));
+
+    let mut per_encoder: Vec<serde_json::Value> = Vec::new();
+    for enc in all_encoders {
+        if enc == active_encoder {
+            // Active encoder's results are already in the main
+            // search_query diagnostic — no need to duplicate.
+            continue;
+        }
+        let enc_started = std::time::Instant::now();
+        // Pull this encoder's embedding for the query image. Falls
+        // back gracefully — empty embeddings table for an encoder
+        // means we just record "no embeddings".
+        let q_emb = if enc == "clip_vit_b_32" {
+            db.get_image_embedding(image_id).ok()
+        } else {
+            db.get_embedding(image_id, enc).ok()
+        };
+        let q_emb = match q_emb.filter(|v| !v.is_empty()) {
+            Some(v) => v,
+            None => {
+                per_encoder.push(serde_json::json!({
+                    "encoder_id": enc,
+                    "status": "no_embedding_for_query_image",
+                }));
+                continue;
+            }
+        };
+
+        let mut tmp = CosineIndex::new();
+        tmp.populate_from_db_for_encoder(db, enc);
+        let cache_size = tmp.cached_images.len();
+        if cache_size == 0 {
+            per_encoder.push(serde_json::json!({
+                "encoder_id": enc,
+                "status": "no_cache_embeddings",
+            }));
+            continue;
+        }
+        let q = Array1::from_vec(q_emb);
+        let results = tmp.get_similar_images_sorted(&q, 5, exclude_path.as_ref());
+        per_encoder.push(serde_json::json!({
+            "encoder_id": enc,
+            "status": "ok",
+            "cache_size": cache_size,
+            "top5": results.iter().map(|(p, s)| serde_json::json!({
+                "path": p.to_string_lossy(),
+                "score": *s,
+            })).collect::<Vec<_>>(),
+            "elapsed_ms": enc_started.elapsed().as_millis() as u64,
+        }));
+    }
+
+    perf::record_diagnostic(
+        "cross_encoder_comparison",
+        serde_json::json!({
+            "fired_for_image_id": image_id,
+            "active_encoder": active_encoder,
+            "comparison_results": per_encoder,
+            "total_elapsed_ms": started.elapsed().as_millis() as u64,
+            "note": "Fires once per session — first View-Similar after launch. Subsequent searches skip the cross-encoder cost.",
+        }),
+    );
+}
 
 #[tauri::command]
 #[tracing::instrument(name = "ipc.get_tiered_similar_images", skip(db, cosine_state), fields(image_id, encoder_id = ?encoder_id))]
@@ -63,12 +163,57 @@ pub fn get_tiered_similar_images(
     let query = Array1::from_vec(embedding);
     let cache_size = index.cached_images.len();
     let raw_results = index.get_tiered_similar_images(&query, exclude_path.as_ref());
+    let raw_scores: Vec<f32> = raw_results.iter().map(|(_, s)| *s).collect();
+
+    // Path resolution + thumbnail enrichment. The dimensions used to
+    // be fetched frontend-side via N parallel `getImageSize` DOM image
+    // loads (audit Performance finding) — moved to backend here so
+    // the result lands fully-populated in one IPC round-trip. Uses
+    // the same `db.get_image_thumbnail_info` helper that
+    // `semantic_search` already calls.
+    //
+    // We track per-path resolution outcomes so the diagnostic below
+    // can show "raw cosine returned 35 results, 33 resolved to image
+    // ids, 2 missed (paths: ...)" — pinpoints whether bad search is
+    // due to encoder quality or path-mapping bugs.
+    let mut resolution_misses: Vec<String> = Vec::new();
+    let mut thumb_misses: u32 = 0;
+    let results: Vec<ImageSearchResult> = raw_results
+        .iter()
+        .cloned()
+        .filter_map(|(path, score)| {
+            match resolve_image_id_for_cosine_path(&db, &path, Some(&all_images)) {
+                Some((id, final_path)) => {
+                    let thumb_info = db.get_image_thumbnail_info(id).ok().flatten();
+                    if thumb_info.is_none() {
+                        thumb_misses += 1;
+                    }
+                    let (thumbnail_path, width, height) = thumb_info
+                        .map(|(tp, w, h)| (Some(tp), Some(w), Some(h)))
+                        .unwrap_or((None, None, None));
+                    Some(ImageSearchResult {
+                        id,
+                        path: final_path,
+                        score,
+                        thumbnail_path,
+                        width,
+                        height,
+                    })
+                }
+                None => {
+                    resolution_misses.push(path.to_string_lossy().into_owned());
+                    None
+                }
+            }
+        })
+        .collect();
 
     // Diagnostic: dump the FULL cosine result list (paths + scores)
-    // before any path-resolution filtering. Lets the user audit
-    // whether bad search results are an encoder-quality issue (cosine
-    // returned the wrong things) or a downstream rendering issue
-    // (right things returned but mapped to wrong tiles).
+    // plus score-distribution stats and path-resolution outcomes.
+    // Lets the user audit whether bad search results are an
+    // encoder-quality issue (cosine returned the wrong things), a
+    // path-mapping bug (right things returned but couldn't be mapped
+    // to image ids), or a thumbnail-enrichment issue.
     perf::record_diagnostic(
         "search_query",
         serde_json::json!({
@@ -82,43 +227,36 @@ pub fn get_tiered_similar_images(
                 "score": *s,
             })).collect::<Vec<_>>(),
             "raw_result_count": raw_results.len(),
+            "score_distribution":
+                crate::similarity_and_semantic_search::cosine::diagnostics::score_distribution_stats(&raw_scores),
+            "path_resolution_outcomes": {
+                "raw_count": raw_results.len(),
+                "resolved_count": results.len(),
+                "missed_count": resolution_misses.len(),
+                "thumbnail_misses": thumb_misses,
+                "missed_paths_sample": resolution_misses.iter().take(10).cloned().collect::<Vec<_>>(),
+            },
         }),
     );
-
-    // Path resolution + thumbnail enrichment. The dimensions used to
-    // be fetched frontend-side via N parallel `getImageSize` DOM image
-    // loads (audit Performance finding) — moved to backend here so
-    // the result lands fully-populated in one IPC round-trip. Uses
-    // the same `db.get_image_thumbnail_info` helper that
-    // `semantic_search` already calls.
-    let results: Vec<ImageSearchResult> = raw_results
-        .into_iter()
-        .filter_map(|(path, score)| {
-            resolve_image_id_for_cosine_path(&db, &path, Some(&all_images)).map(
-                |(id, final_path)| {
-                    let (thumbnail_path, width, height) = db
-                        .get_image_thumbnail_info(id)
-                        .ok()
-                        .flatten()
-                        .map(|(tp, w, h)| (Some(tp), Some(w), Some(h)))
-                        .unwrap_or((None, None, None));
-                    ImageSearchResult {
-                        id,
-                        path: final_path,
-                        score,
-                        thumbnail_path,
-                        width,
-                        height,
-                    }
-                },
-            )
-        })
-        .collect();
 
     info!(
         "get_tiered_similar_images returning {} results",
         results.len()
     );
+
+    // Fire the cross-encoder comparison diagnostic once per session.
+    // compare_exchange ensures only the first arriving View-Similar
+    // call pays the cost (~50-200 ms × number of other encoders).
+    if perf::is_profiling_enabled()
+        && CROSS_ENCODER_RAN
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    {
+        // Drop the cosine_state lock before running comparison —
+        // the comparison function builds its own temporary indexes.
+        drop(index);
+        run_cross_encoder_comparison(&db, image_id, &encoder_id);
+    }
 
     Ok(results)
 }
@@ -181,24 +319,7 @@ pub fn get_similar_images(
     );
     let cache_size = index.cached_images.len();
     let raw_results = index.get_similar_images(&query, top_n, exclude_path.as_ref());
-
-    // Diagnostic — same shape as the tiered version's diagnostic.
-    perf::record_diagnostic(
-        "search_query",
-        serde_json::json!({
-            "type": "similar",
-            "encoder_id": encoder_id,
-            "top_n": top_n,
-            "query_image_id": image_id,
-            "query_image_path": exclude_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
-            "cosine_cache_size": cache_size,
-            "raw_results": raw_results.iter().map(|(p, s)| serde_json::json!({
-                "path": p.to_string_lossy(),
-                "score": *s,
-            })).collect::<Vec<_>>(),
-            "raw_result_count": raw_results.len(),
-        }),
-    );
+    let raw_scores: Vec<f32> = raw_results.iter().map(|(_, s)| *s).collect();
     debug!(
         "index.get_similar_images returned {} results",
         raw_results.len()
@@ -215,9 +336,14 @@ pub fn get_similar_images(
 
     // Path resolution shared via `resolve_image_id_for_cosine_path`
     // (audit: extracted from triplicated normalize_path closure +
-    // 60-line lookup block).
+    // 60-line lookup block). Resolution outcomes tracked for the
+    // diagnostic so we can spot path-mapping bugs vs encoder-quality
+    // issues.
+    let mut resolution_misses: Vec<String> = Vec::new();
+    let mut thumb_misses: u32 = 0;
     let results: Vec<ImageSearchResult> = raw_results
-        .into_iter()
+        .iter()
+        .cloned()
         .filter_map(|(path, score)| {
             let info = resolve_image_id_for_cosine_path(&db, &path, Some(&all_images));
             if info.is_none() {
@@ -225,6 +351,7 @@ pub fn get_similar_images(
                     "  Failed to map path to id - path: {:?}",
                     path.file_name().unwrap_or_default()
                 );
+                resolution_misses.push(path.to_string_lossy().into_owned());
             }
             info.map(|(id, final_path)| {
                 debug!(
@@ -237,10 +364,11 @@ pub fn get_similar_images(
                 // semantic_search and get_tiered_similar_images. Saves
                 // the frontend N parallel `getImageSize` DOM image
                 // loads (audit Performance finding).
-                let (thumbnail_path, width, height) = db
-                    .get_image_thumbnail_info(id)
-                    .ok()
-                    .flatten()
+                let thumb_info = db.get_image_thumbnail_info(id).ok().flatten();
+                if thumb_info.is_none() {
+                    thumb_misses += 1;
+                }
+                let (thumbnail_path, width, height) = thumb_info
                     .map(|(tp, w, h)| (Some(tp), Some(w), Some(h)))
                     .unwrap_or((None, None, None));
                 ImageSearchResult {
@@ -254,6 +382,33 @@ pub fn get_similar_images(
             })
         })
         .collect();
+
+    // Diagnostic — same shape as the tiered version's diagnostic.
+    perf::record_diagnostic(
+        "search_query",
+        serde_json::json!({
+            "type": "similar",
+            "encoder_id": encoder_id,
+            "top_n": top_n,
+            "query_image_id": image_id,
+            "query_image_path": exclude_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            "cosine_cache_size": cache_size,
+            "raw_results": raw_results.iter().map(|(p, s)| serde_json::json!({
+                "path": p.to_string_lossy(),
+                "score": *s,
+            })).collect::<Vec<_>>(),
+            "raw_result_count": raw_results.len(),
+            "score_distribution":
+                crate::similarity_and_semantic_search::cosine::diagnostics::score_distribution_stats(&raw_scores),
+            "path_resolution_outcomes": {
+                "raw_count": raw_results.len(),
+                "resolved_count": results.len(),
+                "missed_count": resolution_misses.len(),
+                "thumbnail_misses": thumb_misses,
+                "missed_paths_sample": resolution_misses.iter().take(10).cloned().collect::<Vec<_>>(),
+            },
+        }),
+    );
 
     info!("Final results count: {}", results.len());
     if !results.is_empty() {
@@ -269,6 +424,16 @@ pub fn get_similar_images(
                 sim.score
             );
         }
+    }
+
+    // Cross-encoder comparison — once per session (see top of file).
+    if perf::is_profiling_enabled()
+        && CROSS_ENCODER_RAN
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    {
+        drop(index);
+        run_cross_encoder_comparison(&db, image_id, &encoder_id);
     }
 
     Ok(results)

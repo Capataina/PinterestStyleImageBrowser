@@ -5,10 +5,10 @@
 //! interface. The search layer dispatches by the user's selected
 //! encoder without knowing the concrete type.
 //!
-//! Each concrete encoder produces a fixed-dimensional embedding (most
-//! CLIP-family models are 512-d; SigLIP-Large is 1024-d; DINOv2-Small
-//! is 384-d). Cosine similarity assumes L2-normalised vectors, so
-//! every implementation must normalise before returning.
+//! Each concrete encoder produces a fixed-dimensional embedding (CLIP
+//! ViT-B/32 is 512-d; SigLIP-2 Base 256 and DINOv2-Base are both 768-d).
+//! Cosine similarity assumes L2-normalised vectors, so every
+//! implementation must normalise before returning.
 //!
 //! ## Why two traits, not one
 //!

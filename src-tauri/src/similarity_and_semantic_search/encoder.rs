@@ -98,25 +98,49 @@ impl ClipImageEncoder {
         &self,
         image_path: &Path,
     ) -> Result<ndarray::Array4<f32>, Box<dyn std::error::Error>> {
-        // Lanczos3 preserves edge information vastly better than the
-        // previous Nearest filter — this matters for CLIP because the
-        // 224x224 downsample is the only resampling step before the
-        // network sees the image. Reference CLIP uses bicubic; Lanczos3
-        // is closer to it than Nearest.
+        // Canonical OpenAI CLIP preprocessing (from `preprocessor_config.json`
+        // on Xenova/clip-vit-base-patch32, verified 2026-04-26):
+        //
+        //   1. Convert to RGB
+        //   2. Resize on shortest edge to 224 (BICUBIC)
+        //   3. Center-crop to 224×224
+        //   4. Rescale by 1/255 → [0, 1]
+        //   5. Normalize with CLIP-specific mean/std
+        //
+        // Previous code used `resize_exact(224, 224)` with Lanczos3 — this
+        // squashed non-square images (CLIP was trained on aspect-preserving
+        // resize + center-crop). CatmullRom is image-rs's bicubic-family
+        // filter, the closest match to PIL's BICUBIC.
+        const TARGET_SHORT: u32 = 224;
+        const CROP: u32 = 224;
         let img = ImageReader::open(image_path)?
             .with_guessed_format()?
             .decode()?
-            .resize_exact(224, 224, image::imageops::FilterType::Lanczos3)
             .to_rgb8();
 
-        let mut input_tensor: Vec<f32> = Vec::with_capacity((224 * 224 * 3) as usize);
+        let (orig_w, orig_h) = img.dimensions();
+        let (new_w, new_h) = if orig_w < orig_h {
+            let new_w = TARGET_SHORT;
+            let new_h = (orig_h as f32 * (new_w as f32 / orig_w as f32)).round() as u32;
+            (new_w, new_h)
+        } else {
+            let new_h = TARGET_SHORT;
+            let new_w = (orig_w as f32 * (new_h as f32 / orig_h as f32)).round() as u32;
+            (new_w, new_h)
+        };
+        let resized = image::imageops::resize(&img, new_w, new_h, image::imageops::FilterType::CatmullRom);
+        let crop_x = (new_w.saturating_sub(CROP)) / 2;
+        let crop_y = (new_h.saturating_sub(CROP)) / 2;
+        let img = image::imageops::crop_imm(&resized, crop_x, crop_y, CROP, CROP).to_image();
+
+        let mut input_tensor: Vec<f32> = Vec::with_capacity((CROP * CROP * 3) as usize);
 
         // ONNX expects channels-first (CHW) layout: all R values first,
         // then all G, then all B. The image crate gives us interleaved
         // RGBRGB pixels, so we split-and-concat here.
-        let mut r = Vec::with_capacity((224 * 224) as usize);
-        let mut g = Vec::with_capacity((224 * 224) as usize);
-        let mut b = Vec::with_capacity((224 * 224) as usize);
+        let mut r = Vec::with_capacity((CROP * CROP) as usize);
+        let mut g = Vec::with_capacity((CROP * CROP) as usize);
+        let mut b = Vec::with_capacity((CROP * CROP) as usize);
 
         for pixel in img.pixels() {
             r.push(pixel[0] as f32 / 255.0);
@@ -128,22 +152,26 @@ impl ClipImageEncoder {
         input_tensor.extend(g);
         input_tensor.extend(b);
 
-        // CLIP-native normalization stats (from openai/CLIP repository).
-        // The previous code used ImageNet stats which subtly shift the
-        // embedding distribution away from what the OpenAI reference
-        // produces.
+        // CLIP-native normalization stats (from openai/CLIP repository
+        // and Xenova's preprocessor_config.json). The previous code
+        // used ImageNet stats which subtly shift the embedding
+        // distribution away from what the OpenAI reference produces.
         let mean = [0.48145466_f32, 0.4578275, 0.40821073];
         let std = [0.26862954_f32, 0.26130258, 0.27577711];
 
+        let plane = (CROP * CROP) as usize;
         for c in 0..3 {
-            for i in 0..(224 * 224) {
-                let idx = c * 224 * 224 + i;
+            for i in 0..plane {
+                let idx = c * plane + i;
                 input_tensor[idx] = (input_tensor[idx] - mean[c]) / std[c];
             }
         }
 
         // we create a 4d array using ndarray bc otherwise ort tensor creation is a pain
-        let input_array = ndarray::Array4::from_shape_vec((1, 3, 224, 224), input_tensor)?;
+        let input_array = ndarray::Array4::from_shape_vec(
+            (1, 3, CROP as usize, CROP as usize),
+            input_tensor,
+        )?;
         Ok(input_array)
     }
 
@@ -195,27 +223,21 @@ impl ClipImageEncoder {
         let (data, _offset) = input_array.into_raw_vec_and_offset();
         let onnx_input: Tensor<f32> = Tensor::from_array((shape, data))?;
 
-        // Xenova's combined-graph CLIP model expects text-branch tensors
-        // even when we're only doing image encoding. Dummy zero values
-        // satisfy the graph; the image_embeds output is what we want.
-        let text_shape = [1usize, 1];
-        let dummy_text_data = vec![0i64; 1];
-        let input_ids: Tensor<i64> = Tensor::from_array((text_shape, dummy_text_data.clone()))?;
-        let attention_mask: Tensor<i64> = Tensor::from_array((text_shape, dummy_text_data))?;
-
-        // Hardcoded input/output names match the bundled model. Future
-        // model swaps would surface here as a runtime error from ort.
+        // Separate `vision_model.onnx` takes ONLY `pixel_values`. The
+        // previous combined-graph model required dummy text inputs;
+        // those are gone now that we use the split export.
         let outputs = self.session.run(ort::inputs![
-            "pixel_values" => onnx_input,
-            "input_ids" => input_ids,
-            "attention_mask" => attention_mask
+            "pixel_values" => onnx_input
         ])?;
 
         let dyn_tensor: &Value<_> = &outputs["image_embeds"];
         let (_out_shape, data_view) = dyn_tensor.try_extract_tensor::<f32>()?;
         let embedding = data_view.to_vec();
 
-        Ok(embedding)
+        // L2-normalize so cosine similarity is well-conditioned.
+        // Xenova's vision_model.onnx outputs the post-projection
+        // embedding without normalization.
+        Ok(super::encoder_text::pooling::normalize(&embedding))
     }
 
     #[tracing::instrument(name = "clip.encode_image_batch", skip(self, image_paths), fields(batch = image_paths.len()))]
@@ -241,15 +263,9 @@ impl ClipImageEncoder {
             let (data, _offset) = batch_array.into_raw_vec_and_offset();
             let onnx_input: Tensor<f32> = Tensor::from_array((shape, data))?;
 
-            let text_shape = [batch_size, 1];
-            let dummy_text_data = vec![0i64; batch_size];
-            let input_ids: Tensor<i64> = Tensor::from_array((text_shape, dummy_text_data.clone()))?;
-            let attention_mask: Tensor<i64> = Tensor::from_array((text_shape, dummy_text_data))?;
-
+            // Separate vision_model.onnx — only pixel_values input.
             let outputs = self.session.run(ort::inputs![
-                "pixel_values" => onnx_input,
-                "input_ids" => input_ids,
-                "attention_mask" => attention_mask
+                "pixel_values" => onnx_input
             ])?;
 
             let dyn_tensor: &Value<_> = &outputs["image_embeds"];
@@ -261,7 +277,9 @@ impl ClipImageEncoder {
             for i in 0..batch_size {
                 let start = i * embedding_size;
                 let end = start + embedding_size;
-                all_embeddings.push(data_slice[start..end].to_vec());
+                let raw = data_slice[start..end].to_vec();
+                // L2-normalize so cosine is well-conditioned.
+                all_embeddings.push(super::encoder_text::pooling::normalize(&raw));
             }
         }
 

@@ -173,6 +173,13 @@ impl ImageDatabase {
              ON embeddings(encoder_id);",
             [],
         )?;
+
+        // One-shot embedding-pipeline invalidation. Runs AFTER the
+        // embeddings table is created (it issues DELETE against that
+        // table). Bumps when CLIP/DINOv2 pipeline changes invalidate
+        // prior embeddings.
+        self.migrate_embedding_pipeline_version()?;
+
         Ok(())
     }
 

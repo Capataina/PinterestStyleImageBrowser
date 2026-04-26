@@ -1,23 +1,31 @@
 # clip-image-encoder
 
-*Maturity: working*
+*Maturity: comprehensive*
 
 ## Scope / Purpose
 
-Loads a CLIP ViT-B/32 ONNX model and produces 512-dimensional `f32` embeddings for image files. Tries CUDA first, falls back to CPU. Operates per image and in batches. Used at startup to populate every row in the `images` table that lacks an embedding.
+Loads OpenAI CLIP ViT-B/32's separate `vision_model.onnx` and produces 512-dimensional L2-normalised `f32` embeddings for image files. Runs CPU-only on macOS (CoreML's runtime inference fails on this graph) and tries CUDA on non-macOS, both with CPU fallback. Driven by the indexing pipeline's encode phase to populate `images.embedding` BLOB + the per-encoder `embeddings(image_id, encoder_id="clip_vit_b_32", embedding)` row for every image lacking one.
 
 ## Boundaries / Ownership
 
-- **Owns:** image preprocessing (resize, channel split, normalisation), ONNX session lifecycle, batched inference, the dummy-text-input hack required by the bundled model.
-- **Does not own:** writing embeddings to disk (delegates to `database::update_image_embedding`), CUDA detection (relies on `ort`'s built-in fallback semantics).
-- **Public API:** `Encoder::new(model_path)`, `inspect_model`, `preprocess_image`, `batch_preprocess_image`, `encode`, `encode_batch`, `encode_all_images_in_database(batch_size, &db)`.
+- **Owns:** image preprocessing (aspect-preserving bicubic resize + center-crop + CLIP-native normalization), ONNX session lifecycle with EP fallback, single + batched inference, L2-normalize at output.
+- **Does not own:** writing embeddings to disk (delegates to `db.update_image_embedding` + `db.upsert_embedding`), CUDA / CoreML detection (relies on `ort`'s built-in fallback semantics), the model file on disk (delegates to `paths::models_dir()` + `model_download::CLIP_VISION_FILENAME`), text-side encoding (lives in `clip-text-encoder`).
+- **Public API:** `ClipImageEncoder::new(model_path)`, `inspect_model`, `preprocess_image`, `batch_preprocess_image`, `encode`, `encode_batch`. Implements the `ImageEncoder` trait so the indexing pipeline can dispatch via `Box<dyn ImageEncoder>`.
 
 ## Current Implemented Reality
 
-### Pipeline per image
+### Pipeline per image — canonical OpenAI CLIP preprocessing
 
 ```text
-ImageReader::open → with_guessed_format → decode → to_rgb8 (224×224 with FilterType::Nearest)
+ImageReader::open → with_guessed_format → decode → to_rgb8
+    │
+    ▼
+Aspect-preserving resize on shortest edge to 224 (CatmullRom — image-rs's bicubic-family
+    filter, closest match to PIL's BICUBIC). NOT resize_exact (which would squash).
+    │
+    ▼
+Center-crop to 224×224. Cuts away anything outside the central window — see
+    notes/preprocessing-spatial-coverage.md for the implication on edge content.
     │
     ▼
 Split RGB into 3 contiguous slices (R then G then B):
@@ -25,8 +33,9 @@ Split RGB into 3 contiguous slices (R then G then B):
     │
     ▼
 Normalise per-channel: x = (x/255 - mean[c]) / std[c]
-    where mean = [0.485, 0.456, 0.406]   ← ImageNet stats, not CLIP-native
-          std  = [0.229, 0.224, 0.225]
+    where mean = [0.48145466, 0.4578275, 0.40821073]   ← CLIP-native, from
+                                                         Xenova preprocessor_config.json
+          std  = [0.26862954, 0.26130258, 0.27577711]
     │
     ▼
 Reshape to ndarray::Array4 with shape (1, 3, 224, 224)
@@ -35,68 +44,96 @@ Reshape to ndarray::Array4 with shape (1, 3, 224, 224)
 ort::Tensor::from_array((shape, raw_vec))
     │
     ▼
-Session::run with three inputs:
+Session::run with ONE input (separate vision_model.onnx — no dummy text inputs):
     pixel_values    ← image tensor
-    input_ids       ← dummy [[0]] (i64, shape [1, 1])
-    attention_mask  ← dummy [[0]] (i64, shape [1, 1])
     │
     ▼
-Extract output["image_embeds"] → Vec<f32> length 512
+Output: image_embeds, shape [1, 512]
+    │
+    ▼
+L2-normalize via super::encoder_text::pooling::normalize
+    └─► return Vec<f32> length 512
 ```
 
-Source: `encoder.rs:62-195`.
+### The "no dummy text inputs" change
 
-### Batch path
+Pre-2026-04-26 the encoder used Xenova's combined-graph CLIP export, which bundled image and text encoders in a single ONNX graph. Calling it for image-only inference required supplying dummy `input_ids: [[0]]` and `attention_mask: [[1]]` to satisfy the graph signature.
 
-`encode_batch` batches preprocessing in groups of 32 (hardcoded `preprocessing_batch_size = 32` at `encoder.rs:207`), concatenates each chunk along axis 0, runs ONNX once per chunk, splits the output by `embedding_size` (512). The `encode_all_images_in_database` caller passes the same `batch_size = 32` from `main.rs:49`.
+The current build uses the **separate** `vision_model.onnx` from the same Xenova repo. Inputs are reduced to just `pixel_values`, simplifying the call shape and removing the unused text branch from session memory. This was part of the same change that switched the text encoder from the multilingual distillation to OpenAI English (see `clip-text-encoder.md`) — both halves were swapped together to keep the embedding space consistent.
 
-### CUDA fallback
-
-`Session::builder().with_execution_providers([CUDAExecutionProvider::default().build()])`. If that builder errors, falls back to a plain `Session::builder().commit_from_file(model_path)`. The fallback is **inside the `match` arm** — it does not test whether CUDA *actually* runs, only whether the builder accepted the provider config. Per the inline comments at `encoder.rs:25-33`, the author observed that debug builds use CPU even when CUDA is "enabled," and release builds use the GPU. This is documented but not solved.
-
-### Hardcoded ONNX I/O names
+### Execution provider — CoreML disabled, CPU-only on macOS
 
 ```rust
-let input_name  = "pixel_values";
-let output_name = "image_embeds";
+#[cfg(target_os = "macos")]
+fn build_session_with_accel(model_path: &Path) -> Result<Session, Box<dyn Error>> {
+    // CoreML's GetCapability accepts ~54% of CLIP nodes (980 of 1827) and
+    // session-create succeeds, but actual inference fails at runtime with
+    // "Unable to compute the prediction using a neural network model
+    // (error code: -1)". Documented in encoder.rs header comment block.
+    Session::builder()?.commit_from_file(model_path)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn build_session_with_accel(model_path: &Path) -> Result<Session, Box<dyn Error>> {
+    Session::builder()?
+        .with_execution_providers([CUDAExecutionProvider::default().build()])?
+        .commit_from_file(model_path)
+}
 ```
 
-Plus the dummy text inputs are required because the bundled ONNX graph contains both image and text branches and would error on missing tensors. (`encoder.rs:158-167`.)
+CoreML was disabled mid-2026 after the runtime-failure pattern was confirmed across multiple ort releases. The encoder.rs file header carries the diagnosis: ort's CoreML EP partition decision is permissive at compile time but the resulting graph doesn't actually run. CPU on M-series is ~200–500 ms per image — acceptable for the project's library sizes (1500–10k images).
+
+### Batch encoding
+
+```rust
+pub fn encode_batch(&mut self, paths: &[&Path]) -> Result<Vec<Vec<f32>>>
+```
+
+Pre-processes every image in `paths` serially (could be rayon-parallelised), then runs a single `Session::run` with a stacked tensor of shape `[batch_size, 3, 224, 224]`. Default batch size in the indexing pipeline is 32. Output is `[batch_size, 512]` which gets unstacked and L2-normalised per-row.
+
+### Where it runs
+
+The indexing pipeline calls `ClipImageEncoder::new(image_model_path)` once per pipeline run (so a re-spawn after `add_root` reloads the model — slightly wasteful, but the cost is bounded by how often pipelines re-spawn).
 
 ## Key Interfaces / Data Flow
 
-```text
-main.rs (startup)
-    ──► Encoder::new(Path::new("models/model_image.onnx"))
-    ──► encode_all_images_in_database(32, &database)
-        ──► db.get_images_without_embeddings()
-        ──► for batch in chunks(32):
-              encode_batch(batch_paths)
-                ──► batch_preprocess_image (chunked further by 32)
-                ──► Session::run per ONNX-batch
-                ──► split output by 512
-              for (image, embedding) in zip:
-                db.update_image_embedding(id, embedding)
+```
+indexing.rs::run_clip_encoder:
+    image_model_path = paths::models_dir().join(model_download::CLIP_VISION_FILENAME)  // "clip_vision.onnx"
+    if image_model_path.exists():
+        needs_embed = db.get_images_without_embeddings()
+        for chunk in needs_embed.chunks(32):
+            embeddings = encoder.encode_batch(chunk_paths)
+            for (image, embedding) in chunk.zip(embeddings):
+                db.update_image_embedding(image.id, embedding.clone())   // legacy column
+                db.upsert_embedding(image.id, "clip_vit_b_32", embedding) // per-encoder table
+            emit Phase::Encode(processed, total)
+        emit "encoder_run_summary" diagnostic (attempted/succeeded/failed/mean ms)
+        emit "preprocessing_sample" diagnostic on first batch
+    else:
+        warn "{CLIP_VISION_FILENAME} missing; embeddings will be empty until next launch."
 ```
 
-Output BLOB encoding is owned by `database::update_image_embedding` (the `unsafe` cast).
+The encode phase is gated on the model file existing. If it doesn't (first launch + download in progress, user manually deleted), the pipeline skips encode entirely. Semantic + similarity search on a no-embedding library returns empty Vec.
 
 ## Implemented Outputs / Artifacts
 
-- 512-d `Vec<f32>` per image, written into `images.embedding` BLOB column.
-- Tests assert `embedding.len() == 512` and `0.9 < L2 norm < 1.1` (the model is approximately L2-normalised by training).
+- `Library/models/clip_vision.onnx` (~352 MB) loaded at construction.
+- 512-d L2-normalised `f32` embedding per image.
+- Two storage destinations per embedding:
+  - Legacy `images.embedding` BLOB (kept for backward-compat with semantic_search reader)
+  - New `embeddings(image_id, encoder_id="clip_vit_b_32", embedding)` row
+- Encoder is recreated per indexing-pipeline run; not held in long-lived Tauri state.
 
 ## Known Issues / Active Risks
 
 | Risk | Triggered by | Downstream impact |
 |------|--------------|-------------------|
-| `FilterType::Nearest` resize | Every image preprocessing | Lower-quality preprocessing than the reference CLIP implementation, which uses Bicubic/Lanczos. Embedding quality is degraded by an unmeasured but non-zero amount. One-line fix to `Lanczos3`. |
-| ImageNet normalisation stats, not CLIP-native | Every image preprocessing | The reference OpenAI CLIP uses `mean=[0.48145466, 0.4578275, 0.40821073]`, `std=[0.26862954, 0.26130258, 0.27577711]`. The stats here are ImageNet's: `mean=[0.485, 0.456, 0.406]`, `std=[0.229, 0.224, 0.225]`. Drift in cosine similarity vs reference embeddings. |
-| Dummy text-branch tensors required | Every inference call | If the model is swapped to one that *only* exposes the image branch, the call fails with "missing input." See author's TODO at `encoder.rs:160`. |
-| Hardcoded ONNX input/output names | A model swap | Silent breakage — a different graph would not have `pixel_values`/`image_embeds` named exactly that way. There is no schema check at session-create time. |
-| `ort = 2.0.0-rc.10` (release candidate) | Building the project at any time | Non-pinned RC, with `download-binaries` feature pulling CUDA libs at build time. Build is non-reproducible and tied to external hosting. The session-create panic during dev sometimes asks for a newer rc — caught only at runtime. |
-| Encoder pipeline is single-threaded over batches | Initial encoding pass | Several minutes for hundreds of images. The batching reduces overhead vs per-image, but does not parallelise across CPU cores. |
-| First-failed encode aborts the whole batch | A corrupt JPEG in `test_images/` | `encode_all_images_in_database` propagates the first `Err(?)` and stops. Subsequent images are not attempted. |
+| Center-crop drops edge content | Tall/wide images with meaningful periphery | Embeddings reflect only the central 224×224 window. Splash arts / scenery / group photos with edge content are under-represented. See `notes/preprocessing-spatial-coverage.md`. |
+| EP fallback is silent | CUDA init failure on non-macOS | Runs on CPU at 10× slower throughput with no UI signal. The user sees a slow encode phase but no error. |
+| Encoder is re-instantiated per pipeline run | Frequent root mutations | Each `add_root` triggers a new pipeline → new `ClipImageEncoder::new` → re-load 352 MB model into ONNX session. Wasteful but bounded. |
+| Sequential preprocessing within `encode_batch` | Large batches | Decoding 32 images sequentially before the ONNX batch is the bottleneck for some workloads. Could be rayon-parallelised. |
+| Model file corruption surfaces only at session creation time | Disk corruption mid-download | `Session::builder().commit_from_file` errors → `ApiError::Encoder("ONNX session creation failed: ...")`. |
 
 ## Partial / In Progress
 
@@ -104,22 +141,19 @@ None.
 
 ## Planned / Missing / Likely Changes
 
-- Swap `FilterType::Nearest` → `FilterType::Lanczos3` (one-character change at `encoder.rs:69`).
-- Swap ImageNet stats → CLIP-native stats (six-number change at `encoder.rs:91-92`).
-- Add a model-swap-friendly inspector that checks input/output names at session creation and errors clearly if the bundled model does not match expectations.
-- Consider parallelising preprocessing via `rayon` while keeping ONNX inference serialised (the session is `&mut self` so it cannot be shared across threads without further work).
-- Track embedding quality vs a Python reference CLIP via a small benchmark suite. The `test_inference_speed` test already provides a CPU/GPU detection signal at runtime; a quality test would close the loop.
+- **Hold the encoder in Tauri state** to avoid re-loading on every pipeline re-spawn. Trade-off: ~352 MB resident memory always vs the load cost on rare re-spawns. Probably worth it now that the encoder is much smaller than before.
+- **Rayon-parallel preprocessing** within `encode_batch` to overlap decode with the next batch's CPU work.
+- **Smart per-query encoder routing** — long-term, route color/scenery queries to SigLIP-2 (no crop) and character/object queries to CLIP. Captured as an open concern in `notes/preprocessing-spatial-coverage.md`.
+- **Int8 quantised image encoder** — would shrink the download by ~4× and speed up inference. Documented in `enhancements/recommendations/06-int8-quantisation-encoders.md`. Note: the user has explicitly rejected quantization on quality grounds for the current pipeline — revisit only if a use case justifies the trade-off.
 
 ## Durable Notes / Discarded Approaches
 
-The author left several rich rationale comments in code that are worth preserving here:
-
-- **CUDA detection is structurally limited by `ort`'s API** (`encoder.rs:25-33`): "the session says it's initialised with CUDA but the encoding is incredibly slow ... so we do a test run here ... it's definitely using the CPU not GPU despite saying it initialised with the GPU ... it seems like during debug, the PC uses the CPU even if CUDA is enabled but in release mode it uses the GPU." The fallback is intentional defensive code, not paranoia.
-- **The ONNX RGB-channel layout transform is required** (`encoder.rs:74-75`): "Change layout from RGBRGB... to RRR...GGG...BBB... for some reason ONNX wants it like this." This is in fact CHW (channels-first) layout, which is the standard for PyTorch-exported models. The comment is informal but the work is correct.
-- **The dummy text-branch tensors are a model contract, not a workaround** (`encoder.rs:158-167`): "Create dummy inputs for the text branch to prevent ONNX crashes ... The model expects these to exist even if we are only doing image encoding." A future model that exposes only the image branch would let this be deleted, but the bundled model needs it. The author's `// TODO: Fix this when it breaks in the future...` is honest.
-- **The `try_extract_tensor` method choice was forced** (`encoder.rs:187-191`): "this is an absolute pain to fix ... if we get a tuple from the tensor, tuples do not have view, as_slice or any of the other methods for us to turn them into a vec ... so we use try_extract_tensor which gives us both the shape and a view we can turn into a vec." Documented friction with the `ort` API.
-- **The ndarray ownership/Tensor::from_array dance** (`encoder.rs:146-151`): the `into_raw_vec_and_offset()` extraction is a workaround for the lifetime constraints of `Tensor::from_array`. Author's TODO is "Optimize this to avoid copies." Today's implementation copies the preprocessed array to construct the Tensor; a zero-copy version requires a different ort API path.
+- **Combined-graph + dummy text inputs is gone.** The encoder now uses the separate `vision_model.onnx`. Old indexing data with dummy-text-input embeddings is invalidated by `migrate_embedding_pipeline_version` (DB version 2) — see `systems/database.md`. If a future ONNX export change requires re-invalidating, bump the version constant.
+- **CoreML stays disabled even though "GetCapability" reports it can handle the graph.** The runtime inference failure pattern was reproducible across multiple ort releases. Re-enabling without verifying every op runs under inference is silent corruption waiting to happen.
+- **Per-channel slice layout `[R..., G..., B...]` is intentional, not interleaved `[RGB, RGB, ...]`.** ONNX tensor convention is NCHW (channels first); interleaved would require a transpose at every encode call.
+- **CatmullRom over Lanczos3 is the canonical bicubic match.** PIL's `BICUBIC` (resample=3) maps to a cubic family closer to CatmullRom than Lanczos3. Not bit-exact, but standard for ONNX deployments outside Python.
+- **L2-normalize at output is required** — the Xenova vision_model.onnx outputs un-normalised projected embeddings. Cosine similarity still works without normalising (the math divides by norms) but pre-normalisation makes the resulting vectors interchangeable and the cache cosines well-conditioned.
 
 ## Obsolete / No Longer Relevant
 
-The earlier per-image `encode_batch` implementation that called `preprocess_image` in a loop was replaced in commit `33398fb` (2025-12-08) with a `batch_preprocess_image`-based pipeline. The TODO it cleared is gone from the source.
+The combined-graph code path with dummy text inputs (pre-2026-04-26). The `FilterType::Nearest` and ImageNet-stats shortcut documented in earlier versions of `notes/clip-preprocessing-decisions.md`. The 1.1 GB combined `model.onnx` filename `model_image.onnx` — files now use `clip_vision.onnx` and the migration system invalidates legacy data automatically.
