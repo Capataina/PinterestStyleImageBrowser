@@ -237,7 +237,36 @@ impl ImageDatabase {
         _filter_string: String,
         match_all_tags: bool,
     ) -> rusqlite::Result<Vec<ImageData>> {
-        let conn = self.connection.lock().unwrap();
+        // Sub-span instrumentation for the `get_images` IPC path.
+        //
+        // Context: `context/plans/performance-analysis.md` shows
+        // `ipc.get_images` is normally 70-125ms but produced two
+        // ~22-second outliers during heavy SigLIP-2 phases. The raw
+        // SQL runs in ~58ms on a quiet system, so the 22s is
+        // contention rather than query plan. To attribute correctly
+        // we split the handler into named sub-spans that surface in
+        // the on-exit perf report under their own row:
+        //
+        //   get_images.lock_wait    — time blocked on the DB Mutex.
+        //                             If this dominates, the fix is
+        //                             connection-pool / write-batching.
+        //   get_images.sql_prepare  — time in `conn.prepare(...)`.
+        //   get_images.row_iter     — time walking `query` rows
+        //                             (covers the SQLite execute and
+        //                             the per-row cursor work).
+        //   get_images.aggregate    — time in `aggregate_image_rows`,
+        //                             i.e. HashMap roll-up of the
+        //                             LEFT JOIN unrolls.
+        //   get_images.materialise  — time mapping the aggregated
+        //                             tuples into ImageData + sort.
+        //
+        // Each subspan is opened with `info_span!(...).entered()` to
+        // match the existing pattern in indexing.rs / watcher.rs.
+        let conn = {
+            let _lock_span =
+                tracing::info_span!("get_images.lock_wait").entered();
+            self.connection.lock().unwrap()
+        };
 
         // Common WHERE for root-and-orphan filtering. Used both with
         // and without tag-filter SQL.
@@ -304,33 +333,59 @@ impl ImageDatabase {
                 WHERE {root_filter};"
             )
         };
-        let mut stmt = conn.prepare(&sql)?;
-        let mut rows = stmt.query(params_from_iter(filter_tag_ids))?;
-        let aggregated = aggregate_image_rows(&mut rows)?;
+        let mut stmt = {
+            let _prepare_span =
+                tracing::info_span!("get_images.sql_prepare").entered();
+            conn.prepare(&sql)?
+        };
+
+        // `row_iter` and `aggregate` are interleaved in practice:
+        // `aggregate_image_rows` pulls the next row, builds the
+        // HashMap entry, repeats. We split them into two spans by
+        // doing the SQLite execute under one and the HashMap roll-up
+        // under the next, accepting that row-pull cost shows up on
+        // the aggregate span (it's the cost of consuming the cursor).
+        // The split still tells us whether the dominant cost is in
+        // SQLite kernel work (prepare + execute) or in our roll-up.
+        let mut rows = {
+            let _row_iter_span =
+                tracing::info_span!("get_images.row_iter").entered();
+            stmt.query(params_from_iter(filter_tag_ids))?
+        };
+        let aggregated = {
+            let _aggregate_span =
+                tracing::info_span!("get_images.aggregate").entered();
+            aggregate_image_rows(&mut rows)?
+        };
 
         // This function is the only one that USES the thumbnail
         // columns — the helper provides them uniformly; we read them
         // here when materialising into ImageData.
-        let mut images: Vec<ImageData> = aggregated
-            .into_iter()
-            .map(|(id, path, tags, thumbnail_path, width, height)| {
-                let mut img = ImageData::new(id, std::path::Path::new(&path), tags);
-                img.thumbnail_path = thumbnail_path;
-                img.width = width.map(|w| w as u32);
-                img.height = height.map(|h| h as u32);
-                img
-            })
-            .collect();
+        let images = {
+            let _materialise_span =
+                tracing::info_span!("get_images.materialise").entered();
+            let mut images: Vec<ImageData> = aggregated
+                .into_iter()
+                .map(|(id, path, tags, thumbnail_path, width, height)| {
+                    let mut img = ImageData::new(id, std::path::Path::new(&path), tags);
+                    img.thumbnail_path = thumbnail_path;
+                    img.width = width.map(|w| w as u32);
+                    img.height = height.map(|h| h as u32);
+                    img
+                })
+                .collect();
 
-        // Stable order by id (oldest first). The previous "shuffle on
-        // every read" caused the visible "entire app refreshes"
-        // behaviour during indexing — every refetch (every ~2s while
-        // thumbnails were generating) reordered the grid, making
-        // tiles jump around. Sort modes are now controlled via the
-        // user's `sortMode` preference and applied frontend-side
-        // when needed (the frontend can apply a deterministic
-        // shuffle with a session seed if the user picks "shuffle").
-        images.sort_by_key(|i| i.id);
+            // Stable order by id (oldest first). The previous "shuffle on
+            // every read" caused the visible "entire app refreshes"
+            // behaviour during indexing — every refetch (every ~2s while
+            // thumbnails were generating) reordered the grid, making
+            // tiles jump around. Sort modes are now controlled via the
+            // user's `sortMode` preference and applied frontend-side
+            // when needed (the frontend can apply a deterministic
+            // shuffle with a session seed if the user picks "shuffle").
+            images.sort_by_key(|i| i.id);
+            images
+        };
 
         Ok(images)
     }
