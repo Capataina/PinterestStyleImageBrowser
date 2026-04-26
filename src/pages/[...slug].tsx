@@ -15,7 +15,7 @@ import { useTags, useCreateTag, useDeleteTag } from "@/queries/useTags";
 import { SearchBar } from "@/components/SearchBar";
 import { PinterestModal } from "@/components/PinterestModal";
 import { IndexingStatusPill } from "@/components/IndexingStatusPill";
-import { SettingsDrawer } from "@/components/SettingsDrawer";
+import { SettingsDrawer } from "@/components/settings";
 import { PerfOverlay } from "@/components/PerfOverlay";
 import { isProfilingEnabled, recordAction } from "@/services/perf";
 import { useQueryClient } from "@tanstack/react-query";
