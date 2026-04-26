@@ -2,7 +2,7 @@
 
 ## Header
 
-- **Status:** synthesis complete; one batch of fixes already in working tree (uncommitted), three batches pending decision
+- **Status:** Tier 1 + Tier 2 + Phase 4 + Phase 5 + Phase 6 + Phase 7 SHIPPED on 2026-04-26. R5 (FP16) deferred. App-support wiped — next launch re-encodes everything under the new pipeline.
 - **Date:** 2026-04-26
 - **Trigger:** lag during the 1842-image splash-arts indexing pass (two 22-second `get_images` UI freezes), plus mean SigLIP-2 encode at 252 ms/image and CLIP-text at 292 ms/call
 - **Source materials this plan synthesises:**
