@@ -64,7 +64,22 @@ export function StatsSection() {
   // empty library (shows "0 images" + 0% bars).
   const total = stats.total_images;
   const thumbPct = total > 0 ? Math.round((stats.with_thumbnail / total) * 100) : 0;
-  const embedPct = total > 0 ? Math.round((stats.with_embedding / total) * 100) : 0;
+
+  // Friendly display names for each encoder. Matches the EncoderInfo
+  // display_names from src-tauri/src/commands/encoders.rs but without
+  // an extra IPC round-trip.
+  const encoderLabel = (id: string): string => {
+    switch (id) {
+      case "clip_vit_b_32":
+        return "CLIP";
+      case "siglip2_base":
+        return "SigLIP-2";
+      case "dinov2_small":
+        return "DINOv2";
+      default:
+        return id;
+    }
+  };
 
   return (
     <Section title="Indexing progress">
@@ -81,12 +96,21 @@ export function StatsSection() {
           total={total}
           pct={thumbPct}
         />
-        <ProgressRow
-          label="Embeddings"
-          done={stats.with_embedding}
-          total={total}
-          pct={embedPct}
-        />
+        {/* Per-encoder progress — one row per encoder. Encoders that
+            haven't been indexed yet show 0/total in muted style; full
+            encoders show the bar at 100%. */}
+        {stats.with_embedding_per_encoder.map((ec) => {
+          const pct = total > 0 ? Math.round((ec.count / total) * 100) : 0;
+          return (
+            <ProgressRow
+              key={ec.encoder_id}
+              label={`Embeddings · ${encoderLabel(ec.encoder_id)}`}
+              done={ec.count}
+              total={total}
+              pct={pct}
+            />
+          );
+        })}
         {stats.orphaned > 0 && (
           <StatRow
             label="Orphaned (file deleted on disk)"

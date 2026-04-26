@@ -20,24 +20,32 @@ use crate::{image_struct::ImageData, tag_struct::Tag};
 ///
 /// Returned by `get_pipeline_stats` and exposed to the frontend via
 /// the `get_pipeline_stats` Tauri command. Lets the user see at a
-/// glance how much work the indexing pipeline has done so far:
-/// how many images are catalogued, how many have thumbnails, how
-/// many have CLIP embeddings, how many are orphaned (file deleted
-/// from disk between launches).
+/// glance how much work the indexing pipeline has done so far per
+/// encoder.
 ///
-/// All counts come from a single SELECT — it's one DB Mutex
-/// acquisition per call regardless of library size.
-#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+/// All counts come from a small number of SELECTs — one for the
+/// total/thumbnail/orphaned base, one per encoder for embedding
+/// counts. Acceptable cost given the typical ~3 encoder configurations.
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
 pub struct PipelineStats {
     /// Every row in the `images` table (including orphaned).
     pub total_images: i64,
     /// Rows with a non-empty `thumbnail_path`.
     pub with_thumbnail: i64,
-    /// Rows with a non-empty `embedding` BLOB.
-    pub with_embedding: i64,
+    /// Per-encoder counts of (encoder_id, count). Includes the
+    /// legacy CLIP from images.embedding (so users on an
+    /// already-encoded library see CLIP at full count even before
+    /// they re-index under the new per-encoder schema).
+    pub with_embedding_per_encoder: Vec<EncoderEmbeddingCount>,
     /// Rows where the file was found missing on disk during the last
     /// orphan-detection pass.
     pub orphaned: i64,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+pub struct EncoderEmbeddingCount {
+    pub encoder_id: String,
+    pub count: i64,
 }
 
 /// Aggregate the standard "images LEFT JOIN images_tags LEFT JOIN tags"
@@ -359,15 +367,24 @@ impl ImageDatabase {
         }
     }
 
-    /// Snapshot of the pipeline's progress — total / with-thumbnail /
-    /// with-embedding / orphaned counts, all from one SELECT.
+    /// Snapshot of the pipeline's progress — base counts plus
+    /// per-encoder embedding counts.
     ///
-    /// SUM(CASE WHEN ... THEN 1 ELSE 0 END) collapses what would
-    /// otherwise be 4 separate COUNT queries into one full-table scan.
-    /// For ~10k image libraries the difference is small but the locking
-    /// story is cleaner — one Mutex acquire vs four.
+    /// Base counts come from one SELECT over `images` (total /
+    /// with_thumbnail / with_legacy_clip_embedding / orphaned). Then
+    /// one COUNT per encoder over the `embeddings` table for the
+    /// per-encoder breakdown the Settings UI shows.
+    ///
+    /// The per-encoder list always includes `clip_vit_b_32` (sourced
+    /// from the legacy `images.embedding` column for users who
+    /// haven't re-indexed under the new schema yet — `OR` the
+    /// embeddings table if they have), `siglip2_base`, and
+    /// `dinov2_small`. Adding new encoders means appending to this
+    /// list.
     pub fn get_pipeline_stats(&self) -> rusqlite::Result<PipelineStats> {
         let conn = self.connection.lock().unwrap();
+
+        // Base counts: total + thumbnail + legacy-CLIP + orphaned.
         let mut stmt = conn.prepare(
             "SELECT
                 COUNT(*) AS total,
@@ -378,20 +395,50 @@ impl ImageDatabase {
                 SUM(CASE
                     WHEN embedding IS NOT NULL AND length(embedding) > 0
                     THEN 1 ELSE 0
-                END) AS with_embedding,
+                END) AS with_legacy_clip,
                 SUM(CASE WHEN orphaned = 1 THEN 1 ELSE 0 END) AS orphaned
             FROM images",
         )?;
-        let row = stmt.query_row([], |row| {
-            Ok(PipelineStats {
-                total_images: row.get::<_, i64>(0)?,
-                // SUM returns NULL on empty tables, hence Option::unwrap_or(0)
-                with_thumbnail: row.get::<_, Option<i64>>(1)?.unwrap_or(0),
-                with_embedding: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
-                orphaned: row.get::<_, Option<i64>>(3)?.unwrap_or(0),
-            })
+        let (total, thumb, legacy_clip, orphaned) = stmt.query_row([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                row.get::<_, Option<i64>>(3)?.unwrap_or(0),
+            ))
         })?;
-        Ok(row)
+        drop(stmt);
+
+        // Per-encoder counts from the new embeddings table.
+        let known_encoders = ["clip_vit_b_32", "siglip2_base", "dinov2_small"];
+        let mut counts: Vec<EncoderEmbeddingCount> = Vec::with_capacity(known_encoders.len());
+        for encoder_id in known_encoders {
+            let mut stmt = conn.prepare(
+                "SELECT COUNT(*) FROM embeddings WHERE encoder_id = ?1",
+            )?;
+            let new_count: i64 =
+                stmt.query_row(rusqlite::params![encoder_id], |row| row.get(0))?;
+            // For the CLIP entry, prefer the larger of (legacy column,
+            // new table). Users who haven't re-indexed under the new
+            // schema have non-zero legacy_clip and 0 new_count; users
+            // who have re-indexed have both columns populated.
+            let count = if encoder_id == "clip_vit_b_32" {
+                new_count.max(legacy_clip)
+            } else {
+                new_count
+            };
+            counts.push(EncoderEmbeddingCount {
+                encoder_id: encoder_id.to_string(),
+                count,
+            });
+        }
+
+        Ok(PipelineStats {
+            total_images: total,
+            with_thumbnail: thumb,
+            with_embedding_per_encoder: counts,
+            orphaned,
+        })
     }
 }
 
@@ -417,7 +464,9 @@ mod tests {
         let stats = db.get_pipeline_stats().unwrap();
         assert_eq!(stats.total_images, 0);
         assert_eq!(stats.with_thumbnail, 0);
-        assert_eq!(stats.with_embedding, 0);
+        for ec in &stats.with_embedding_per_encoder {
+            assert_eq!(ec.count, 0, "encoder {} should be 0", ec.encoder_id);
+        }
         assert_eq!(stats.orphaned, 0);
     }
 
@@ -446,7 +495,13 @@ mod tests {
         let stats = db.get_pipeline_stats().unwrap();
         assert_eq!(stats.total_images, 3);
         assert_eq!(stats.with_thumbnail, 2, "thumbnail count");
-        assert_eq!(stats.with_embedding, 1, "embedding count");
+        // CLIP comes from the legacy column (or new table) — img_a has it
+        let clip = stats
+            .with_embedding_per_encoder
+            .iter()
+            .find(|e| e.encoder_id == "clip_vit_b_32")
+            .unwrap();
+        assert_eq!(clip.count, 1, "CLIP embedding count");
         assert_eq!(stats.orphaned, 0);
     }
 

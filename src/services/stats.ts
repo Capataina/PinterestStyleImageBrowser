@@ -11,10 +11,15 @@
 import { invoke } from "@tauri-apps/api/core";
 import { formatApiError } from "./apiError";
 
+export interface EncoderEmbeddingCount {
+  encoder_id: string;
+  count: number;
+}
+
 export interface PipelineStats {
   total_images: number;
   with_thumbnail: number;
-  with_embedding: number;
+  with_embedding_per_encoder: EncoderEmbeddingCount[];
   orphaned: number;
 }
 
