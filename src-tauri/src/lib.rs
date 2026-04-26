@@ -54,6 +54,30 @@ impl CosineIndexState {
     /// Returns an error if the DB read fails. Callers should treat
     /// this as a hard failure for the search command — there's no
     /// useful "partial cache" state to fall back to.
+    /// Drop the in-memory cache AND the "currently loaded encoder"
+    /// marker so the very next search call repopulates from the DB.
+    ///
+    /// Why both: `ensure_loaded_for` short-circuits when
+    /// `current_encoder_id` matches the requested encoder, and only
+    /// repopulates the cache otherwise. If we cleared the cache but
+    /// left the marker, the next search would short-circuit and run
+    /// against an empty cache (image-image returns 0; semantic search
+    /// only saves itself via a separate empty-cache fallback in
+    /// `commands/semantic.rs`). Worse, the previous code's leftover
+    /// pre-toggle entries kept appearing in results because nothing
+    /// forced a reload — exactly the "disabled folder still shows in
+    /// View Similar" bug. Lock order matches `ensure_loaded_for`
+    /// (current_encoder_id then index) to keep the search path
+    /// deadlock-free.
+    pub fn invalidate(&self) {
+        if let (Ok(mut cur), Ok(mut idx)) =
+            (self.current_encoder_id.lock(), self.index.lock())
+        {
+            idx.cached_images.clear();
+            cur.clear();
+        }
+    }
+
     pub fn ensure_loaded_for(
         &self,
         db: &ImageDatabase,

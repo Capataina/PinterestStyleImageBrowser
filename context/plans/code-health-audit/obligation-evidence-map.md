@@ -1,0 +1,44 @@
+# Code Health Audit Obligation Evidence Map
+
+**Date:** 2026-04-26
+**Repository:** `/Users/atacanercetinkaya/Documents/Programming-Projects/PinterestStyleImageBrowser`
+**Status:** complete
+
+This map is the per-system evidence ledger for the audit. It exists to make the non-negotiable obligations explicit: research happened, diagnostics were written where they changed confidence, modularisation candidates received a verdict, and omissions are reasoned rather than silent.
+
+## Front-Loaded Research
+
+| Obligation | Status | Evidence | Research mode | Source URL | Notes |
+|---|---|---|---|---|---|
+| Pre-Pass-1 WebSearch | done | Query: `code health audit patterns for Rust Tauri React desktop app` | mode 1 — domain pattern lookup | https://www.projectrules.ai/rules/tauri | Search performed before loading audit references; source used only as initial orientation, not as authoritative project evidence. |
+
+## Research Mode Distribution
+
+| Mode | Count | Evidence |
+|---|---:|---|
+| mode 1 — domain pattern lookup | 3 | Tauri state management, TanStack Query invalidation, ONNX/runtime encoder source review |
+| mode 2 — specific-technique evaluation | 4 | SQLite WAL concurrency, Rust `select_nth_unstable_by`, tracing `Layer::on_close`, tokenizers batch/encoding APIs |
+| mode 3 — known-anti-pattern check | 3 | cache invalidation/state-marker mismatch, watcher debouncer lifecycle, stale documentation/unused direct dependency sweep |
+
+## Live Obligations
+
+| System / candidate | Status | Research obligation | Diagnostic-test obligation | Modularisation verdict | Evidence / notes |
+|---|---|---|---|---|---|
+| App shell / Tauri state wiring | done | mode 1 + mode 3: query `Tauri v2 state management Mutex official documentation`; source https://v2.tauri.app/develop/state-management/ | wrote `src-tauri/tests/cosine_cache_invalidation_diagnostic.rs`; default run passes because the bug demonstrator is ignored; `-- --ignored` fails as intended until fixed | `src-tauri/src/lib.rs`: leave-as-is | Finding emitted in `backend-state-and-indexing.md`: `CosineIndexState::ensure_loaded_for` trusts `current_encoder_id` even when the shared cache has been cleared by root commands. |
+| Multi-folder roots / cache invalidation | done | mode 3: same state-management research plus direct code read of root command invalidation paths | covered by `cosine_cache_invalidation_diagnostic.rs` | not applicable | `set_scan_root`, `remove_root`, and `set_root_enabled` clear `cached_images` without clearing `current_encoder_id`; this is the concrete trigger for the diagnostic. |
+| Indexing pipeline | done | mode 2: query `SQLite WAL concurrent readers writer checkpoint official documentation`; source https://www.sqlite.org/wal.html | no new diagnostic: existing `cargo test` covers pipeline helpers; behaviour-free split recommendation does not need a new test until implementation | `src-tauri/src/indexing.rs`: split-recommended | Finding emitted in `backend-state-and-indexing.md`: extract scan/orphan, thumbnail worker, encoder worker, and cache finalisation into private modules while preserving `try_spawn_pipeline`. |
+| Persistence and image query layer | done | mode 2: query `rusqlite aggregate row mapping type complexity Rust docs`; source https://docs.rs/rusqlite/latest/rusqlite/ | no new diagnostic: Clippy `type_complexity` and direct row-shape inspection are sufficient; implementation should run existing DB tests | `src-tauri/src/db/images_query.rs`: leave-as-is | Finding emitted in `cross-cutting.md`: replace the anonymous aggregate tuple/map value with a private row struct or type alias; no file split recommended. |
+| Cosine / similarity retrieval | done | mode 2: query `Rust slice select_nth_unstable documentation top k`; source https://doc.rust-lang.org/std/primitive.slice.html#method.select_nth_unstable_by | existing `src-tauri/tests/cosine_topk_partial_sort_diagnostic.rs`; new cache invalidation diagnostic covers the active correctness issue | `src-tauri/src/similarity_and_semantic_search/cosine/index.rs`: leave-as-is; `src-tauri/src/commands/similarity.rs`: leave-as-is | Partial top-k work is already implemented correctly; the remaining active issue is cache state coherence, grouped with app state. |
+| Encoder stack and semantic dispatch | done | mode 1 + mode 2: query `tokenizers Rust tokenizer padding truncation docs`; source https://docs.rs/tokenizers/latest/tokenizers/tokenizer/struct.Tokenizer.html; ONNX execution-provider source https://onnxruntime.ai/docs/execution-providers/ | no new diagnostic: `cargo clippy` pinpoints a behaviour-free allocation in the text encoder; semantic SigLIP dispatch is a documented feature gap, not a free code-health cleanup | `src-tauri/src/similarity_and_semantic_search/encoder.rs`: leave-as-is | Finding emitted in `cross-cutting.md`: remove the unnecessary `to_vec()` before `normalize(&data[start..end])` as part of strict-Clippy cleanup. SigLIP text dispatch recorded as reasoned omission. |
+| Profiling / diagnostics | done | mode 2: query `tracing subscriber Layer on_close span timing official docs`; source https://docs.rs/tracing-subscriber/latest/tracing_subscriber/layer/trait.Layer.html | no new diagnostic: existing `perf.rs` and `perf_report.rs` unit tests cover event serialisation, flush, timeline parsing, and report sections | `src-tauri/src/perf.rs`: leave-as-is; `src-tauri/src/perf_report.rs`: leave-as-is | Finding emitted in `cross-cutting.md`: strict Clippy gate is currently unusable; perf files contain several small behaviour-free lint fixes but no structural split is justified yet. |
+| Frontend routing/state | done | mode 1: query `TanStack Query invalidation optimistic updates React official docs`; source https://tanstack.com/query/latest/docs/framework/react/guides/query-invalidation | no new diagnostic: recommendation is extraction-only and should be covered by existing Vitest plus route smoke testing when implemented | `src/pages/[...slug].tsx`: split-recommended | Finding emitted in `frontend-and-docs.md`: extract search result selection, notes, shortcuts/profiling, and folder-add flows from the 516-line route component. |
+| Model download and paths/state | done | mode 3: query `notify debouncer mini Rust watcher debounce crate docs`; source https://docs.rs/notify-debouncer-mini/latest/notify_debouncer_mini/ | reasoned omission: no new finding emitted; documented watcher rebuild gap changes behaviour and is already tracked in context | `src-tauri/src/model_download.rs`: leave-as-is | `paths.rs` has a Clippy `manual_strip` fix, but no system-level finding beyond the strict-Clippy cleanup bundle. |
+| Cross-cutting hygiene | done | mode 3: direct dependency/import sweep and stale context comparison; sources are local `package.json`, `package-lock.json`, `context/*`, and `lib.rs` | no new diagnostic: static evidence (`rg`, `npm ls`, `cargo clippy`) is decisive | not applicable | Findings emitted in `cross-cutting.md` and `frontend-and-docs.md`: strict Clippy gate, stale context plan/docs, unused direct dev dependencies. |
+| `src-tauri/src/db/embeddings.rs` | done | reasoned omission: covered under persistence; no separate external research because the file is a cohesive CRUD/test module under the same SQLite evidence row | no new diagnostic: existing embedding tests cover behaviour | leave-as-is | Candidate classified; no finding emitted. |
+| `src-tauri/tests/similarity_integration_test.rs` | done | reasoned omission: test file, not production modularisation target | not applicable | not-applicable | Candidate classified; no finding emitted. |
+| `scripts/download_lol_splashes.py` | done | mode 3: orphan-candidate check against `scripts/README.md` documentation | not applicable | leave-as-is | Static fan-in is zero, but the script is an explicitly documented test-corpus generator. Do not delete. |
+| `src/services/images.ts` | done | reasoned omission: frontend service file is below the manual split threshold and already represents one IPC concern | no new diagnostic | leave-as-is | Candidate classified; no finding emitted. |
+| `src/components/PerfOverlay.tsx` | done | reasoned omission: covered under profiling; component is large but cohesive | no new diagnostic | leave-as-is | Candidate classified; no finding emitted. |
+| `src/components/SearchBar.tsx` | done | reasoned omission: component is large but cohesive and tested through existing UI flow tests | no new diagnostic | leave-as-is | Candidate classified; no finding emitted. |
+| `src/services/services.test.ts` | done | reasoned omission: test file, not production modularisation target | not applicable | not-applicable | Candidate classified; no finding emitted. |
+| `src/components/masonryPacking.test.ts` | done | reasoned omission: test file, not production modularisation target | not applicable | not-applicable | Candidate classified; no finding emitted. |

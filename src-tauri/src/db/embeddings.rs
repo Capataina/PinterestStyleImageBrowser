@@ -96,9 +96,23 @@ impl ImageDatabase {
     /// so callers don't have to filter them out.
     pub fn get_all_embeddings(&self) -> rusqlite::Result<Vec<(ID, String, Vec<f32>)>> {
         let conn = self.connection.lock().unwrap();
+        // Mirror the grid filter (`db/images_query.rs:get_images_with_thumbnails`)
+        // so disabled / orphaned images are excluded from the cosine
+        // cache too. Without this, a user could disable a folder via
+        // Settings and still get its images back from "View Similar"
+        // and semantic search — the grid hides them but the search
+        // cache happily returns them. `root_id IS NULL` is preserved
+        // for legacy pre-multi-folder rows (same exception the grid
+        // makes).
         let mut stmt = conn.prepare(
             "SELECT id, path, embedding FROM images
-             WHERE embedding IS NOT NULL AND length(embedding) > 0",
+             WHERE embedding IS NOT NULL
+               AND length(embedding) > 0
+               AND orphaned = 0
+               AND (
+                   root_id IS NULL
+                   OR root_id IN (SELECT id FROM roots WHERE enabled = 1)
+               )",
         )?;
         let rows = stmt.query_map([], |row| {
             let id: ID = row.get(0)?;
@@ -180,11 +194,20 @@ impl ImageDatabase {
         encoder_id: &str,
     ) -> rusqlite::Result<Vec<(ID, String, Vec<f32>)>> {
         let conn = self.connection.lock().unwrap();
+        // Same disabled/orphaned filter as `get_all_embeddings` — the
+        // cosine cache must not return images whose root the user has
+        // toggled off (or whose file disappeared from disk). The JOIN
+        // on `images` is already here, so we just gate the WHERE clause.
         let mut stmt = conn.prepare(
             "SELECT i.id, i.path, e.embedding
              FROM embeddings e
              JOIN images i ON i.id = e.image_id
-             WHERE e.encoder_id = ?1",
+             WHERE e.encoder_id = ?1
+               AND i.orphaned = 0
+               AND (
+                   i.root_id IS NULL
+                   OR i.root_id IN (SELECT id FROM roots WHERE enabled = 1)
+               )",
         )?;
         let rows = stmt.query_map(rusqlite::params![encoder_id], |row| {
             Ok((
@@ -465,5 +488,80 @@ mod tests {
         db.add_image("/a.jpg".into(), None).unwrap();
         let rows = db.get_all_embeddings().unwrap();
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn get_all_embeddings_excludes_disabled_root_images() {
+        // Regression: disabled-folder images used to leak into the
+        // cosine cache via this function (the grid query filtered them
+        // but the search path didn't), so "View Similar" / semantic
+        // search returned images from folders the user had toggled off.
+        let db = fresh_db();
+        let enabled = db.add_root("/enabled".into()).unwrap();
+        let disabled = db.add_root("/disabled".into()).unwrap();
+        db.add_image("/enabled/keep.jpg".into(), Some(enabled.id))
+            .unwrap();
+        db.add_image("/disabled/hide.jpg".into(), Some(disabled.id))
+            .unwrap();
+        let keep_id = db.get_image_id_by_path("/enabled/keep.jpg").unwrap();
+        let hide_id = db.get_image_id_by_path("/disabled/hide.jpg").unwrap();
+        db.update_image_embedding(keep_id, vec![1.0, 0.0]).unwrap();
+        db.update_image_embedding(hide_id, vec![0.0, 1.0]).unwrap();
+
+        // Both roots enabled → both rows visible.
+        let rows = db.get_all_embeddings().unwrap();
+        assert_eq!(rows.len(), 2);
+
+        // Disable one root → its row drops out of the search cache.
+        db.set_root_enabled(disabled.id, false).unwrap();
+        let rows = db.get_all_embeddings().unwrap();
+        assert_eq!(rows.len(), 1, "disabled root must not leak into cache");
+        assert_eq!(rows[0].1, "/enabled/keep.jpg");
+
+        // Re-enabling brings it back without re-encoding.
+        db.set_root_enabled(disabled.id, true).unwrap();
+        assert_eq!(db.get_all_embeddings().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn get_all_embeddings_excludes_orphaned_images() {
+        let db = fresh_db();
+        let r = db.add_root("/r".into()).unwrap();
+        db.add_image("/r/alive.jpg".into(), Some(r.id)).unwrap();
+        db.add_image("/r/dead.jpg".into(), Some(r.id)).unwrap();
+        let alive_id = db.get_image_id_by_path("/r/alive.jpg").unwrap();
+        let dead_id = db.get_image_id_by_path("/r/dead.jpg").unwrap();
+        db.update_image_embedding(alive_id, vec![1.0]).unwrap();
+        db.update_image_embedding(dead_id, vec![1.0]).unwrap();
+        // Mark dead.jpg as orphan (file gone from disk).
+        db.mark_orphaned(r.id, &["/r/alive.jpg".to_string()])
+            .unwrap();
+
+        let rows = db.get_all_embeddings().unwrap();
+        assert_eq!(rows.len(), 1, "orphaned row must not leak into cache");
+        assert_eq!(rows[0].1, "/r/alive.jpg");
+    }
+
+    #[test]
+    fn get_all_embeddings_for_excludes_disabled_and_orphaned() {
+        // Same invariant as the legacy column, but on the per-encoder
+        // table. This is the path that drives image-image search via
+        // populate_from_db_for_encoder.
+        let db = fresh_db();
+        let kept = db.add_root("/kept".into()).unwrap();
+        let off = db.add_root("/off".into()).unwrap();
+        db.add_image("/kept/a.jpg".into(), Some(kept.id)).unwrap();
+        db.add_image("/off/b.jpg".into(), Some(off.id)).unwrap();
+        let a = db.get_image_id_by_path("/kept/a.jpg").unwrap();
+        let b = db.get_image_id_by_path("/off/b.jpg").unwrap();
+        db.upsert_embedding(a, "clip_vit_b_32", &[1.0, 0.0]).unwrap();
+        db.upsert_embedding(b, "clip_vit_b_32", &[0.0, 1.0]).unwrap();
+
+        assert_eq!(db.get_all_embeddings_for("clip_vit_b_32").unwrap().len(), 2);
+
+        db.set_root_enabled(off.id, false).unwrap();
+        let rows = db.get_all_embeddings_for("clip_vit_b_32").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, "/kept/a.jpg");
     }
 }

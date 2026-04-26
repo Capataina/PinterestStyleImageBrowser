@@ -48,9 +48,7 @@ pub fn set_scan_root(
     db.wipe_images_for_new_root()?;
     db.add_root(path.clone())?;
 
-    if let Ok(mut idx) = cosine_state.index.lock() {
-        idx.cached_images.clear();
-    }
+    cosine_state.invalidate();
 
     indexing::try_spawn_pipeline(
         app.clone(),
@@ -130,9 +128,7 @@ pub fn remove_root(
     // Cosine cache contains entries from the removed root; cheapest
     // way to clean is to drop the whole cache and let next-query
     // populate from the remaining DB rows.
-    if let Ok(mut idx) = cosine_state.index.lock() {
-        idx.cached_images.clear();
-    }
+    cosine_state.invalidate();
     info!("remove_root removed root id {}", id);
     Ok(())
 }
@@ -149,8 +145,6 @@ pub fn set_root_enabled(
     db.set_root_enabled(id, enabled)?;
     // Cosine cache may include images from the toggled root; clear so
     // the next similarity query rebuilds with the right active set.
-    if let Ok(mut idx) = cosine_state.index.lock() {
-        idx.cached_images.clear();
-    }
+    cosine_state.invalidate();
     Ok(())
 }
