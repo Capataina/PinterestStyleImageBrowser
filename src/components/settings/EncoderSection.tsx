@@ -5,6 +5,34 @@ import { recordAction } from "../../services/perf";
 import { Section } from "./controls";
 
 /**
+ * Module-level "last pushed" cache for the priority-encoder IPC.
+ *
+ * Why module-level rather than `useRef`: React 19 StrictMode mounts →
+ * unmounts → re-mounts every component once in dev, AND the
+ * SettingsDrawer is conditionally mounted (each open is a fresh mount).
+ * A `useRef` is destroyed on every unmount, so a fresh ref starts at
+ * `null` on the next mount and the dedup short-circuit never fires —
+ * exactly the failure pattern the on-exit profiling report at t=5.87s
+ * captured (`set_priority_image_encoder` firing twice within 13ms per
+ * settings_open). A module-level cache survives both StrictMode replays
+ * and conditional remounts because it lives in the JS module namespace,
+ * not in React's component tree.
+ *
+ * Trade-off: HMR reloads of this file reset it (acceptable — HMR
+ * already re-runs effects). Test isolation: `__resetEncoderPushCache`
+ * is exported below so vitest's `beforeEach` can clear it without
+ * reaching into module internals.
+ */
+let lastPushedImageEncoder: string | null = null;
+
+/** Test-only: reset the module-level dedup cache. Not part of the
+ *  public API — production code never needs to reset, the cache only
+ *  matters within a single browser session. */
+export function __resetEncoderPushCache() {
+  lastPushedImageEncoder = null;
+}
+
+/**
  * Backend EncoderInfo, mirrors src-tauri/src/commands/encoders.rs.
  */
 interface EncoderInfo {
@@ -62,15 +90,40 @@ export function EncoderSection() {
   // rescan) runs the user's encoder FIRST and hot-populates the cosine
   // cache for it as soon as that phase finishes — instead of always
   // running CLIP → SigLIP-2 → DINOv2 in fixed order.
+  //
+  // Idempotency via the module-level `lastPushedImageEncoder` cache
+  // (declared above the component): React 19 StrictMode replays mount
+  // effects in dev, AND the SettingsDrawer is conditionally mounted —
+  // every drawer open re-mounts EncoderSection. A `useRef` would be
+  // destroyed on each unmount and reset to null, so the next mount
+  // would always re-fire the IPC; the module-level cache survives both
+  // failure modes. The on-exit profiling report (settings_open at
+  // t=5.87s) captured the duplicate pair `+30ms` and `+43ms`; this
+  // dedupes at the IPC boundary rather than papering over with a
+  // debounce so a genuine encoder change is still pushed immediately,
+  // with no race window. The backend `set_priority_image_encoder`
+  // command also short-circuits when the value matches the persisted
+  // one — defence-in-depth so any future caller can't reintroduce the
+  // settings.json churn.
   useEffect(() => {
-    invoke("set_priority_image_encoder", { id: prefs.imageEncoder }).catch(
-      (e) => {
-        // Non-fatal: an unknown id at the backend (e.g. encoder removed
-        // between releases) just means the pipeline falls back to its
-        // default ordering. Log so the failure isn't silent in dev.
-        console.warn("set_priority_image_encoder failed:", e);
-      },
-    );
+    if (lastPushedImageEncoder === prefs.imageEncoder) return;
+    const target = prefs.imageEncoder;
+    // Mark BEFORE awaiting the IPC — under React 19 StrictMode the
+    // mount → unmount → re-mount cycle runs SYNCHRONOUSLY, so if we
+    // only set the cache on `.then()` the second mount's effect runs
+    // before the first promise resolves and re-fires the IPC. Setting
+    // synchronously means the second mount sees the cache populated
+    // and short-circuits cleanly. Trade-off: a failed IPC leaves the
+    // cache poisoned for this session; the next genuine value change
+    // (user picks a different encoder) clears it, and the validation
+    // effect below normalises away unknown encoder IDs anyway.
+    lastPushedImageEncoder = target;
+    invoke("set_priority_image_encoder", { id: target }).catch((e) => {
+      // Non-fatal: an unknown id at the backend (e.g. encoder removed
+      // between releases) just means the pipeline falls back to its
+      // default ordering. Log so the failure isn't silent in dev.
+      console.warn("set_priority_image_encoder failed:", e);
+    });
   }, [prefs.imageEncoder]);
 
   // Validate the saved encoder choice against the live options. Cleans

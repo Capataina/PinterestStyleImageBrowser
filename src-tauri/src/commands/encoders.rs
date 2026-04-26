@@ -72,17 +72,110 @@ pub fn list_available_encoders() -> Vec<EncoderInfo> {
 /// Validation: the id must match one of the encoders in `ENCODERS`.
 /// Unknown ids return BadInput so the frontend can surface the error
 /// rather than silently writing a value the pipeline will ignore.
+/// Validate `id` against the compiled encoder list. Extracted so the
+/// command body and the unit tests share one definition of "is this a
+/// pickable image encoder" — adding a fourth encoder shouldn't require
+/// touching multiple call sites.
+fn is_known_image_encoder(id: &str) -> bool {
+    ENCODERS.iter().any(|e| e.id == id && e.supports_image)
+}
+
+/// Pure decision function for the `set_priority_image_encoder` command —
+/// extracted from the command body so it's testable without filesystem
+/// isolation games (`paths::settings_path()` resolves to a process-wide
+/// location, so two parallel cargo tests sharing it would race).
+///
+/// Returns:
+///   - `Err(BadInput)` if `id` isn't a known image encoder,
+///   - `Ok(None)` if the value already matches what's persisted (the
+///     idempotent short-circuit — caller skips the disk write),
+///   - `Ok(Some(id))` if a write is needed; caller persists the value.
+///
+/// The on-exit profiling report at t=5.87s showed
+/// `set_priority_image_encoder` firing twice per drawer open. The
+/// frontend `useRef` dedup is the primary fix; this short-circuit is
+/// defence-in-depth so any other caller (current or future) doesn't
+/// produce settings.json churn — every save was paired with an
+/// unnecessary fsync on what was already the persisted value.
+fn decide_priority_write(
+    current: Option<&str>,
+    requested: &str,
+) -> Result<Option<String>, super::ApiError> {
+    if !is_known_image_encoder(requested) {
+        return Err(super::ApiError::BadInput(format!(
+            "Unknown image encoder id '{requested}' — not in the available encoders list"
+        )));
+    }
+    if current == Some(requested) {
+        return Ok(None);
+    }
+    Ok(Some(requested.to_string()))
+}
+
 #[tauri::command]
 #[tracing::instrument(name = "ipc.set_priority_image_encoder", skip())]
 pub fn set_priority_image_encoder(id: String) -> Result<(), super::ApiError> {
-    if !ENCODERS.iter().any(|e| e.id == id && e.supports_image) {
-        return Err(super::ApiError::BadInput(format!(
-            "Unknown image encoder id '{id}' — not in the available encoders list"
-        )));
-    }
     let mut s = crate::settings::Settings::load();
-    s.priority_image_encoder = Some(id);
-    s.save()
-        .map_err(|e| super::ApiError::Internal(format!("settings save failed: {e}")))?;
-    Ok(())
+    match decide_priority_write(s.priority_image_encoder.as_deref(), &id)? {
+        None => Ok(()), // already at requested value — no disk write
+        Some(next) => {
+            s.priority_image_encoder = Some(next);
+            s.save().map_err(|e| {
+                super::ApiError::Internal(format!("settings save failed: {e}"))
+            })?;
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decide_write_rejects_unknown_encoder() {
+        // BadInput is the same shape the original command produced —
+        // frontend surfaces this rather than silently writing a value
+        // the indexing pipeline would ignore.
+        let err = decide_priority_write(None, "not_a_real_encoder").unwrap_err();
+        match err {
+            super::super::ApiError::BadInput(msg) => {
+                assert!(msg.contains("not_a_real_encoder"));
+            }
+            other => panic!("expected BadInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decide_write_short_circuits_when_value_matches() {
+        // Regression test for the on-exit profiling-report finding at
+        // t=5.87s: `set_priority_image_encoder` fired twice per drawer
+        // open, each call doing a full settings.json round-trip even
+        // though the value never changed. The frontend now dedupes via
+        // useRef, this asserts the backend also no-ops on a same-value
+        // push so any future caller can't reintroduce the churn.
+        let result = decide_priority_write(Some("dinov2_base"), "dinov2_base").unwrap();
+        assert_eq!(
+            result, None,
+            "matching current value must short-circuit (no Some(_)) so the caller skips the disk write"
+        );
+    }
+
+    #[test]
+    fn decide_write_proceeds_when_value_changes() {
+        // The dedup must not silently drop a genuine encoder change —
+        // that would leave settings.json out of sync with the picker
+        // and the next pipeline run would use the old priority.
+        let result = decide_priority_write(Some("clip_vit_b_32"), "dinov2_base").unwrap();
+        assert_eq!(result, Some("dinov2_base".to_string()));
+    }
+
+    #[test]
+    fn decide_write_proceeds_when_no_prior_value() {
+        // First-ever set: settings.json has no priority_image_encoder
+        // field yet (None), the user picks one in the drawer. Must
+        // produce a write so the pipeline picks it up next run.
+        let result = decide_priority_write(None, "dinov2_base").unwrap();
+        assert_eq!(result, Some("dinov2_base".to_string()));
+    }
 }
