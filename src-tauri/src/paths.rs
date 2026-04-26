@@ -1,11 +1,11 @@
-//! Project-local paths for app data, thumbnails, models, and settings.
+//! Platform-default paths for app data, thumbnails, models, settings,
+//! and exports.
 //!
-//! Everything user-state lives under `<repo>/Library/` in dev builds —
-//! the user prefers project-local visibility over the standard
-//! platform-convention paths. Layout:
+//! All user-state lives under the platform's standard app-data
+//! directory regardless of build mode (debug or release). Layout:
 //!
 //! ```text
-//! <repo>/Library/
+//! <platform_data_dir>/com.ataca.image-browser/
 //!   images.db
 //!   settings.json
 //!   cosine_cache.bin
@@ -16,15 +16,16 @@
 //!   thumbnails/
 //!     root_1/thumb_42.jpg
 //!     root_2/thumb_99.jpg
+//!   exports/
+//!     perf-<unix-ts>/{report.md,raw.json,timeline.jsonl}
 //! ```
 //!
-//! Library/ is gitignored so user state never lands in commits.
+//! On macOS the base is `~/Library/Application Support/`; on Linux
+//! `$XDG_DATA_HOME` (default `~/.local/share`); on Windows
+//! `%APPDATA%`. The bundle id segment matches `tauri.conf.json`.
 //!
-//! Trade-off: a packaged release build (no project folder, no
-//! CARGO_MANIFEST_DIR) needs the platform app-data dir as a fallback.
-//! We branch on `cfg(debug_assertions)` to do the right thing:
-//! - `cargo tauri dev` (debug)   → <repo>/Library/
-//! - `tauri build` (release)     → ~/Library/Application Support/<bundle_id>/
+//! `IMAGE_BROWSER_DATA_DIR` env var overrides the default for ad-hoc
+//! redirection (testing, side-by-side instances, CI fixtures).
 
 use std::borrow::Cow;
 use std::fs;
@@ -51,35 +52,35 @@ pub fn strip_windows_extended_prefix(path_str: &str) -> Cow<'_, str> {
     }
 }
 
-#[cfg(not(debug_assertions))]
 use tracing::warn;
 
 /// Tauri bundle identifier — must stay in sync with `tauri.conf.json::identifier`.
-/// Used only by the release-build fallback path.
-#[cfg(not(debug_assertions))]
 const BUNDLE_ID: &str = "com.ataca.image-browser";
 
 /// Root of all app-managed state.
 ///
-/// Resolution order (first match wins):
+/// Always resolves to the platform's standard app-data directory so
+/// debug and release builds share state. On macOS that's
+/// `~/Library/Application Support/com.ataca.image-browser/`; on
+/// Linux `$XDG_DATA_HOME/com.ataca.image-browser/`; on Windows
+/// `%APPDATA%/com.ataca.image-browser/`.
 ///
-/// 1. `IMAGE_BROWSER_DATA_DIR` env var, if set. Lets you point ANY
-///    build (release or debug) at any directory — useful when running
-///    a release-mode profiling session against your dev `<repo>/Library/`
-///    so you don't re-download the 1.1GB models. Set it to an absolute
-///    path:
-///        IMAGE_BROWSER_DATA_DIR=/path/to/repo/Library cargo tauri dev --release
-/// 2. Debug builds resolve to `<repo>/Library/` via `CARGO_MANIFEST_DIR`
-///    (captured at compile time; points at `src-tauri/`, so `.parent()`
-///    lands at the repo root).
-/// 3. Release builds fall back to the platform's app data directory
-///    (`~/Library/Application Support/com.ataca.image-browser/` on
-///    macOS) because a packaged binary has no project folder.
+/// The `IMAGE_BROWSER_DATA_DIR` env var overrides this for ad-hoc
+/// redirection (testing against a separate state, running multiple
+/// instances side by side, pointing CI at a fixture directory). Set
+/// it to an absolute path; the env var wins over the platform
+/// default.
+///
+/// Why platform-default rather than project-local: dev and release
+/// builds compile differently (debug vs --release) but should see
+/// the same DB, the same downloaded models (1.1GB), and the same
+/// thumbnails. A `cfg(debug_assertions)` split would force a
+/// re-download every time you switched build modes — which is
+/// exactly the bite that prompted reverting to the standard path.
 pub fn app_data_dir() -> PathBuf {
-    // Env-var override comes first so it works in EITHER cfg branch.
-    // The whole point of this escape hatch is to let release-mode
-    // dev runs (cargo tauri dev --release) point at the dev data
-    // dir, sharing the model cache + DB across build modes.
+    // Env-var override comes first — useful for testing against a
+    // separate state, running multiple instances, or pointing at a
+    // fixture directory.
     if let Ok(override_path) = std::env::var("IMAGE_BROWSER_DATA_DIR") {
         if !override_path.is_empty() {
             let dir = PathBuf::from(override_path);
@@ -88,37 +89,16 @@ pub fn app_data_dir() -> PathBuf {
         }
     }
 
-    #[cfg(debug_assertions)]
-    {
-        // CARGO_MANIFEST_DIR is captured by env! at compile time; it
-        // points at src-tauri/ (where Cargo.toml lives). One step up
-        // is the repo root, where Library/ lives.
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let repo_root = std::path::Path::new(manifest_dir)
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("."));
-        let dir = repo_root.join("Library");
-        let _ = ensure_dir(&dir);
-        return dir;
-    }
-
-    #[cfg(not(debug_assertions))]
-    {
-        // Release: a packaged binary doesn't have a project folder.
-        // Fall back to the platform's app-data directory so the
-        // built app still works when distributed.
-        let base = dirs::data_dir().unwrap_or_else(|| {
-            warn!(
-                "dirs::data_dir() returned None; falling back to ./app-data — \
-                 your platform may not be fully supported"
-            );
-            PathBuf::from("./app-data")
-        });
-        let dir = base.join(BUNDLE_ID);
-        let _ = ensure_dir(&dir);
-        dir
-    }
+    let base = dirs::data_dir().unwrap_or_else(|| {
+        warn!(
+            "dirs::data_dir() returned None; falling back to ./app-data — \
+             your platform may not be fully supported"
+        );
+        PathBuf::from("./app-data")
+    });
+    let dir = base.join(BUNDLE_ID);
+    let _ = ensure_dir(&dir);
+    dir
 }
 
 /// Path to the SQLite database file. Parent directory is created if missing.
@@ -184,11 +164,11 @@ pub fn cosine_cache_path() -> PathBuf {
 
 /// User-facing exports directory. Anything the user might want to
 /// share, archive, or compare goes here:
-///   - perf-<unix-ts>.json — perf snapshots from the diagnostics overlay
+///   - perf-<unix-ts>/ — profiling sessions written by perf_report
 ///   - (future) selected-set.csv, query-history.json, etc.
 ///
-/// Lives under Library/ so it follows the same "all generated files
-/// in one place" rule as everything else.
+/// Lives under app_data_dir() so it follows the same "all generated
+/// files in one place" rule as everything else.
 pub fn exports_dir() -> PathBuf {
     let p = app_data_dir().join("exports");
     let _ = ensure_dir(&p);
@@ -207,17 +187,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_app_data_dir_lives_in_repo_library_folder_in_dev() {
-        // Tests run with debug_assertions enabled, so app_data_dir()
-        // resolves to <repo>/Library/. Verify the basename is "Library".
+    fn test_app_data_dir_lives_under_platform_data_dir() {
+        // app_data_dir() always resolves to <platform_data_dir>/<bundle_id>/
+        // regardless of build mode. Verify the basename matches the
+        // bundle id (last path segment).
         let dir = app_data_dir();
         assert_eq!(
             dir.file_name().and_then(|s| s.to_str()),
-            Some("Library"),
-            "in dev/test, app_data_dir should be the repo's Library/ folder, got: {}",
+            Some(BUNDLE_ID),
+            "app_data_dir basename should be the bundle id, got: {}",
             dir.display()
         );
     }
+
+    // IMAGE_BROWSER_DATA_DIR override has no automated test because
+    // process-wide env mutation races with the other paths tests when
+    // cargo runs them in parallel. The override is a one-line read +
+    // PathBuf construct; manual smoke-test from a shell:
+    //   IMAGE_BROWSER_DATA_DIR=/tmp/foo cargo run --bin image-browser
+    // and verify the binary writes images.db under /tmp/foo/.
 
     #[test]
     fn test_paths_are_under_app_data_dir() {
