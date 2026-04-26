@@ -136,15 +136,52 @@ where
     let total_bytes: u64 = to_download.iter().map(|(_, _, s)| s).sum();
     progress(0, total_bytes, None);
 
-    // Phase 2: actually download. The aggregate counter accumulates
-    // across files so the UI sees one smooth 0..total progression.
+    // Phase 2: actually download. Per-file fail-soft — a single 401
+    // (e.g. SigLIP-2 hosted under a gated repo) shouldn't abort the
+    // whole batch and prevent DINOv2 from downloading. Each file's
+    // failure is logged with its URL so the user can identify which
+    // one needs a corrected URL.
+    //
+    // The aggregate counter accumulates across files so the UI sees
+    // one smooth 0..total progression even when some files are
+    // skipped (their headers' content-length still counted in total).
     let mut bytes_so_far: u64 = 0;
-    for (url, filename, _) in &to_download {
+    let mut succeeded = 0;
+    let mut failed: Vec<(String, String)> = Vec::new();
+    for (url, filename, declared_size) in &to_download {
         let dest = models_dir.join(filename);
-        download_to_file(url, &dest, &mut bytes_so_far, total_bytes, &progress)?;
+        match download_to_file(url, &dest, &mut bytes_so_far, total_bytes, &progress) {
+            Ok(()) => {
+                succeeded += 1;
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                warn!(
+                    "model file download failed: {} ({}): {}",
+                    filename, url, msg
+                );
+                // Advance the aggregate so the bar doesn't stall.
+                // Treat the file's declared size as "skipped" — we
+                // still consumed that many bar-tick units.
+                bytes_so_far = bytes_so_far.saturating_add(*declared_size);
+                progress(bytes_so_far, total_bytes, None);
+                failed.push((filename.to_string(), msg));
+            }
+        }
     }
 
-    info!("All model files present.");
+    info!(
+        "model download phase done: {} succeeded, {} failed",
+        succeeded,
+        failed.len()
+    );
+    if !failed.is_empty() {
+        warn!(
+            "the following model files failed to download (their encoder \
+             will be skipped at indexing): {:?}",
+            failed
+        );
+    }
     progress(total_bytes, total_bytes, None);
     Ok(())
 }

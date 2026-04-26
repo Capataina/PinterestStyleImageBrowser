@@ -49,19 +49,21 @@ use super::encoder_text::pooling::normalize;
 use super::encoders::{ImageEncoder, TextEncoder as TextEncoderTrait};
 
 /// Vision tower ONNX. SigLIP-2-Base, 224×224, patch16.
+/// `Xenova/siglip2-base-patch16-224` is the canonical pre-built ONNX
+/// export; the previous `onnx-community/...` path returned 401.
 pub const SIGLIP2_IMAGE_MODEL_URL: &str =
-    "https://huggingface.co/onnx-community/siglip2-base-patch16-224/resolve/main/onnx/vision_model_fp32.onnx";
+    "https://huggingface.co/Xenova/siglip2-base-patch16-224/resolve/main/onnx/vision_model.onnx";
 pub const SIGLIP2_IMAGE_MODEL_FILENAME: &str = "model_siglip2_image.onnx";
 
 /// Text tower ONNX. Same checkpoint as image tower; produces text
 /// embeddings in the shared 768-dim space.
 pub const SIGLIP2_TEXT_MODEL_URL: &str =
-    "https://huggingface.co/onnx-community/siglip2-base-patch16-224/resolve/main/onnx/text_model_fp32.onnx";
+    "https://huggingface.co/Xenova/siglip2-base-patch16-224/resolve/main/onnx/text_model.onnx";
 pub const SIGLIP2_TEXT_MODEL_FILENAME: &str = "model_siglip2_text.onnx";
 
 /// SentencePiece-based tokenizer in HF tokenizer.json format.
 pub const SIGLIP2_TOKENIZER_URL: &str =
-    "https://huggingface.co/onnx-community/siglip2-base-patch16-224/resolve/main/tokenizer.json";
+    "https://huggingface.co/Xenova/siglip2-base-patch16-224/resolve/main/tokenizer.json";
 pub const SIGLIP2_TOKENIZER_FILENAME: &str = "tokenizer_siglip2.json";
 
 // =====================================================================
