@@ -104,6 +104,13 @@ fn build_markdown(events: &[RawEvent], snap: &perf::PerfSnapshot) -> String {
     out.push_str(&section_top_by_total(snap));
     out.push_str(&section_hotspots(snap));
     out.push_str(&section_outliers(&sorted));
+    // Phase 7 — stall analysis + resource trends. New sections that
+    // collapse the "go grep timeline.jsonl yourself" workflow into one
+    // place. They show up after Outliers (which is per-event) and
+    // before the user-action timeline so the structural picture lands
+    // before the per-action narrative.
+    out.push_str(&section_stall_analysis(&sorted));
+    out.push_str(&section_resource_trends(&sorted));
     out.push_str(&section_action_timeline(&sorted));
     out.push_str(&section_per_span_table(snap));
     out.push_str(&section_diagnostics(&sorted));
@@ -444,6 +451,173 @@ fn section_per_span_table(snap: &perf::PerfSnapshot) -> String {
 /// `perf::record_diagnostic`. Grouped by `diagnostic` kind so the
 /// reader can scan for "search_query" results (audit cosine output)
 /// or "startup_state" (audit per-encoder embedding counts).
+/// Phase 7 — stall analysis section.
+///
+/// Walks every span event, surfaces the ones over `STALL_MS` (anything
+/// the user would notice as a freeze), and for each cites the most
+/// recent system_sample around it (rss_mib + cpu_percent within a 2s
+/// window). This collapses the "did the app stall because of memory
+/// pressure or CPU saturation?" question into one table.
+///
+/// If profiling caught no stalls, the section says so explicitly — that's
+/// useful information after a Tier-1 perf bundle ships.
+fn section_stall_analysis(sorted: &[RawEvent]) -> String {
+    const STALL_MS: u64 = 1_000; // 1s
+    const SAMPLE_WINDOW_MS: i64 = 2_000;
+
+    // (ts_ms, name, duration_us)
+    let mut stalls: Vec<(u64, &str, u64)> = sorted
+        .iter()
+        .filter_map(|e| match e {
+            RawEvent::Span {
+                ts_ms,
+                name,
+                duration_us,
+            } if (*duration_us / 1_000) >= STALL_MS => {
+                Some((*ts_ms, name.as_str(), *duration_us))
+            }
+            _ => None,
+        })
+        .collect();
+    stalls.sort_by_key(|s| std::cmp::Reverse(s.2));
+    stalls.truncate(20);
+
+    // Index every system_sample diagnostic for the neighbourhood lookup.
+    let samples: Vec<(u64, f64, f64)> = sorted
+        .iter()
+        .filter_map(|e| match e {
+            RawEvent::Diagnostic {
+                ts_ms,
+                diagnostic,
+                payload,
+            } if diagnostic == "system_sample" => Some((
+                *ts_ms,
+                payload.get("rss_mib").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                payload
+                    .get("cpu_percent")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0),
+            )),
+            _ => None,
+        })
+        .collect();
+
+    let mut s = String::new();
+    s.push_str("## Stall analysis (spans ≥ 1 s)\n\n");
+    s.push_str(
+        "Spans that ran longer than 1 s are the events the user notices as freezes. \
+         Each row cites the closest system_sample (within ±2 s) so memory- or CPU-pressure \
+         stalls stand out from pure-work stalls.\n\n",
+    );
+    if stalls.is_empty() {
+        s.push_str(
+            "_No spans exceeded 1 s in this session. \
+             If the app felt slow, check the Outliers section above for sub-second outliers \
+             or the Resource trends section below for sustained CPU/RSS pressure._\n\n",
+        );
+        return s;
+    }
+    s.push_str("| # | t | Span | Duration | RSS (MiB) | CPU (%) |\n");
+    s.push_str("|---|---|------|----------|-----------|---------|\n");
+    for (i, (ts, name, dur)) in stalls.iter().enumerate() {
+        let nearest = samples
+            .iter()
+            .min_by_key(|sa| (sa.0 as i64 - *ts as i64).abs())
+            .filter(|sa| (sa.0 as i64 - *ts as i64).abs() <= SAMPLE_WINDOW_MS);
+        let (rss, cpu) = match nearest {
+            Some((_, r, c)) => (format!("{r:.0}"), format!("{c:.0}")),
+            None => ("—".into(), "—".into()),
+        };
+        s.push_str(&format!(
+            "| {} | {} | `{}` | {} | {} | {} |\n",
+            i + 1,
+            format_ms_human(*ts),
+            name,
+            format_us_human(*dur),
+            rss,
+            cpu,
+        ));
+    }
+    s.push('\n');
+    s
+}
+
+/// Phase 7 — resource trends section.
+///
+/// Aggregates the 1Hz system_sample diagnostics into a single
+/// summary table (sample_count, RSS min/p50/p95/max, CPU min/p50/p95/max).
+/// Pinpoints sustained pressure (e.g. "CPU was at 800% for the entire
+/// encoder phase") without making the reader scan a thousand
+/// individual sample lines.
+fn section_resource_trends(sorted: &[RawEvent]) -> String {
+    let mut rss: Vec<f64> = Vec::new();
+    let mut cpu: Vec<f64> = Vec::new();
+    for e in sorted {
+        if let RawEvent::Diagnostic {
+            diagnostic,
+            payload,
+            ..
+        } = e
+        {
+            if diagnostic != "system_sample" {
+                continue;
+            }
+            if let Some(r) = payload.get("rss_mib").and_then(|v| v.as_f64()) {
+                rss.push(r);
+            }
+            if let Some(c) = payload.get("cpu_percent").and_then(|v| v.as_f64()) {
+                cpu.push(c);
+            }
+        }
+    }
+
+    let mut s = String::new();
+    s.push_str("## Resource trends (1 Hz sampler)\n\n");
+    if rss.is_empty() && cpu.is_empty() {
+        s.push_str(
+            "_No system_sample diagnostics recorded — either the sampler thread didn't start, \
+             or this session was very short (<1 s)._\n\n",
+        );
+        return s;
+    }
+    s.push_str("| Metric | Samples | min | p50 | p95 | max |\n");
+    s.push_str("|--------|--------:|----:|----:|----:|----:|\n");
+    if !rss.is_empty() {
+        let stats = percentile_summary(&mut rss);
+        s.push_str(&format!(
+            "| RSS (MiB) | {} | {:.0} | {:.0} | {:.0} | {:.0} |\n",
+            stats.0, stats.1, stats.2, stats.3, stats.4
+        ));
+    }
+    if !cpu.is_empty() {
+        let stats = percentile_summary(&mut cpu);
+        s.push_str(&format!(
+            "| CPU (%) | {} | {:.0} | {:.0} | {:.0} | {:.0} |\n",
+            stats.0, stats.1, stats.2, stats.3, stats.4
+        ));
+    }
+    s.push('\n');
+    s.push_str(
+        "_RSS = process resident set size (resident memory). \
+         CPU = sysinfo's per-core %, so 100 % = one full core; on M2 the ceiling is 800 %._\n\n",
+    );
+    s
+}
+
+/// Returns (count, min, p50, p95, max). Sorts the input in place.
+fn percentile_summary(values: &mut [f64]) -> (usize, f64, f64, f64, f64) {
+    if values.is_empty() {
+        return (0, 0.0, 0.0, 0.0, 0.0);
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = values.len();
+    let p = |q: f64| {
+        let idx = ((q * (n as f64 - 1.0)).round() as usize).min(n - 1);
+        values[idx]
+    };
+    (n, values[0], p(0.5), p(0.95), values[n - 1])
+}
+
 fn section_diagnostics(sorted: &[RawEvent]) -> String {
     let mut s = String::new();
     s.push_str("## Diagnostics\n\n");

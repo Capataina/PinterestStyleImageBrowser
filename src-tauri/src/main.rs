@@ -67,6 +67,9 @@ fn main() {
                     dir.display()
                 );
                 perf::spawn_flush_thread();
+                // Phase 7 — 1Hz RSS/CPU sampler. No-op if profiling
+                // is off (the if-let above already gates on that).
+                perf::spawn_system_sampler_thread();
             }
             Err(e) => {
                 // Don't crash the app if we can't write diagnostics —

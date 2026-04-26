@@ -297,6 +297,69 @@ fn push_event(event: RawEvent) {
     buf.push(event);
 }
 
+/// Phase 7 (profiling-diagnostics-expansion §4) — 1 Hz system
+/// resource sampler.
+///
+/// Emits a `system_sample` diagnostic every second under `--profile`
+/// so the on-exit report can show RSS/CPU trends alongside the span
+/// timeline. Lets a future "stall analysis" section answer "was the
+/// app memory-pressured during this 22 s freeze?" without requiring
+/// the user to have run Activity Monitor manually.
+///
+/// Process-global pid for sysinfo lookups; computed once on first
+/// sample so we don't pay the lookup cost per tick.
+///
+/// Cost: one syscall per second to refresh CPU stats, one diagnostic
+/// per second (~150 bytes serialised). Negligible at the cadence we
+/// pick. No-op if profiling is disabled.
+///
+/// Sampler runs until process exit; we don't join the handle.
+pub fn spawn_system_sampler_thread() {
+    if !is_profiling_enabled() {
+        return;
+    }
+    let pid = sysinfo::get_current_pid().ok();
+    let pid = match pid {
+        Some(p) => p,
+        None => {
+            tracing::warn!("system sampler: could not resolve current pid");
+            return;
+        }
+    };
+
+    thread::spawn(move || {
+        // sysinfo recommends one System instance per sampling thread —
+        // refreshing it does the actual stat lookup.
+        let mut sys = sysinfo::System::new();
+        // refresh_all() is overkill — only refresh what we read.
+        let refresh_kind =
+            sysinfo::ProcessRefreshKind::new().with_cpu().with_memory();
+        loop {
+            thread::sleep(std::time::Duration::from_secs(1));
+            sys.refresh_processes_specifics(
+                sysinfo::ProcessesToUpdate::Some(&[pid]),
+                true,
+                refresh_kind,
+            );
+            if let Some(proc_) = sys.process(pid) {
+                // RSS in bytes from sysinfo; convert to MiB for human
+                // readability in the report.
+                let rss_mib = (proc_.memory() as f64) / (1024.0 * 1024.0);
+                // CPU percentage is per-core (so 100% = one full core);
+                // 800% on M2 means all 8 cores are busy.
+                let cpu_pct = proc_.cpu_usage() as f64;
+                record_diagnostic(
+                    "system_sample",
+                    serde_json::json!({
+                        "rss_mib": rss_mib,
+                        "cpu_percent": cpu_pct,
+                    }),
+                );
+            }
+        }
+    });
+}
+
 /// Spawn the background thread that drains the raw event buffer to
 /// `timeline.jsonl` every `FLUSH_INTERVAL`. No-op if profiling is
 /// off or the session directory wasn't initialised.
