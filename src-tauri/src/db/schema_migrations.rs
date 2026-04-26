@@ -81,24 +81,17 @@ impl ImageDatabase {
     /// Bump `CURRENT_PIPELINE_VERSION` whenever a future change
     /// invalidates existing embeddings.
     pub(super) fn migrate_embedding_pipeline_version(&self) -> rusqlite::Result<()> {
-        // Version 3 — bumped 2026-04-26 with the Tier-1 + Tier-2 perf
-        // bundle. The R6 fast_image_resize swap changes the resize
-        // backend (image-rs CatmullRom → fast_image_resize Lanczos3);
-        // R7 changes the JPEG decode path (full decode → scaled IDCT
-        // for JPEGs). Both produce subtly different RGB buffers than
-        // the previous code, which means thumbnails AND any encoder
-        // reading from those preprocessed buffers will produce
-        // slightly different embeddings. Easier to wipe and re-encode
-        // than to live with a hybrid library where some embeddings
-        // came from the old buffers and some from the new.
+        // Version 4 — bumped 2026-04-26 with Phase 12e. Each encoder's
+        // preprocessing now uses fast_image_resize Lanczos3 instead of
+        // image-rs's CatmullRom (CLIP, DINOv2) or Triangle (SigLIP-2).
+        // Different filter, different output bytes, different
+        // embeddings. Wipe + re-encode is the cleaner path than living
+        // with hybrid distributions.
         //
-        // R8 also lands here: the legacy images.embedding column is
-        // no longer written by the encoder pipeline (CLIP only writes
-        // to the per-encoder embeddings table). The bump triggers a
-        // wipe of the legacy column so the cosine populate fallback
-        // (cosine/index.rs) sees an empty legacy column and reads only
-        // the per-encoder rows.
-        const CURRENT_PIPELINE_VERSION: i64 = 3;
+        // (Version 3 was the Tier-2 thumbnail-only resize change. The
+        // encoders kept their old image-rs paths until Phase 12e
+        // brought them onto fast_image_resize too.)
+        const CURRENT_PIPELINE_VERSION: i64 = 4;
 
         let conn = self.connection.lock().unwrap();
 

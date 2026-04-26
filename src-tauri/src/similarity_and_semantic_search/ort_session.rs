@@ -52,23 +52,47 @@ use ort::{
 use std::path::Path;
 use tracing::info;
 
-/// Build a `Session` from an ONNX model on disk with M2-tuned thread
-/// + optimisation settings.
-///
-/// `label` is included in the log line so a future perf report can
-/// confirm every encoder went through this path (vs an old
-/// `Session::builder()?.commit_from_file()` site that was missed).
+/// Default intra-thread count for an encoder when nothing else is
+/// running in parallel. Matches the M2 P-cluster size (4 perf cores).
+pub const DEFAULT_INTRA_THREADS: usize = 4;
+
+/// Build a `Session` from an ONNX model with the default intra-thread
+/// count (4). For encoders that may run in parallel with peers (image
+/// encoders during indexing), prefer `build_tuned_session_with_intra`
+/// and pass `4 / num_concurrent_encoders` so the total ORT thread
+/// count stays at 4 regardless of N.
 pub fn build_tuned_session(
     label: &str,
     model_path: &Path,
 ) -> Result<Session, ort::Error> {
+    build_tuned_session_with_intra(label, model_path, DEFAULT_INTRA_THREADS)
+}
+
+/// Phase 12c — build a `Session` with an explicit intra-thread count.
+///
+/// `intra_threads` is clamped to `[1, DEFAULT_INTRA_THREADS]` to keep
+/// the M2 P-cluster the upper bound. Caller computes the value (e.g.
+/// `4 / num_enabled_encoders` for image-encoder parallelism).
+///
+/// Why this exists: the perf-1777226449 report showed CLIP batches
+/// at 12.7s under Phase 11e's 3-encoder parallelism (vs 1.36s
+/// pre-parallel) — total ORT threads were 3 × 4 = 12 on the M2's
+/// 8 cores, and the contention was severe. Capping total threads at 4
+/// across all encoders restores per-encoder throughput while still
+/// letting the encoders run concurrently.
+pub fn build_tuned_session_with_intra(
+    label: &str,
+    model_path: &Path,
+    intra_threads: usize,
+) -> Result<Session, ort::Error> {
+    let intra = intra_threads.clamp(1, DEFAULT_INTRA_THREADS);
     let session = Session::builder()?
         .with_optimization_level(GraphOptimizationLevel::Level3)?
-        .with_intra_threads(4)?
+        .with_intra_threads(intra)?
         .with_inter_threads(1)?
         .commit_from_file(model_path)?;
     info!(
-        "ort session ready ({label}, Level3, intra=4, inter=1, path={})",
+        "ort session ready ({label}, Level3, intra={intra}, inter=1, path={})",
         model_path.display()
     );
     Ok(session)

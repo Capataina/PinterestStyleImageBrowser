@@ -45,7 +45,6 @@
 //! at the final LayerNorm.
 
 use image::ImageReader;
-use image::imageops::FilterType;
 use ort::{session::Session, value::Tensor};
 use std::{error::Error, path::Path};
 use tracing::{debug, info, warn};
@@ -79,11 +78,20 @@ pub struct Dinov2ImageEncoder {
 
 impl Dinov2ImageEncoder {
     pub fn new(model_path: &Path) -> Result<Self, Box<dyn Error>> {
-        info!("=== Initialising DINOv2-Base image encoder ===");
+        Self::new_with_intra(model_path, super::ort_session::DEFAULT_INTRA_THREADS)
+    }
+
+    /// Phase 12c — explicit intra-thread count. See ort_session.rs for
+    /// rationale.
+    pub fn new_with_intra(model_path: &Path, intra_threads: usize) -> Result<Self, Box<dyn Error>> {
+        info!("=== Initialising DINOv2-Base image encoder (intra={intra_threads}) ===");
         info!("model: {}", model_path.display());
 
-        // R4 — shared M2-tuned session builder (Level3 + intra=4).
-        let session = match super::ort_session::build_tuned_session("dinov2", model_path) {
+        let session = match super::ort_session::build_tuned_session_with_intra(
+            "dinov2",
+            model_path,
+            intra_threads,
+        ) {
             Ok(s) => s,
             Err(e) => {
                 warn!("DINOv2 image session init failed ({e}); cannot load encoder");
@@ -115,7 +123,9 @@ impl Dinov2ImageEncoder {
         // match to PIL.Image.BICUBIC (resample=3). Visually equivalent
         // for embedding similarity; not bit-exact but standard for
         // ONNX deployments outside Python.
-        let resized = image::imageops::resize(&img, new_w, new_h, FilterType::CatmullRom);
+        // Phase 12e — fast_image_resize Lanczos3 instead of image-rs's
+        // CatmullRom. Same ~7-13× speedup as the CLIP path.
+        let resized = super::preprocess::fast_resize_rgb8(&img, new_w, new_h, "dinov2");
 
         // Center-crop to CROP × CROP.
         let crop_x = (new_w.saturating_sub(CROP)) / 2;

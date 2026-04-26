@@ -6,3 +6,4 @@ pub mod encoder_siglip2;
 pub mod encoder_text;
 pub mod encoders;
 pub mod ort_session;
+pub mod preprocess;

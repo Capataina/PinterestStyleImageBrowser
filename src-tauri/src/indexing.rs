@@ -244,22 +244,55 @@ fn run_pipeline_inner(
     //     a spinner.
     {
         let models_dir = paths::models_dir();
-        let model_path = models_dir.join(crate::model_download::CLIP_TEXT_FILENAME);
-        let tokenizer_path = models_dir.join(crate::model_download::CLIP_TOKENIZER_FILENAME);
-        if model_path.exists() && tokenizer_path.exists() {
-            // Bind the State separately so its lifetime extends across
-            // the full block. Inlining `app.state::<TextEncoderState>()
-            // .encoder.lock()` produces a temporary that the borrow
-            // checker drops too early.
-            let text_encoder_state: tauri::State<'_, TextEncoderState> =
-                app.state::<TextEncoderState>();
+        // Bind the State separately so its lifetime extends across
+        // the full block. Inlining `app.state::<TextEncoderState>()
+        // .encoder.lock()` produces a temporary that the borrow
+        // checker drops too early.
+        let text_encoder_state: tauri::State<'_, TextEncoderState> =
+            app.state::<TextEncoderState>();
+
+        // CLIP text encoder pre-warm (was here before — unchanged).
+        let clip_model_path = models_dir.join(crate::model_download::CLIP_TEXT_FILENAME);
+        let clip_tokenizer_path =
+            models_dir.join(crate::model_download::CLIP_TOKENIZER_FILENAME);
+        if clip_model_path.exists() && clip_tokenizer_path.exists() {
             let lock_result = text_encoder_state.encoder.lock();
             if let Ok(mut lock) = lock_result {
                 if lock.is_none() {
-                    info!("pre-warming text encoder");
-                    match ClipTextEncoder::new(&model_path, &tokenizer_path) {
+                    info!("pre-warming CLIP text encoder");
+                    match ClipTextEncoder::new(&clip_model_path, &clip_tokenizer_path) {
                         Ok(encoder) => *lock = Some(encoder),
-                        Err(e) => warn!("text encoder pre-warm failed: {e}"),
+                        Err(e) => warn!("CLIP text encoder pre-warm failed: {e}"),
+                    }
+                }
+            }
+        }
+
+        // Phase 12d — SigLIP-2 text encoder pre-warm. Mirrors the CLIP
+        // path. Without this, the first text-image fusion query pays
+        // ~2.4s of model-load cost (perf-1777226449 outlier #8) for
+        // SigLIP-2 — visible to the user as a spinner. The CLIP text
+        // encoder gets a real-input pre-warm via encode("warmup")
+        // inside its own `new`; SigLIP-2 inherits the same on its own
+        // construction path, so loading the encoder here is enough to
+        // collapse the user-visible cold-start.
+        let siglip2_model_path = models_dir.join(
+            crate::similarity_and_semantic_search::encoder_siglip2::SIGLIP2_TEXT_MODEL_FILENAME,
+        );
+        let siglip2_tokenizer_path = models_dir.join(
+            crate::similarity_and_semantic_search::encoder_siglip2::SIGLIP2_TOKENIZER_FILENAME,
+        );
+        if siglip2_model_path.exists() && siglip2_tokenizer_path.exists() {
+            let lock_result = text_encoder_state.siglip2_encoder.lock();
+            if let Ok(mut lock) = lock_result {
+                if lock.is_none() {
+                    info!("pre-warming SigLIP-2 text encoder");
+                    match crate::similarity_and_semantic_search::encoder_siglip2::Siglip2TextEncoder::new(
+                        &siglip2_model_path,
+                        &siglip2_tokenizer_path,
+                    ) {
+                        Ok(encoder) => *lock = Some(encoder),
+                        Err(e) => warn!("SigLIP-2 text encoder pre-warm failed: {e}"),
                     }
                 }
             }
@@ -357,56 +390,26 @@ fn run_pipeline_inner(
     emit(app, Phase::Scan, total_found, total_found, None);
     drop(_scan_phase);
 
-    // 5. Thumbnails + encoder run in PARALLEL.
+    // 5. Thumbnails phase (rayon-parallel, runs to completion before
+    //    encoder phase begins).
     //
-    // Previously these were sequential phases — first thumbnails for
-    // every image (rayon-parallel), then embeddings (single-threaded
-    // CLIP) — so on a fresh ~1500-image library the user stared at
-    // a partially-empty grid for ~80s waiting for the encoder to
-    // finish. Now they run concurrently:
+    // Phase 12b reverted the previous "thumbnails + encoder in parallel"
+    // overlap. That was a sound design when the encoder phase was
+    // single-threaded — adding it to the rayon pool was tolerable. With
+    // Phase 11e's per-encoder parallel execution (3 encoder threads,
+    // each with its own ORT pool of 4 intra threads = 12 ORT threads
+    // total) the thumbnail rayon workers were fighting 12 ORT threads
+    // for the M2's 8 cores. The perf-1777226449 report showed CLIP
+    // batches ballooning from 1.36s to ~12s under that contention, AND
+    // the thumbnail wallclock per image rose from 19ms to 222ms.
     //
-    //   - The thumbnail rayon loop occupies the CPU pool
-    //   - The encoder runs on a dedicated thread with its own DB
-    //     connection (WAL mode lets concurrent writes coexist —
-    //     thumbnails write `thumbnail_path/width/height`, the encoder
-    //     writes `embedding`; different columns, no row-level conflict)
-    //
-    // The thumbnail phase finishes first (rayon makes it ~10× faster
-    // than encoder per-image), so the user sees a fully populated
-    // grid in ~7s while the encoder cooks in the background. Cosine
-    // repopulate joins both before running.
-    //
-    // The encoder phase span lives inside its spawned thread so the
-    // perf report still attributes its time correctly.
+    // Doing thumbnails first exclusively (rayon owns the CPU) and then
+    // encoders (parallel encoder threads own the CPU) gives each phase
+    // a clean run at the hardware. We trade "user sees partial grid
+    // earlier" for "everything finishes faster overall" — and the user
+    // already sees thumbnails as they generate via the foreground
+    // get_images polling, so the latency cost is small.
     let image_model_path = paths::models_dir().join(crate::model_download::CLIP_VISION_FILENAME);
-    let encoder_handle: Option<thread::JoinHandle<Result<(), String>>> =
-        if image_model_path.exists() {
-            let app = app.clone();
-            let db_path_for_encoder = db_path.to_string();
-            let model_path = image_model_path.clone();
-            // Clone the cosine state Arcs into the spawned thread so
-            // it can hot-populate the cache after the priority encoder
-            // finishes — without waiting for the bulk populate at the
-            // end of run_pipeline_inner.
-            let cosine_index_for_encoder = cosine_index.clone();
-            let cosine_current_encoder_for_encoder = cosine_current_encoder.clone();
-            Some(thread::spawn(move || {
-                run_encoder_phase(
-                    &app,
-                    &db_path_for_encoder,
-                    &model_path,
-                    &cosine_index_for_encoder,
-                    &cosine_current_encoder_for_encoder,
-                )
-            }))
-        } else {
-            warn!(
-                "{} missing; embeddings will be \
-                 empty until next launch.",
-                crate::model_download::CLIP_VISION_FILENAME
-            );
-            None
-        };
 
     let _thumb_phase = tracing::info_span!("pipeline.thumbnail_phase").entered();
     //
@@ -478,15 +481,28 @@ fn run_pipeline_inner(
     emit(app, Phase::Thumbnail, total_thumbs, total_thumbs, None);
     drop(_thumb_phase);
 
-    // Join the encoder thread that was spawned before the thumbnail
-    // loop. Cosine repopulate (next step) needs every embedding
-    // committed to disk first, so this barrier is load-bearing.
-    if let Some(handle) = encoder_handle {
-        match handle.join() {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => warn!("encoder phase failed: {e}"),
-            Err(_) => warn!("encoder thread panicked"),
+    // 6. Encoder phase (Phase 12b: now strictly after thumbnails). The
+    //    inside of `run_encoder_phase` still spawns one thread per
+    //    enabled encoder via Phase 11e, so multiple encoders run
+    //    concurrently — they just don't overlap with the thumbnail
+    //    rayon loop above. Phase 12c also tunes intra_threads
+    //    dynamically based on how many encoders are enabled, so the
+    //    total ORT thread count stays at 4 regardless of N.
+    if image_model_path.exists() {
+        if let Err(e) = run_encoder_phase(
+            app,
+            db_path,
+            &image_model_path,
+            cosine_index,
+            cosine_current_encoder,
+        ) {
+            warn!("encoder phase failed: {e}");
         }
+    } else {
+        warn!(
+            "{} missing; embeddings will be empty until next launch.",
+            crate::model_download::CLIP_VISION_FILENAME
+        );
     }
 
     // 7. Final safety-net cosine populate.
@@ -607,6 +623,19 @@ fn run_encoder_phase(
         crate::similarity_and_semantic_search::encoder_dinov2::DINOV2_IMAGE_MODEL_FILENAME,
     );
 
+    // Phase 12c — dynamic intra_threads. Total ORT thread budget across
+    // all enabled encoders stays at 4 (M2 P-cluster). With N=1, each
+    // encoder gets 4 threads. With N=3, each gets 1. Avoids the perf-
+    // 1777226449 12-threads-on-8-cores oversubscription.
+    let intra_per_encoder = (super::similarity_and_semantic_search::ort_session::DEFAULT_INTRA_THREADS
+        / enabled.len().max(1))
+        .max(1);
+    info!(
+        "encoder phase: spawning {} threads, intra_threads={} each",
+        enabled.len(),
+        intra_per_encoder
+    );
+
     // Spawn one thread per enabled encoder. Each thread is independent
     // (own DB connection, own ORT session, own progress events) so
     // they don't have to coordinate during the loop.
@@ -619,6 +648,7 @@ fn run_encoder_phase(
         let image_model_path = image_model_path.to_path_buf();
         let siglip2_path = siglip2_path.clone();
         let dinov2_path = dinov2_path.clone();
+        let intra = intra_per_encoder;
 
         handles.push(thread::spawn(move || -> Result<(), String> {
             // Per-thread DB. Two connections (writer + read-only
@@ -633,14 +663,16 @@ fn run_encoder_phase(
             database.initialize().map_err(|e| e.to_string())?;
 
             match encoder_id.as_str() {
-                "clip_vit_b_32" => run_clip_encoder(&app, &database, &image_model_path),
+                "clip_vit_b_32" => {
+                    run_clip_encoder_with_intra(&app, &database, &image_model_path, intra)
+                }
                 "siglip2_base" => {
                     if siglip2_path.exists() {
                         run_trait_encoder(
                             &app,
                             &database,
                             "siglip2_base",
-                            || crate::similarity_and_semantic_search::encoder_siglip2::Siglip2ImageEncoder::new(&siglip2_path),
+                            || crate::similarity_and_semantic_search::encoder_siglip2::Siglip2ImageEncoder::new_with_intra(&siglip2_path, intra),
                         )
                     } else {
                         warn!(
@@ -656,7 +688,7 @@ fn run_encoder_phase(
                             &app,
                             &database,
                             crate::similarity_and_semantic_search::encoder_dinov2::DINOV2_ENCODER_ID,
-                            || crate::similarity_and_semantic_search::encoder_dinov2::Dinov2ImageEncoder::new(&dinov2_path),
+                            || crate::similarity_and_semantic_search::encoder_dinov2::Dinov2ImageEncoder::new_with_intra(&dinov2_path, intra),
                         )
                     } else {
                         warn!(
@@ -719,10 +751,16 @@ fn run_encoder_phase(
 /// reader) AND the new `embeddings` table row keyed by encoder_id.
 /// This double-write goes away in a future migration once everyone
 /// has re-indexed.
-fn run_clip_encoder(
+/// Phase 12c — CLIP encoder loop. Takes an explicit intra-thread
+/// count so the indexing pipeline can size each parallel encoder's
+/// ORT pool appropriately. See `ort_session.rs::build_tuned_session_with_intra`.
+/// (The previous `run_clip_encoder(app, db, path)` wrapper was
+/// dropped — every caller goes through the with-intra form now.)
+fn run_clip_encoder_with_intra(
     app: &AppHandle,
     database: &ImageDatabase,
     model_path: &Path,
+    intra_threads: usize,
 ) -> Result<(), String> {
     let needs_embed = database
         .get_images_without_embeddings()
@@ -734,7 +772,8 @@ fn run_clip_encoder(
     emit(app, Phase::Encode, 0, total, Some("Encoding (CLIP)".into()));
 
     let run_started = std::time::Instant::now();
-    let mut encoder = ClipImageEncoder::new(model_path).map_err(|e| e.to_string())?;
+    let mut encoder = ClipImageEncoder::new_with_intra(model_path, intra_threads)
+        .map_err(|e| e.to_string())?;
     const BATCH_SIZE: usize = 32;
     let mut processed = 0usize;
     let mut succeeded = 0usize;

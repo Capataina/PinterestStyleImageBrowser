@@ -38,27 +38,23 @@ pub struct ClipImageEncoder {
 
 impl ClipImageEncoder {
     pub fn new(model_path: &Path) -> Result<Self, Box<dyn Error>> {
-        info!("=== Initializing image encoder ===");
+        Self::new_with_intra(model_path, super::ort_session::DEFAULT_INTRA_THREADS)
+    }
 
-        // Try the platform-appropriate accelerator first; fall back to
-        // CPU on any error. ort's `with_execution_providers` is unusual
-        // in that it succeeds even if the provider couldn't actually
-        // register — ort logs the rejection at warn level and the
-        // session ends up running on CPU. That's why the previous code
-        // appeared to "succeed with CUDA" on machines without CUDA. We
-        // now check the rejection by inspecting whether ort's logs
-        // contain the registered provider; absent that, we just trust
-        // ort to do the right thing and avoid claiming a specific EP.
-        match Self::build_session_with_accel(model_path) {
+    /// Phase 12c — explicit intra-thread count. Indexing pipeline
+    /// computes `4 / num_enabled_encoders` and passes it through so
+    /// concurrent encoders share the M2 P-cluster instead of all
+    /// asking for 4 threads each.
+    pub fn new_with_intra(model_path: &Path, intra_threads: usize) -> Result<Self, Box<dyn Error>> {
+        info!("=== Initializing image encoder (intra={intra_threads}) ===");
+        match Self::build_session_with_accel(model_path, intra_threads) {
             Ok(session) => Ok(ClipImageEncoder { session }),
             Err(e) => {
-                warn!(
-                    "accelerator initialization failed ({e}); falling back to CPU"
-                );
-                // R4 — fall through to the shared tuned builder.
-                let session = super::ort_session::build_tuned_session(
+                warn!("accelerator initialization failed ({e}); falling back to CPU");
+                let session = super::ort_session::build_tuned_session_with_intra(
                     "clip_image_fallback",
                     model_path,
+                    intra_threads,
                 )?;
                 Ok(ClipImageEncoder { session })
             }
@@ -66,26 +62,29 @@ impl ClipImageEncoder {
     }
 
     #[cfg(target_os = "macos")]
-    fn build_session_with_accel(model_path: &Path) -> Result<Session, Box<dyn Error>> {
-        // macOS: CPU-only because CoreML's runtime inference errors on
-        // CLIP's image graph despite accepting the partition at compile
-        // time. See top-of-file comment for the full diagnosis.
-        // R4 — use the shared M2-tuned builder so this CPU path gets
-        // Level3 + intra=4 instead of ORT's default 8-thread auto-pool.
+    fn build_session_with_accel(
+        model_path: &Path,
+        intra_threads: usize,
+    ) -> Result<Session, Box<dyn Error>> {
         info!("image encoder using CPU (CoreML disabled — see encoder.rs header)");
-        let session = super::ort_session::build_tuned_session(
+        let session = super::ort_session::build_tuned_session_with_intra(
             "clip_image",
             model_path,
+            intra_threads,
         )?;
         Ok(session)
     }
 
     #[cfg(not(target_os = "macos"))]
-    fn build_session_with_accel(model_path: &Path) -> Result<Session, Box<dyn Error>> {
+    fn build_session_with_accel(
+        model_path: &Path,
+        _intra_threads: usize,
+    ) -> Result<Session, Box<dyn Error>> {
         info!("trying CUDA execution provider");
-        // CUDA path: keep the existing builder + EP setup. R4's
-        // M2-specific intra_threads(4) tuning is irrelevant when CUDA
-        // is doing the work, and Level3 is on by default for GPU EPs.
+        // CUDA path: keep the existing builder + EP setup. The M2
+        // intra_threads tuning is irrelevant when CUDA is doing the
+        // work, and Level3 is on by default for GPU EPs. Underscore
+        // the parameter to silence unused-arg warnings.
         let session = Session::builder()?
             .with_execution_providers([CUDAExecutionProvider::default().build()])?
             .commit_from_file(model_path)?;
@@ -140,7 +139,9 @@ impl ClipImageEncoder {
             let new_w = (orig_w as f32 * (new_h as f32 / orig_h as f32)).round() as u32;
             (new_w, new_h)
         };
-        let resized = image::imageops::resize(&img, new_w, new_h, image::imageops::FilterType::CatmullRom);
+        // Phase 12e — fast_image_resize Lanczos3 instead of image-rs's
+        // CatmullRom. ~7-13× speedup for the same quality on M2 NEON.
+        let resized = super::preprocess::fast_resize_rgb8(&img, new_w, new_h, "clip_image");
         let crop_x = (new_w.saturating_sub(CROP)) / 2;
         let crop_y = (new_h.saturating_sub(CROP)) / 2;
         let img = image::imageops::crop_imm(&resized, crop_x, crop_y, CROP, CROP).to_image();

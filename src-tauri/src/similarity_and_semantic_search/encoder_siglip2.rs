@@ -57,11 +57,10 @@
 //! suffix — the non-suffixed variant returned 401.
 
 use image::ImageReader;
-use image::imageops::FilterType;
 use ort::{session::Session, value::Tensor};
 use std::{error::Error, path::Path};
 use tokenizers::Tokenizer;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::encoder_text::pooling::normalize;
 use super::encoders::{ImageEncoder, TextEncoder as TextEncoderTrait};
@@ -102,12 +101,17 @@ pub struct Siglip2ImageEncoder {
 
 impl Siglip2ImageEncoder {
     pub fn new(model_path: &Path) -> Result<Self, Box<dyn Error>> {
-        info!("=== Initialising SigLIP-2 image encoder ===");
+        Self::new_with_intra(model_path, super::ort_session::DEFAULT_INTRA_THREADS)
+    }
+
+    /// Phase 12c — explicit intra-thread count. See ort_session.rs.
+    pub fn new_with_intra(model_path: &Path, intra_threads: usize) -> Result<Self, Box<dyn Error>> {
+        info!("=== Initialising SigLIP-2 image encoder (intra={intra_threads}) ===");
         info!("model: {}", model_path.display());
-        // R4 — shared M2-tuned session builder.
-        let session = super::ort_session::build_tuned_session(
+        let session = super::ort_session::build_tuned_session_with_intra(
             "siglip2_image",
             model_path,
+            intra_threads,
         )?;
         Ok(Self { session })
     }
@@ -120,7 +124,12 @@ impl Siglip2ImageEncoder {
             .with_guessed_format()?
             .decode()?
             .to_rgb8();
-        let resized = image::imageops::resize(&img, IMG_SIZE, IMG_SIZE, FilterType::Triangle);
+        // Phase 12e — fast_image_resize Lanczos3 instead of image-rs's
+        // Triangle (bilinear). Slight quality upgrade (Lanczos3 ≥
+        // bilinear) plus the ~7-13× speedup. SigLIP-2's stretched-square
+        // resize doesn't preserve aspect, so the filter quality matters
+        // less than for aspect-preserving resizes — but free is free.
+        let resized = super::preprocess::fast_resize_rgb8(&img, IMG_SIZE, IMG_SIZE, "siglip2_image");
 
         let plane = (IMG_SIZE * IMG_SIZE) as usize;
         let mut tensor: Vec<f32> = Vec::with_capacity(3 * plane);
@@ -219,11 +228,25 @@ impl Siglip2TextEncoder {
             model_path,
         )?;
 
-        Ok(Self {
+        let mut encoder = Self {
             session,
             tokenizer,
             max_seq_length: MAX_SEQ,
-        })
+        };
+
+        // Phase 12d — real-input pre-warm. Same pattern as the CLIP
+        // text encoder. Without this, the first SigLIP-2 text query
+        // pays ORT's first-inference initialisation tax (perf-1777226449
+        // captured this as a 2.41s outlier on `ipc.get_fused_semantic_search`).
+        // Running encode("warmup") here moves the cost off the user's
+        // interactive path. We don't care about the result.
+        use crate::similarity_and_semantic_search::encoders::TextEncoder as TextEncoderTrait;
+        match encoder.encode("warmup") {
+            Ok(_) => info!("SigLIP-2 text encoder real-input pre-warm complete"),
+            Err(e) => warn!("SigLIP-2 text encoder pre-warm inference failed: {e}"),
+        }
+
+        Ok(encoder)
     }
 
     /// Tokenise + pad/truncate to `max_seq_length`. The Gemma

@@ -4,9 +4,19 @@ import { ImageData, ImageItem, SimilarImageItem } from "../types";
 import { perfInvoke } from "./perf";
 import { formatApiError } from "./apiError";
 
-// Default dimensions if backend doesn't provide them (fallback)
-const DEFAULT_WIDTH = 800;
-const DEFAULT_HEIGHT = 600;
+// Placeholder dimensions used when an image hasn't been thumbnailed
+// yet (NULL width/height in the DB). 1:1 square is the symmetric
+// least-bad choice — reflows minimally to either landscape or portrait
+// when the actual aspect arrives, AND looks visually intentional as a
+// loading placeholder. Was 800×600 (4:3) historically; that produced
+// the visible "tall vertical placeholders next to actual 16:9 photos"
+// jank during Phase 11. Phase 12a settles on 1:1.
+//
+// Picking the same value for both means rendered tiles default to a
+// square — the masonry packer treats this the same as any other
+// aspect, so the tile takes column-width × column-width pixels.
+const PLACEHOLDER_WIDTH = 400;
+const PLACEHOLDER_HEIGHT = 400;
 
 /** Frontend-side sort modes. Backend always returns stable order
  *  (by id ASC); we apply name/added/shuffle here. The shuffle uses
@@ -30,41 +40,33 @@ export async function fetchImages(
 
     // Convert backend data to frontend ImageItem format.
     //
-    // Filter out images that haven't been thumbnailed yet (NULL
-    // width/height in the DB). The Masonry layout sizes each tile by
-    // aspect ratio; rows with missing dimensions used to fall back to
-    // the 800×600 default, which produced a visibly mixed grid during
-    // indexing — placeholder tiles rendered at 4:3 next to actual
-    // ~16:9 phone photos. The user's report described it as "really
-    // vertical [tiles] and weird spacing between them."
+    // Phase 12a fix: render every scanned image, with a 1:1 square
+    // placeholder for rows whose thumbnail hasn't been generated yet
+    // (NULL width/height). Phase 11a tried to fix the layout-jank
+    // problem by FILTERING OUT those rows, which produced the worse
+    // bug of "No images yet" appearing for a fully-scanned library
+    // whose initial get_images call landed before the first thumbnail
+    // batch finished.
     //
-    // Better UX: skip the row entirely until its thumbnail is generated
-    // (which is what populates width/height in the DB). The status pill
-    // already shows progress; the grid populates progressively as
-    // thumbnails land. Layout never reshuffles mid-encoding.
-    //
-    // The DEFAULT_WIDTH/DEFAULT_HEIGHT constants are kept as a
-    // belt-and-braces fallback in case a row somehow gets through with
-    // partial dimensions, but the filter below means they should
-    // basically never fire in practice.
-    const images: ImageItem[] = imagesDB
-      .filter((img) => img.width != null && img.height != null)
-      .map((img) => {
-        const url = convertFileSrc(img.path);
-        const thumbnailUrl = img.thumbnail_path
-          ? convertFileSrc(img.thumbnail_path)
-          : url;
+    // Square placeholder is the symmetric least-bad: minimal reflow
+    // when actual aspect arrives, looks visually intentional as a
+    // loading state. The status pill still shows real progress.
+    const images: ImageItem[] = imagesDB.map((img) => {
+      const url = convertFileSrc(img.path);
+      const thumbnailUrl = img.thumbnail_path
+        ? convertFileSrc(img.thumbnail_path)
+        : url;
 
-        return {
-          id: img.id,
-          name: img.name,
-          url,
-          thumbnailUrl,
-          width: img.width ?? DEFAULT_WIDTH,
-          height: img.height ?? DEFAULT_HEIGHT,
-          tags: img.tags,
-        };
-      });
+      return {
+        id: img.id,
+        name: img.name,
+        url,
+        thumbnailUrl,
+        width: img.width ?? PLACEHOLDER_WIDTH,
+        height: img.height ?? PLACEHOLDER_HEIGHT,
+        tags: img.tags,
+      };
+    });
 
     // Apply sort mode frontend-side. Backend returned stable order
     // by id; we re-order here as the user prefers.
@@ -234,8 +236,8 @@ function mapImageSearchResult(res: {
     thumbnailUrl: res.thumbnail_path
       ? convertFileSrc(res.thumbnail_path)
       : convertFileSrc(getThumbnailPath(res.id)),
-    width: res.width ?? DEFAULT_WIDTH,
-    height: res.height ?? DEFAULT_HEIGHT,
+    width: res.width ?? PLACEHOLDER_WIDTH,
+    height: res.height ?? PLACEHOLDER_HEIGHT,
     score: res.score,
     name: res.path.split(/[\\/]/).pop() ?? res.path,
   };
