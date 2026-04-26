@@ -1,6 +1,5 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import { getImageSize } from "../utils";
 import { ImageData, ImageItem, SimilarImageItem } from "../types";
 
 // Default dimensions if backend doesn't provide them (fallback)
@@ -191,58 +190,50 @@ export async function setScanRoot(path: string): Promise<void> {
   }
 }
 
+/**
+ * Map a backend ImageSearchResult into the frontend's SimilarImageItem
+ * shape. All three search commands (semantic, similar, tiered) now
+ * return the same struct (audit consolidation), so this single helper
+ * covers every call site.
+ *
+ * Backend supplies thumbnail_path/width/height when the image was
+ * thumbnailed at indexing time. Legacy DB rows may lack them; fall
+ * back to the canonical thumb_{id}.jpg path + default dimensions.
+ */
+function mapImageSearchResult(res: {
+  id: number;
+  path: string;
+  score: number;
+  thumbnail_path?: string;
+  width?: number;
+  height?: number;
+}): SimilarImageItem {
+  return {
+    id: res.id,
+    path: res.path,
+    url: convertFileSrc(res.path),
+    thumbnailUrl: res.thumbnail_path
+      ? convertFileSrc(res.thumbnail_path)
+      : convertFileSrc(getThumbnailPath(res.id)),
+    width: res.width ?? DEFAULT_WIDTH,
+    height: res.height ?? DEFAULT_HEIGHT,
+    score: res.score,
+    name: res.path.split(/[\\/]/).pop() ?? res.path,
+  };
+}
+
 export async function fetchSimilarImages(imageId: number, topN: number = 8) {
   try {
-    const results: { id: number; path: string; score: number }[] = await invoke(
+    // Backend now returns the unified ImageSearchResult shape
+    // (thumbnail_path/width/height included). Audit Performance
+    // finding: dimensions used to be fetched frontend-side via
+    // N parallel `getImageSize` DOM image loads — gone now,
+    // a single IPC round-trip carries the full payload.
+    const results: Parameters<typeof mapImageSearchResult>[0][] = await invoke(
       "get_similar_images",
-      {
-        imageId,
-        topN,
-      }
+      { imageId, topN }
     );
-
-    // For similar images, we need to get dimensions
-    // We'll load them in parallel but with a concurrency limit
-    const images = await Promise.all(
-      results.map(async (res) => {
-        const url = convertFileSrc(res.path);
-        const thumbnailPath = getThumbnailPath(res.id);
-        const thumbnailUrl = convertFileSrc(thumbnailPath);
-
-        // Try to get dimensions from thumbnail (faster) or fall back to full image
-        let width = DEFAULT_WIDTH;
-        let height = DEFAULT_HEIGHT;
-        try {
-          const size = await getImageSize(thumbnailUrl);
-          // Scale up dimensions since thumbnail is smaller
-          // This is approximate but good enough for layout
-          width = size.width;
-          height = size.height;
-        } catch {
-          // Thumbnail doesn't exist, try full image
-          try {
-            const size = await getImageSize(url);
-            width = size.width;
-            height = size.height;
-          } catch {
-            // Use defaults
-          }
-        }
-
-        return {
-          id: res.id,
-          path: res.path,
-          url,
-          thumbnailUrl,
-          width,
-          height,
-          score: res.score,
-          name: res.path.split(/[\\/]/).pop() ?? res.path,
-        };
-      })
-    );
-
-    return images;
+    return results.map(mapImageSearchResult);
   } catch (error) {
     console.error("[Frontend] Error in fetchSimilarImages:", error);
     throw new Error(`Failed to fetch similar images: ${error}`);
@@ -251,49 +242,11 @@ export async function fetchSimilarImages(imageId: number, topN: number = 8) {
 
 export async function fetchTieredSimilarImages(imageId: number) {
   try {
-    const results: { id: number; path: string; score: number }[] = await invoke(
+    const results: Parameters<typeof mapImageSearchResult>[0][] = await invoke(
       "get_tiered_similar_images",
       { imageId }
     );
-
-    // For tiered similar images, construct thumbnail URLs and get dimensions
-    const images = await Promise.all(
-      results.map(async (res) => {
-        const url = convertFileSrc(res.path);
-        const thumbnailPath = getThumbnailPath(res.id);
-        const thumbnailUrl = convertFileSrc(thumbnailPath);
-
-        // Try to get dimensions from thumbnail (faster) or fall back to full image
-        let width = DEFAULT_WIDTH;
-        let height = DEFAULT_HEIGHT;
-        try {
-          const size = await getImageSize(thumbnailUrl);
-          width = size.width;
-          height = size.height;
-        } catch {
-          try {
-            const size = await getImageSize(url);
-            width = size.width;
-            height = size.height;
-          } catch {
-            // Use defaults
-          }
-        }
-
-        return {
-          id: res.id,
-          path: res.path,
-          url,
-          thumbnailUrl,
-          width,
-          height,
-          score: res.score,
-          name: res.path.split(/[\\/]/).pop() ?? res.path,
-        };
-      })
-    );
-
-    return images;
+    return results.map(mapImageSearchResult);
   } catch (error) {
     console.error("[Frontend] Error in fetchTieredSimilarImages:", error);
     throw new Error(`Failed to fetch tiered similar images: ${error}`);
@@ -312,28 +265,11 @@ export async function semanticSearch(
   topN: number = 50
 ): Promise<SimilarImageItem[]> {
   try {
-    const results: {
-      id: number;
-      path: string;
-      score: number;
-      thumbnail_path?: string;
-      width?: number;
-      height?: number;
-    }[] = await invoke("semantic_search", { query, topN });
-
-    // Convert backend results to frontend format
-    return results.map((res) => ({
-      id: res.id,
-      path: res.path,
-      url: convertFileSrc(res.path),
-      thumbnailUrl: res.thumbnail_path
-        ? convertFileSrc(res.thumbnail_path)
-        : convertFileSrc(getThumbnailPath(res.id)),
-      width: res.width ?? DEFAULT_WIDTH,
-      height: res.height ?? DEFAULT_HEIGHT,
-      score: res.score,
-      name: res.path.split(/[\\/]/).pop() ?? res.path,
-    }));
+    const results: Parameters<typeof mapImageSearchResult>[0][] = await invoke(
+      "semantic_search",
+      { query, topN }
+    );
+    return results.map(mapImageSearchResult);
   } catch (error) {
     console.error("[Frontend] Error in semanticSearch:", error);
     throw new Error(`Semantic search failed: ${error}`);

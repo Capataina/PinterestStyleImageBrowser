@@ -13,18 +13,24 @@ use crate::{
     tag_struct::Tag,
 };
 
+/// Unified image-search result returned by every cosine/semantic
+/// command (semantic_search, get_similar_images, get_tiered_similar_images).
+///
+/// Audit finding: `ImageSearchResult` and `ImageSearchResult` used to be
+/// two near-identical structs — only difference was that the semantic
+/// variant carried thumbnail enrichment. After the
+/// "dimensions-to-backend" finding lands (this commit), all three
+/// commands need the same fields, so they share one type. Field
+/// shape preserved across both legacy struct names — this is a strict
+/// superset of what `ImageSearchResult` used to send.
 #[derive(serde::Serialize)]
-struct SimilarImage {
+struct ImageSearchResult {
     id: ID,
     path: String,
     score: f32,
-}
-
-#[derive(serde::Serialize)]
-struct SemanticSearchResult {
-    id: ID,
-    path: String,
-    score: f32,
+    /// Absolute path to the thumbnail JPEG. None for legacy DB rows
+    /// that pre-date the thumbnail migration; the frontend's
+    /// `getThumbnailPath(id)` fallback covers this case.
     thumbnail_path: Option<String>,
     width: Option<u32>,
     height: Option<u32>,
@@ -413,7 +419,7 @@ fn semantic_search(
     text_encoder_state: State<'_, TextEncoderState>,
     query: String,
     top_n: usize,
-) -> Result<Vec<SemanticSearchResult>, String> {
+) -> Result<Vec<ImageSearchResult>, String> {
     use ndarray::Array1;
 
     info!(
@@ -502,11 +508,11 @@ fn semantic_search(
     // pattern across all three).
     let all_images = db.get_all_images().ok();
 
-    // Convert results to SemanticSearchResult with thumbnail info.
+    // Convert results to ImageSearchResult with thumbnail info.
     // Path resolution + Windows-prefix normalisation is shared via
     // `resolve_image_id_for_cosine_path` (audit: extracted from the
     // triplicated normalize_path closure + 3-strategy lookup block).
-    let results: Vec<SemanticSearchResult> = raw_results
+    let results: Vec<ImageSearchResult> = raw_results
         .into_iter()
         .filter_map(|(path, score)| {
             let image_info =
@@ -519,7 +525,7 @@ fn semantic_search(
                     .map(|(tp, w, h)| (Some(tp), Some(w), Some(h)))
                     .unwrap_or((None, None, None));
 
-                SemanticSearchResult {
+                ImageSearchResult {
                     id,
                     path: final_path,
                     score,
@@ -561,7 +567,7 @@ fn get_tiered_similar_images(
     db: State<'_, ImageDatabase>,
     cosine_state: State<'_, CosineIndexState>,
     image_id: i64,
-) -> Result<Vec<SimilarImage>, String> {
+) -> Result<Vec<ImageSearchResult>, String> {
     use ndarray::Array1;
     use std::path::PathBuf;
 
@@ -600,15 +606,31 @@ fn get_tiered_similar_images(
     let query = Array1::from_vec(embedding);
     let raw_results = index.get_tiered_similar_images(&query, exclude_path.as_ref());
 
-    // Path resolution shared via `resolve_image_id_for_cosine_path`.
-    let results: Vec<SimilarImage> = raw_results
+    // Path resolution + thumbnail enrichment. The dimensions used to
+    // be fetched frontend-side via N parallel `getImageSize` DOM image
+    // loads (audit Performance finding) — moved to backend here so
+    // the result lands fully-populated in one IPC round-trip. Uses
+    // the same `db.get_image_thumbnail_info` helper that
+    // `semantic_search` already calls.
+    let results: Vec<ImageSearchResult> = raw_results
         .into_iter()
         .filter_map(|(path, score)| {
             resolve_image_id_for_cosine_path(&db, &path, Some(&all_images)).map(
-                |(id, final_path)| SimilarImage {
-                    id,
-                    path: final_path,
-                    score,
+                |(id, final_path)| {
+                    let (thumbnail_path, width, height) = db
+                        .get_image_thumbnail_info(id)
+                        .ok()
+                        .flatten()
+                        .map(|(tp, w, h)| (Some(tp), Some(w), Some(h)))
+                        .unwrap_or((None, None, None));
+                    ImageSearchResult {
+                        id,
+                        path: final_path,
+                        score,
+                        thumbnail_path,
+                        width,
+                        height,
+                    }
                 },
             )
         })
@@ -629,7 +651,7 @@ fn get_similar_images(
     cosine_state: State<'_, CosineIndexState>,
     image_id: i64,
     top_n: usize,
-) -> Result<Vec<SimilarImage>, String> {
+) -> Result<Vec<ImageSearchResult>, String> {
     use ndarray::Array1;
     use std::path::PathBuf;
 
@@ -701,12 +723,12 @@ fn get_similar_images(
         }
     }
 
-    debug!("Converting results to SimilarImage structs...");
+    debug!("Converting results to ImageSearchResult structs...");
 
     // Path resolution shared via `resolve_image_id_for_cosine_path`
     // (audit: extracted from triplicated normalize_path closure +
     // 60-line lookup block).
-    let results: Vec<SimilarImage> = raw_results
+    let results: Vec<ImageSearchResult> = raw_results
         .into_iter()
         .filter_map(|(path, score)| {
             let info = resolve_image_id_for_cosine_path(&db, &path, Some(&all_images));
@@ -723,10 +745,23 @@ fn get_similar_images(
                     id,
                     score
                 );
-                SimilarImage {
+                // Enrich with thumbnail info — same pattern as
+                // semantic_search and get_tiered_similar_images. Saves
+                // the frontend N parallel `getImageSize` DOM image
+                // loads (audit Performance finding).
+                let (thumbnail_path, width, height) = db
+                    .get_image_thumbnail_info(id)
+                    .ok()
+                    .flatten()
+                    .map(|(tp, w, h)| (Some(tp), Some(w), Some(h)))
+                    .unwrap_or((None, None, None));
+                ImageSearchResult {
                     id,
                     path: final_path,
                     score,
+                    thumbnail_path,
+                    width,
+                    height,
                 }
             })
         })
