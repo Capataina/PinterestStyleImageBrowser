@@ -7,14 +7,41 @@ use std::path::PathBuf;
 use std::time::Instant;
 use tracing::{debug, info, warn};
 
+/// Comparator for `(usize, f32)` similarity tuples — sorts by score
+/// descending, NaN-tolerant. Pulled out as a free function so the
+/// three retrieval methods + `select_nth_unstable_by` and `sort_by`
+/// both reference one definition (was previously triplicated inline).
+///
+/// NaN is treated as smaller than every real number — a NaN score is
+/// never preferred over a real score. Two NaNs compare equal.
+fn score_cmp_desc(a: &(usize, f32), b: &(usize, f32)) -> std::cmp::Ordering {
+    match (b.1.is_nan(), a.1.is_nan()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater, // b is NaN, a wins
+        (false, true) => std::cmp::Ordering::Less,    // a is NaN, b wins
+        (false, false) => b.1.partial_cmp(&a.1).unwrap(),
+    }
+}
+
 pub struct CosineIndex {
     pub cached_images: Vec<(PathBuf, Array1<f32>)>,
+    /// Reusable scratch buffer for per-query similarity calculations.
+    /// Holds `(index_into_cached_images, similarity)` tuples — keyed
+    /// by index so the inner loop never clones a `PathBuf`. Cleared
+    /// on entry to each retrieval method, capacity is preserved.
+    ///
+    /// Composes with `select_nth_unstable_by` (used by
+    /// `get_similar_images_sorted` and the diversity-pool prefix in
+    /// `get_similar_images`) to make warm queries effectively
+    /// allocation-free in the inner loop.
+    scratch: Vec<(usize, f32)>,
 }
 
 impl CosineIndex {
     pub fn new() -> Self {
         CosineIndex {
             cached_images: Vec::new(),
+            scratch: Vec::new(),
         }
     }
 
@@ -177,7 +204,7 @@ impl CosineIndex {
     // exclude_path: optional path to exclude from results (e.g., the query image itself)
     #[tracing::instrument(name = "cosine.get_similar_images", skip(self, embedding, exclude_path), fields(cached = self.cached_images.len(), top_n))]
     pub fn get_similar_images(
-        &self,
+        &mut self,
         embedding: &Array1<f32>,
         top_n: usize,
         exclude_path: Option<&PathBuf>,
@@ -189,82 +216,73 @@ impl CosineIndex {
             exclude_path
         );
 
+        // Step 1: compute similarities for every cached image (except the
+        // optionally-excluded query image) into the reusable scratch
+        // buffer. Indices into cached_images, NOT cloned PathBufs — we
+        // only clone the paths that actually survive into the final result.
+        self.scratch.clear();
         let mut excluded_count = 0;
-        let mut similarities: Vec<(PathBuf, f32)> = self
-            .cached_images
-            .iter()
-            .filter_map(|(path, emb)| {
-                // Exclude the query image itself
-                if let Some(exclude) = exclude_path {
-                    if path == exclude {
-                        excluded_count += 1;
-                        debug!(
-                            "Excluding query image: {:?}",
-                            path.file_name().unwrap_or_default()
-                        );
-                        return None;
-                    }
+        for (idx, (path, emb)) in self.cached_images.iter().enumerate() {
+            if let Some(exclude) = exclude_path {
+                if path == exclude {
+                    excluded_count += 1;
+                    continue;
                 }
-                let sim = Self::cosine_similarity(embedding, emb);
-                Some((path.clone(), sim))
-            })
-            .collect();
+            }
+            let sim = Self::cosine_similarity(embedding, emb);
+            self.scratch.push((idx, sim));
+        }
 
         debug!(
             "Calculated similarities for {} images (excluded {}), query embedding length: {}",
-            similarities.len(),
+            self.scratch.len(),
             excluded_count,
             embedding.len()
         );
 
-        if similarities.is_empty() {
+        if self.scratch.is_empty() {
             warn!("No similarities calculated! Returning empty result.");
             return Vec::new();
         }
 
-        similarities.sort_by(|a, b| {
-            // Sort in descending order (highest similarity first)
-            // Handle NaN by treating it as less than any real number
-            match (b.1.is_nan(), a.1.is_nan()) {
-                (true, true) => std::cmp::Ordering::Equal,
-                (true, false) => std::cmp::Ordering::Greater, // b is NaN, a comes first
-                (false, true) => std::cmp::Ordering::Less,    // a is NaN, b comes first
-                (false, false) => b.1.partial_cmp(&a.1).unwrap(), // Both normal, compare
-            }
-        });
-
-        debug!("Sorted similarities - top 5:");
-        for (i, (path, sim)) in similarities.iter().take(5).enumerate() {
-            debug!(
-                "  {}. {:?} - score: {:.4}",
-                i + 1,
-                path.file_name().unwrap_or_default(),
-                sim
-            );
+        // Diversity pool: top 20% by similarity (or top_n, whichever is
+        // larger). Random sampling within the pool produces diversity
+        // without sacrificing relevance.
+        //
+        // We use `select_nth_unstable_by` to partition around the
+        // (select_count - 1)th best score in O(n) average — only the
+        // pool needs to end up at the front of the buffer; ordering
+        // *within* the pool doesn't matter because we random-sample.
+        // This is the algorithm pinned by
+        // tests/cosine_topk_partial_sort_diagnostic.rs.
+        let base_pool = (self.scratch.len() as f32 * 0.2).ceil() as usize;
+        let select_count = base_pool.max(top_n).min(self.scratch.len());
+        if select_count > 0 && select_count < self.scratch.len() {
+            self.scratch
+                .select_nth_unstable_by(select_count - 1, score_cmp_desc);
+            self.scratch.truncate(select_count);
         }
 
-        // Select top N percent to encourage diversity, but ensure pool is at least top_n size
-        let base_pool = (similarities.len() as f32 * 0.2).ceil() as usize;
-        let select_count = base_pool.max(top_n).min(similarities.len());
-        let diverse_pool = &similarities[..select_count];
         debug!(
-            "Diversity pool - base_pool: {}, select_count: {}, diverse_pool size: {}",
+            "Diversity pool - base_pool: {}, select_count: {}, pool size: {}",
             base_pool,
             select_count,
-            diverse_pool.len()
+            self.scratch.len()
         );
 
-        // Randomly select top_n from the diverse pool
+        // Random sample top_n from the pool. We sample indices into the
+        // (now trimmed) scratch, then materialise the surviving paths
+        // exactly once each.
         let mut rng = rand::rng();
-        let selected: Vec<(PathBuf, f32)> = diverse_pool
-            .choose_multiple(&mut rng, top_n.min(diverse_pool.len()))
-            .cloned()
+        let take = top_n.min(self.scratch.len());
+        let sampled: Vec<&(usize, f32)> =
+            self.scratch.choose_multiple(&mut rng, take).collect();
+        let selected: Vec<(PathBuf, f32)> = sampled
+            .iter()
+            .map(|(cache_idx, sim)| (self.cached_images[*cache_idx].0.clone(), *sim))
             .collect();
 
-        debug!(
-            "Final selected results: {} images",
-            selected.len()
-        );
+        debug!("Final selected results: {} images", selected.len());
         for (i, (path, sim)) in selected.iter().enumerate() {
             debug!(
                 "  {}. {:?} - score: {:.4}",
@@ -283,7 +301,7 @@ impl CosineIndex {
     /// ranking accuracy matters.
     #[tracing::instrument(name = "cosine.get_similar_sorted", skip(self, embedding, exclude_path), fields(cached = self.cached_images.len(), top_n))]
     pub fn get_similar_images_sorted(
-        &self,
+        &mut self,
         embedding: &Array1<f32>,
         top_n: usize,
         exclude_path: Option<&PathBuf>,
@@ -295,36 +313,50 @@ impl CosineIndex {
             exclude_path
         );
 
-        let mut similarities: Vec<(PathBuf, f32)> = self
-            .cached_images
-            .iter()
-            .filter_map(|(path, emb)| {
-                // Exclude the query image itself
-                if let Some(exclude) = exclude_path {
-                    if path == exclude {
-                        return None;
-                    }
+        // Step 1: scratch buffer of (cache_idx, similarity) for every
+        // non-excluded image. No PathBuf clones in the inner loop.
+        self.scratch.clear();
+        for (idx, (path, emb)) in self.cached_images.iter().enumerate() {
+            if let Some(exclude) = exclude_path {
+                if path == exclude {
+                    continue;
                 }
-                let sim = Self::cosine_similarity(embedding, emb);
-                Some((path.clone(), sim))
-            })
-            .collect();
+            }
+            let sim = Self::cosine_similarity(embedding, emb);
+            self.scratch.push((idx, sim));
+        }
 
-        if similarities.is_empty() {
+        if self.scratch.is_empty() {
             warn!("No similarities calculated! Returning empty result.");
             return Vec::new();
         }
 
-        // Sort by similarity descending (highest first)
-        similarities.sort_by(|a, b| match (b.1.is_nan(), a.1.is_nan()) {
-            (true, true) => std::cmp::Ordering::Equal,
-            (true, false) => std::cmp::Ordering::Greater,
-            (false, true) => std::cmp::Ordering::Less,
-            (false, false) => b.1.partial_cmp(&a.1).unwrap(),
-        });
+        // Step 2: top-N selection. Partition around the (top_n - 1)th
+        // best score using `select_nth_unstable_by` (O(n) average) so we
+        // only pay the O(n log n) sort cost on the surviving top_n
+        // elements. For top_n=50 over 1500 images this is the 2.53×
+        // speedup measured in tests/cosine_topk_partial_sort_diagnostic.rs.
+        //
+        // The sort *after* the partial-select preserves the
+        // descending-order contract that semantic-search and the modal
+        // navigation rely on.
+        let want = top_n.min(self.scratch.len());
+        if want == 0 {
+            return Vec::new();
+        }
+        if want < self.scratch.len() {
+            self.scratch.select_nth_unstable_by(want - 1, score_cmp_desc);
+            self.scratch.truncate(want);
+        }
+        self.scratch.sort_unstable_by(score_cmp_desc);
 
-        // Take exactly the top N results in order
-        let result: Vec<(PathBuf, f32)> = similarities.into_iter().take(top_n).collect();
+        // Step 3: materialise the surviving top_n into the return shape.
+        // This is the only PathBuf clone — `want` clones, not `n`.
+        let result: Vec<(PathBuf, f32)> = self
+            .scratch
+            .iter()
+            .map(|(cache_idx, sim)| (self.cached_images[*cache_idx].0.clone(), *sim))
+            .collect();
 
         debug!(
             "Returning {} results sorted by similarity",
@@ -361,7 +393,7 @@ impl CosineIndex {
     /// ... and so on until top 50%
     #[tracing::instrument(name = "cosine.get_tiered_similar", skip(self, embedding, exclude_path), fields(cached = self.cached_images.len()))]
     pub fn get_tiered_similar_images(
-        &self,
+        &mut self,
         embedding: &Array1<f32>,
         exclude_path: Option<&PathBuf>,
     ) -> Vec<(PathBuf, f32)> {
@@ -371,37 +403,36 @@ impl CosineIndex {
             exclude_path
         );
 
-        let mut similarities: Vec<(PathBuf, f32)> = self
-            .cached_images
-            .iter()
-            .filter_map(|(path, emb)| {
-                if let Some(exclude) = exclude_path {
-                    if path == exclude {
-                        return None;
-                    }
+        // Step 1: similarities into the scratch buffer (index-keyed,
+        // no PathBuf clones in the inner loop).
+        self.scratch.clear();
+        for (idx, (path, emb)) in self.cached_images.iter().enumerate() {
+            if let Some(exclude) = exclude_path {
+                if path == exclude {
+                    continue;
                 }
-                let sim = Self::cosine_similarity(embedding, emb);
-                Some((path.clone(), sim))
-            })
-            .collect();
+            }
+            let sim = Self::cosine_similarity(embedding, emb);
+            self.scratch.push((idx, sim));
+        }
 
-        if similarities.is_empty() {
+        if self.scratch.is_empty() {
             warn!("No similarities calculated! Returning empty result.");
             return Vec::new();
         }
 
-        // Sort by similarity descending
-        similarities.sort_by(|a, b| match (b.1.is_nan(), a.1.is_nan()) {
-            (true, true) => std::cmp::Ordering::Equal,
-            (true, false) => std::cmp::Ordering::Greater,
-            (false, true) => std::cmp::Ordering::Less,
-            (false, false) => b.1.partial_cmp(&a.1).unwrap(),
-        });
+        // Tiered sampling needs a fully-sorted list because tiers span
+        // 0-50% in 5% buckets. Partial-sort can't help here without
+        // restructuring the tier definitions, so we keep the full sort
+        // — but the scratch buffer still wins by skipping the per-item
+        // PathBuf clone.
+        self.scratch.sort_unstable_by(score_cmp_desc);
 
-        let total = similarities.len();
+        let total = self.scratch.len();
         let mut result: Vec<(PathBuf, f32)> = Vec::new();
         let mut rng = rand::rng();
-        let mut used_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut used_indices: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
 
         // Sample from each tier: 0-5%, 5-10%, 10-15%, ..., 45-50%
         let tiers = [
@@ -423,21 +454,23 @@ impl CosineIndex {
                 break;
             }
 
-            // Get indices in this tier that haven't been used
+            // Get scratch-indices in this tier that haven't been used
             let available: Vec<usize> = (start_idx..end_idx)
                 .filter(|i| !used_indices.contains(i))
                 .collect();
 
-            // Randomly sample from available
             let to_take = count.min(available.len());
             let sampled: Vec<usize> = available
                 .choose_multiple(&mut rng, to_take)
                 .cloned()
                 .collect();
 
-            for idx in sampled {
-                used_indices.insert(idx);
-                result.push(similarities[idx].clone());
+            // Resolve scratch index → cache index → (PathBuf, f32) here.
+            // Only sampled items pay the clone cost.
+            for scratch_idx in sampled {
+                used_indices.insert(scratch_idx);
+                let (cache_idx, sim) = self.scratch[scratch_idx];
+                result.push((self.cached_images[cache_idx].0.clone(), sim));
             }
         }
 
@@ -711,7 +744,8 @@ mod tests {
 
     #[test]
     fn test_empty_index() {
-        let index = CosineIndex::new();
+        // The retrieval methods take &mut self for the scratch buffer.
+        let mut index = CosineIndex::new();
         let query = array![1.0, 2.0, 3.0];
 
         let results = index.get_similar_images(&query, 5, None);
