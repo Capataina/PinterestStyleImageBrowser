@@ -224,16 +224,25 @@ function mapImageSearchResult(res: {
   };
 }
 
-export async function fetchSimilarImages(imageId: number, topN: number = 8) {
+export async function fetchSimilarImages(
+  imageId: number,
+  topN: number = 8,
+  encoderId?: string,
+) {
   try {
     // Backend now returns the unified ImageSearchResult shape
     // (thumbnail_path/width/height included). Audit Performance
     // finding: dimensions used to be fetched frontend-side via
     // N parallel `getImageSize` DOM image loads — gone now,
     // a single IPC round-trip carries the full payload.
+    //
+    // encoderId picks which embedding family to query against
+    // (CLIP / SigLIP-2 / DINOv2). Backend defaults to clip if
+    // omitted, but in practice the frontend always passes the
+    // user's chosen encoder from useUserPreferences.imageEncoder.
     const results: Parameters<typeof mapImageSearchResult>[0][] = await perfInvoke(
       "get_similar_images",
-      { imageId, topN }
+      { imageId, topN, encoderId }
     );
     return results.map(mapImageSearchResult);
   } catch (error) {
@@ -242,11 +251,11 @@ export async function fetchSimilarImages(imageId: number, topN: number = 8) {
   }
 }
 
-export async function fetchTieredSimilarImages(imageId: number) {
+export async function fetchTieredSimilarImages(imageId: number, encoderId?: string) {
   try {
     const results: Parameters<typeof mapImageSearchResult>[0][] = await perfInvoke(
       "get_tiered_similar_images",
-      { imageId }
+      { imageId, encoderId }
     );
     return results.map(mapImageSearchResult);
   } catch (error) {

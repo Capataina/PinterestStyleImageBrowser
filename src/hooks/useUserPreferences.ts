@@ -38,6 +38,23 @@ export interface UserPreferences {
   semanticResultCount: number;
   /** Whether multi-tag filter ANDs (all) or ORs (any). */
   tagFilterMode: TagFilterMode;
+  /**
+   * Encoder used for "View Similar" (image→image) queries.
+   * Matches the encoder_id values returned by the backend
+   * `list_available_encoders` command.
+   * Default `dinov2_small` per the project-enhancement agent's
+   * recommendation — DINOv2 dominates CLIP for image-image
+   * similarity by 2-5× on benchmarks.
+   */
+  imageEncoder: string;
+  /**
+   * Encoder used for text→image semantic search.
+   * Default `clip_vit_b_32` because the SigLIP-2 text encoder
+   * dispatch isn't fully wired yet — picker accepts the choice
+   * but only CLIP path is functional today. SigLIP-2 text
+   * dispatch is the natural next iteration.
+   */
+  textEncoder: string;
 }
 
 const DEFAULTS: UserPreferences = {
@@ -55,6 +72,8 @@ const DEFAULTS: UserPreferences = {
   similarResultCount: 35,
   semanticResultCount: 50,
   tagFilterMode: "any",
+  imageEncoder: "dinov2_small",
+  textEncoder: "clip_vit_b_32",
 };
 
 const STORAGE_KEY = "imageBrowserPrefs";

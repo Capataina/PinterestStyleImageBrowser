@@ -136,7 +136,12 @@ export default function Home() {
   const deleteTagMutation = useDeleteTag();
   const assignTagMutation = useAssignTagToImage();
   const removeTagMutation = useRemoveTagFromImage();
-  const tieredSimilarImages = useTieredSimilarImages(selectedItem?.id);
+  // Pass the user's chosen image-image encoder so switching it in
+  // Settings auto-refetches (the encoder_id is part of the query key).
+  const tieredSimilarImages = useTieredSimilarImages(
+    selectedItem?.id,
+    prefs.imageEncoder,
+  );
 
   const location = useLocation();
   const navigate = useNavigate();

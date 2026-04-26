@@ -22,6 +22,7 @@ use crate::db::{ImageDatabase, ID};
 use crate::image_struct::ImageData;
 use crate::paths;
 
+pub mod encoders;
 pub mod error;
 pub mod images;
 pub mod notes;

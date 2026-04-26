@@ -44,6 +44,53 @@ pub struct CosineIndexState {
     pub current_encoder_id: Arc<Mutex<String>>,
 }
 
+impl CosineIndexState {
+    /// Ensure `index` holds the cache for `encoder_id`. If it already
+    /// does, returns immediately (no work). Otherwise repopulates
+    /// from `db.get_all_embeddings_for(encoder_id)` — fast because
+    /// the on-disk embeddings are already there from the indexing
+    /// pass; this is just DB→memory transfer.
+    ///
+    /// Returns an error if the DB read fails. Callers should treat
+    /// this as a hard failure for the search command — there's no
+    /// useful "partial cache" state to fall back to.
+    pub fn ensure_loaded_for(
+        &self,
+        db: &ImageDatabase,
+        encoder_id: &str,
+    ) -> Result<(), String> {
+        // Two-step lock acquisition: check current id first to short-
+        // circuit the common case (encoder hasn't changed). Acquire
+        // the index Mutex only if a reload is actually needed.
+        {
+            let cur = self
+                .current_encoder_id
+                .lock()
+                .map_err(|e| format!("current_encoder_id mutex poisoned: {e}"))?;
+            if *cur == encoder_id {
+                return Ok(());
+            }
+        }
+        // Need to switch — take both locks. The order is consistent
+        // (id first, then index) across all callers; deadlock-safe.
+        let mut cur = self
+            .current_encoder_id
+            .lock()
+            .map_err(|e| format!("current_encoder_id mutex poisoned: {e}"))?;
+        let mut index = self
+            .index
+            .lock()
+            .map_err(|e| format!("index mutex poisoned: {e}"))?;
+        // Re-check under the lock (another thread might've switched).
+        if *cur == encoder_id {
+            return Ok(());
+        }
+        index.populate_from_db_for_encoder(db, encoder_id);
+        *cur = encoder_id.to_string();
+        Ok(())
+    }
+}
+
 /// State for the text encoder used in semantic search
 /// Lazy-loaded on first semantic search query
 pub struct TextEncoderState {
@@ -52,6 +99,7 @@ pub struct TextEncoderState {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run(db: ImageDatabase, db_path: String) {
+    use commands::encoders::list_available_encoders;
     use commands::images::{get_images, get_pipeline_stats};
     use commands::notes::{get_image_notes, set_image_notes};
     use commands::profiling::{
@@ -184,6 +232,7 @@ pub fn run(db: ImageDatabase, db_path: String) {
         .invoke_handler(tauri::generate_handler![
             get_images,
             get_pipeline_stats,
+            list_available_encoders,
             get_tags,
             create_tag,
             delete_tag,

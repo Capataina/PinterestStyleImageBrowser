@@ -6,6 +6,7 @@ import { DisplaySection } from "./DisplaySection";
 import { SearchSection } from "./SearchSection";
 import { SortSection } from "./SortSection";
 import { FoldersSection } from "./FoldersSection";
+import { EncoderSection } from "./EncoderSection";
 import { StatsSection } from "./StatsSection";
 import { ResetSection } from "./ResetSection";
 
@@ -85,6 +86,7 @@ export function SettingsDrawer({ open, onClose }: SettingsDrawerProps) {
               <SearchSection />
               <SortSection />
               <FoldersSection />
+              <EncoderSection />
               <StatsSection />
               <ResetSection />
             </div>

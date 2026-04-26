@@ -6,25 +6,37 @@ use crate::db::ImageDatabase;
 use crate::CosineIndexState;
 
 #[tauri::command]
-#[tracing::instrument(name = "ipc.get_tiered_similar_images", skip(db, cosine_state), fields(image_id))]
+#[tracing::instrument(name = "ipc.get_tiered_similar_images", skip(db, cosine_state), fields(image_id, encoder_id = ?encoder_id))]
 pub fn get_tiered_similar_images(
     db: State<'_, ImageDatabase>,
     cosine_state: State<'_, CosineIndexState>,
     image_id: i64,
+    encoder_id: Option<String>,
 ) -> Result<Vec<ImageSearchResult>, ApiError> {
     use ndarray::Array1;
     use std::path::PathBuf;
 
+    // Default to CLIP-ViT-B/32 if frontend hasn't migrated to passing
+    // the param yet. After the picker UI ships, callers always pass
+    // the user's selected image encoder ID.
+    let encoder_id = encoder_id.unwrap_or_else(|| "clip_vit_b_32".to_string());
+
     info!(
-        "get_tiered_similar_images called - image_id: {}",
-        image_id
+        "get_tiered_similar_images - image_id: {} encoder: {}",
+        image_id, encoder_id
     );
+
+    // Ensure the cosine cache is loaded for the chosen encoder.
+    // If the user just switched encoders in Settings, this triggers
+    // a fast DB→memory transfer of the new encoder's embeddings.
+    cosine_state
+        .ensure_loaded_for(&db, &encoder_id)
+        .map_err(|e| ApiError::Cosine(e))?;
 
     let mut index = cosine_state.index.lock()?;
 
     if index.cached_images.is_empty() {
-        debug!("Cache is empty, populating from database...");
-        index.populate_from_db(&db);
+        debug!("Cache empty even after ensure_loaded_for — encoder probably has no embeddings yet (run indexing).");
     }
 
     // Hoist db.get_all_images() to once per command (audit finding —
@@ -38,7 +50,14 @@ pub fn get_tiered_similar_images(
         .find(|img| img.id == image_id)
         .map(|img| PathBuf::from(&img.path));
 
-    let embedding = db.get_image_embedding(image_id)?;
+    // Read the chosen encoder's embedding for the clicked image.
+    // Falls back to legacy `images.embedding` for the CLIP case
+    // (where that column is the source of truth).
+    let embedding = if encoder_id == "clip_vit_b_32" {
+        db.get_image_embedding(image_id)?
+    } else {
+        db.get_embedding(image_id, &encoder_id)?
+    };
 
     let query = Array1::from_vec(embedding);
     let raw_results = index.get_tiered_similar_images(&query, exclude_path.as_ref());
@@ -82,36 +101,29 @@ pub fn get_tiered_similar_images(
 }
 
 #[tauri::command]
-#[tracing::instrument(name = "ipc.get_similar_images", skip(db, cosine_state), fields(image_id, top_n))]
+#[tracing::instrument(name = "ipc.get_similar_images", skip(db, cosine_state), fields(image_id, top_n, encoder_id = ?encoder_id))]
 pub fn get_similar_images(
     db: State<'_, ImageDatabase>,
     cosine_state: State<'_, CosineIndexState>,
     image_id: i64,
     top_n: usize,
+    encoder_id: Option<String>,
 ) -> Result<Vec<ImageSearchResult>, ApiError> {
     use ndarray::Array1;
     use std::path::PathBuf;
 
+    let encoder_id = encoder_id.unwrap_or_else(|| "clip_vit_b_32".to_string());
+
     info!(
-        "get_similar_images called - image_id: {}, top_n: {}",
-        image_id, top_n
+        "get_similar_images - image_id: {}, top_n: {}, encoder: {}",
+        image_id, top_n, encoder_id
     );
+
+    cosine_state
+        .ensure_loaded_for(&db, &encoder_id)
+        .map_err(|e| ApiError::Cosine(e))?;
 
     let mut index = cosine_state.index.lock()?;
-
-    debug!(
-        "Cache state - cached_images count: {}",
-        index.cached_images.len()
-    );
-
-    if index.cached_images.is_empty() {
-        debug!("Cache is empty, populating from database...");
-        index.populate_from_db(&db);
-        debug!(
-            "Cache populated - cached_images count: {}",
-            index.cached_images.len()
-        );
-    }
 
     // Hoist db.get_all_images() to once per command (audit finding —
     // was called twice: once for the exclude-path lookup and once again
@@ -131,8 +143,12 @@ pub fn get_similar_images(
         warn!("Could not find image with id: {}", image_id);
     }
 
-    debug!("Fetching embedding for image_id: {}", image_id);
-    let embedding = db.get_image_embedding(image_id)?;
+    debug!("Fetching embedding for image_id: {} via {}", image_id, encoder_id);
+    let embedding = if encoder_id == "clip_vit_b_32" {
+        db.get_image_embedding(image_id)?
+    } else {
+        db.get_embedding(image_id, &encoder_id)?
+    };
     debug!("Retrieved embedding - length: {}", embedding.len());
 
     let query = Array1::from_vec(embedding);
