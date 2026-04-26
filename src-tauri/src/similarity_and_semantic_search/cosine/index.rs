@@ -40,6 +40,11 @@ impl CosineIndex {
     /// from this method. The on-disk embeddings stay intact (one row
     /// per (image_id, encoder_id)) so swapping back to a previously-
     /// used encoder is instant — the embeddings are already there.
+    ///
+    /// Special case: for `clip_vit_b_32` the new embeddings table
+    /// might be empty for users who haven't re-indexed under the new
+    /// schema. Falls back to the legacy `images.embedding` column
+    /// (`get_all_embeddings`) so those users still get results.
     #[tracing::instrument(name = "cosine.populate_for_encoder", skip(self, db))]
     pub fn populate_from_db_for_encoder(
         &mut self,
@@ -55,6 +60,27 @@ impl CosineIndex {
                 return;
             }
         };
+
+        // Backward-compat for CLIP: if the new embeddings table is
+        // empty for clip_vit_b_32, fall back to the legacy
+        // images.embedding column. Users who indexed before the
+        // per-encoder schema have data only in the legacy column.
+        let rows = if rows.is_empty() && encoder_id == "clip_vit_b_32" {
+            info!(
+                "embeddings table empty for clip_vit_b_32; falling back to \
+                 legacy images.embedding column"
+            );
+            match db.get_all_embeddings() {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("legacy get_all_embeddings fallback failed: {e}");
+                    return;
+                }
+            }
+        } else {
+            rows
+        };
+
         let total = rows.len();
         self.cached_images.clear();
         self.cached_images.reserve(total);
@@ -65,10 +91,24 @@ impl CosineIndex {
             self.cached_images
                 .push((PathBuf::from(path), Array1::from_vec(embedding)));
         }
+        let elapsed_ms = start.elapsed().as_millis() as u64;
         info!(
-            "populate_for_encoder({encoder_id}) done: {} embeddings in {:?}",
+            "populate_for_encoder({encoder_id}) done: {} embeddings in {} ms",
             self.cached_images.len(),
-            start.elapsed()
+            elapsed_ms
+        );
+
+        // Diagnostic: tells the report which encoder's cache was
+        // loaded with how many embeddings — pinpoints the "0 results"
+        // case where the user picked an encoder that hasn't been
+        // indexed yet.
+        crate::perf::record_diagnostic(
+            "cosine_cache_populated",
+            serde_json::json!({
+                "encoder_id": encoder_id,
+                "count": self.cached_images.len(),
+                "duration_ms": elapsed_ms,
+            }),
         );
     }
 

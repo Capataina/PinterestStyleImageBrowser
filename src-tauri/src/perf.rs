@@ -142,8 +142,17 @@ const RAW_EVENT_CAP: usize = 50_000;
 /// "don't beat up the disk during heavy span traffic."
 const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 
-/// One row in the timeline. Either a span close (with its measured
-/// duration) or a user action (with arbitrary JSON payload).
+/// One row in the timeline. Three variants:
+/// - `Span`: a tracing span closed (timing data).
+/// - `User`: a user-action breadcrumb (e.g. clicked image, typed query).
+/// - `Diagnostic`: rich structured snapshot of internal state — what
+///   encoder is loaded, what cosine returned for a query, what an
+///   embedding lookup hit/missed. The diagnostic framework feeds into
+///   the on-exit report's "Diagnostics" section so the user can
+///   correlate "search returned X results" with "actual top-N from
+///   cosine was [...]" — pinpoints whether bad search results are an
+///   encoding issue, a cosine issue, a DB-lookup issue, or a frontend
+///   display issue.
 ///
 /// `Deserialize` is implemented because the on-exit report renderer
 /// reads the JSONL back line-by-line to build the markdown report,
@@ -169,6 +178,20 @@ pub enum RawEvent {
         /// Whatever the call site decided to attach. Free-form JSON
         /// so we don't need a schema migration every time we add an
         /// instrumentation point.
+        payload: Value,
+    },
+    /// Rich diagnostic snapshots of internal state. Emitted from
+    /// backend code via `record_diagnostic`. Only fires when
+    /// profiling is enabled.
+    Diagnostic {
+        ts_ms: u64,
+        /// e.g. `startup_state`, `search_query`, `cosine_cache_populated`,
+        /// `encoder_changed`, `embedding_lookup`, `path_resolution`.
+        diagnostic: String,
+        /// Free-form JSON. Each diagnostic kind has a documented
+        /// expected shape (see `record_diagnostic` callers); the
+        /// renderer uses the diagnostic field to pick the right
+        /// formatter for the report.
         payload: Value,
     },
 }
@@ -232,6 +255,27 @@ pub fn record_user_action(action: String, payload: Value) {
     push_event(RawEvent::User {
         ts_ms: session_ms(),
         action,
+        payload,
+    });
+}
+
+/// Record a diagnostic snapshot into the timeline. No-op when
+/// profiling is off — call sites can sprinkle freely without
+/// worrying about overhead. The on-exit report renders these into
+/// a dedicated "Diagnostics" section grouped by `diagnostic` kind.
+///
+/// The standard diagnostic kinds and their expected payload shapes
+/// are documented at each call site (see commands/similarity.rs,
+/// commands/semantic.rs, lib.rs setup, etc.). New kinds can be added
+/// freely — the renderer falls back to pretty-printing the payload
+/// for unknown kinds.
+pub fn record_diagnostic(diagnostic: &str, payload: Value) {
+    if !is_profiling_enabled() {
+        return;
+    }
+    push_event(RawEvent::Diagnostic {
+        ts_ms: session_ms(),
+        diagnostic: diagnostic.to_string(),
         payload,
     });
 }

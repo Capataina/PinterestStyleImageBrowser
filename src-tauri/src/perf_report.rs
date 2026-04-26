@@ -106,6 +106,7 @@ fn build_markdown(events: &[RawEvent], snap: &perf::PerfSnapshot) -> String {
     out.push_str(&section_outliers(&sorted));
     out.push_str(&section_action_timeline(&sorted));
     out.push_str(&section_per_span_table(snap));
+    out.push_str(&section_diagnostics(&sorted));
     out.push_str(&section_footer());
     out
 }
@@ -114,6 +115,7 @@ fn event_ts(e: &RawEvent) -> u64 {
     match e {
         RawEvent::Span { ts_ms, .. } => *ts_ms,
         RawEvent::User { ts_ms, .. } => *ts_ms,
+        RawEvent::Diagnostic { ts_ms, .. } => *ts_ms,
     }
 }
 
@@ -283,6 +285,9 @@ fn section_outliers(sorted: &[RawEvent]) -> String {
                 });
                 spans.push((*ts_ms, name.as_str(), *duration_us, cause));
             }
+            // Diagnostic events don't appear in the outlier table —
+            // they're rendered in the dedicated Diagnostics section.
+            RawEvent::Diagnostic { .. } => {}
         }
     }
     spans.sort_by(|a, b| b.2.cmp(&a.2));
@@ -430,6 +435,67 @@ fn section_per_span_table(snap: &perf::PerfSnapshot) -> String {
         ));
     }
     s.push_str("\n");
+    s
+}
+
+/// Diagnostics section — renders structured snapshots emitted via
+/// `perf::record_diagnostic`. Grouped by `diagnostic` kind so the
+/// reader can scan for "search_query" results (audit cosine output)
+/// or "startup_state" (audit per-encoder embedding counts).
+fn section_diagnostics(sorted: &[RawEvent]) -> String {
+    let mut s = String::new();
+    s.push_str("## Diagnostics\n\n");
+
+    let diagnostics: Vec<&RawEvent> = sorted
+        .iter()
+        .filter(|e| matches!(e, RawEvent::Diagnostic { .. }))
+        .collect();
+
+    if diagnostics.is_empty() {
+        s.push_str(
+            "_No diagnostic events recorded this session. Diagnostics fire for \
+             search queries, encoder cache populates, and startup state — \
+             trigger any of those to populate this section._\n\n",
+        );
+        return s;
+    }
+
+    // Group by diagnostic kind for scannability.
+    use std::collections::BTreeMap;
+    let mut by_kind: BTreeMap<&str, Vec<&RawEvent>> = BTreeMap::new();
+    for e in &diagnostics {
+        if let RawEvent::Diagnostic { diagnostic, .. } = e {
+            by_kind.entry(diagnostic.as_str()).or_default().push(e);
+        }
+    }
+
+    s.push_str(&format!(
+        "{} diagnostic events across {} kinds. Each kind grouped below; \
+         within a kind, ordered chronologically.\n\n",
+        diagnostics.len(),
+        by_kind.len()
+    ));
+
+    for (kind, events) in &by_kind {
+        s.push_str(&format!(
+            "### `{}` ({} events)\n\n",
+            kind,
+            events.len()
+        ));
+        for e in events {
+            if let RawEvent::Diagnostic {
+                ts_ms, payload, ..
+            } = e
+            {
+                s.push_str(&format!(
+                    "<details><summary>t={}</summary>\n\n```json\n{}\n```\n\n</details>\n\n",
+                    format_ms_human(*ts_ms),
+                    serde_json::to_string_pretty(payload)
+                        .unwrap_or_else(|e| format!("(payload serialise failed: {e})"))
+                ));
+            }
+        }
+    }
     s
 }
 

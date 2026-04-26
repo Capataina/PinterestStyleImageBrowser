@@ -1,6 +1,8 @@
 use tauri::State;
 use tracing::{debug, info};
 
+use crate::perf;
+
 use crate::commands::{resolve_image_id_for_cosine_path, ApiError, ImageSearchResult};
 use crate::db::ImageDatabase;
 use crate::paths;
@@ -88,11 +90,31 @@ pub fn semantic_search(
     // Find similar images using cosine similarity
     // Use get_similar_images_sorted for semantic search to get results in proper order
     let query_array = Array1::from_vec(text_embedding);
+    let cache_size = index.cached_images.len();
     let raw_results = index.get_similar_images_sorted(&query_array, top_n, None);
     debug!(
         "Found {} similar images for query '{}'",
         raw_results.len(),
         query
+    );
+
+    // Diagnostic — full cosine result list for the typed text query.
+    // Lets the user audit "blue fish returned X" against the cosine-
+    // ranking truth.
+    perf::record_diagnostic(
+        "search_query",
+        serde_json::json!({
+            "type": "semantic",
+            "encoder_id": "clip_vit_b_32",
+            "top_n": top_n,
+            "query_text": query,
+            "cosine_cache_size": cache_size,
+            "raw_results": raw_results.iter().map(|(p, s)| serde_json::json!({
+                "path": p.to_string_lossy(),
+                "score": *s,
+            })).collect::<Vec<_>>(),
+            "raw_result_count": raw_results.len(),
+        }),
     );
 
     // Get all images once for flexible matching (audit: was previously

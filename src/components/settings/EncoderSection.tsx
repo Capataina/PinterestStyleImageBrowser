@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
+import { recordAction } from "../../services/perf";
 import { Section } from "./controls";
 
 /**
@@ -88,14 +89,32 @@ export function EncoderSection() {
           value={prefs.imageEncoder}
           options={imageOptions}
           selected={selectedImage}
-          onChange={(id) => update("imageEncoder", id)}
+          onChange={(id) => {
+            // Breadcrumb so the on-exit profiling report's diagnostic
+            // section shows when the user switched encoders — lets us
+            // correlate "search-quality complaint at t=3:45" with
+            // "encoder switched from CLIP→DINOv2 at t=3:42".
+            recordAction("encoder_changed", {
+              field: "imageEncoder",
+              from: prefs.imageEncoder,
+              to: id,
+            });
+            update("imageEncoder", id);
+          }}
         />
         <Picker
           label="Text → Image (Semantic Search)"
           value={prefs.textEncoder}
           options={textOptions}
           selected={selectedText}
-          onChange={(id) => update("textEncoder", id)}
+          onChange={(id) => {
+            recordAction("encoder_changed", {
+              field: "textEncoder",
+              from: prefs.textEncoder,
+              to: id,
+            });
+            update("textEncoder", id);
+          }}
           experimental={
             "Note: text-encoder dispatch beyond CLIP is not fully wired yet — picker accepts the choice but only CLIP path is functional today."
           }

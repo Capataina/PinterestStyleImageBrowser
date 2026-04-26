@@ -3,6 +3,7 @@ use tracing::{debug, info, warn};
 
 use crate::commands::{resolve_image_id_for_cosine_path, ApiError, ImageSearchResult};
 use crate::db::ImageDatabase;
+use crate::perf;
 use crate::CosineIndexState;
 
 #[tauri::command]
@@ -60,7 +61,29 @@ pub fn get_tiered_similar_images(
     };
 
     let query = Array1::from_vec(embedding);
+    let cache_size = index.cached_images.len();
     let raw_results = index.get_tiered_similar_images(&query, exclude_path.as_ref());
+
+    // Diagnostic: dump the FULL cosine result list (paths + scores)
+    // before any path-resolution filtering. Lets the user audit
+    // whether bad search results are an encoder-quality issue (cosine
+    // returned the wrong things) or a downstream rendering issue
+    // (right things returned but mapped to wrong tiles).
+    perf::record_diagnostic(
+        "search_query",
+        serde_json::json!({
+            "type": "tiered_similar",
+            "encoder_id": encoder_id,
+            "query_image_id": image_id,
+            "query_image_path": exclude_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            "cosine_cache_size": cache_size,
+            "raw_results": raw_results.iter().map(|(p, s)| serde_json::json!({
+                "path": p.to_string_lossy(),
+                "score": *s,
+            })).collect::<Vec<_>>(),
+            "raw_result_count": raw_results.len(),
+        }),
+    );
 
     // Path resolution + thumbnail enrichment. The dimensions used to
     // be fetched frontend-side via N parallel `getImageSize` DOM image
@@ -156,7 +179,26 @@ pub fn get_similar_images(
         "Calling index.get_similar_images with top_n: {}, exclude_path: {:?}",
         top_n, exclude_path
     );
+    let cache_size = index.cached_images.len();
     let raw_results = index.get_similar_images(&query, top_n, exclude_path.as_ref());
+
+    // Diagnostic — same shape as the tiered version's diagnostic.
+    perf::record_diagnostic(
+        "search_query",
+        serde_json::json!({
+            "type": "similar",
+            "encoder_id": encoder_id,
+            "top_n": top_n,
+            "query_image_id": image_id,
+            "query_image_path": exclude_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            "cosine_cache_size": cache_size,
+            "raw_results": raw_results.iter().map(|(p, s)| serde_json::json!({
+                "path": p.to_string_lossy(),
+                "score": *s,
+            })).collect::<Vec<_>>(),
+            "raw_result_count": raw_results.len(),
+        }),
+    );
     debug!(
         "index.get_similar_images returned {} results",
         raw_results.len()

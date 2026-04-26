@@ -154,6 +154,48 @@ pub fn run(db: ImageDatabase, db_path: String) {
             let indexing_state = indexing_state.clone();
             let watcher_state = watcher_state.clone();
             move |app| {
+                // Startup diagnostic: snapshot of what's on disk +
+                // what's already encoded. Lets the on-exit report's
+                // Diagnostics section show "this session started with
+                // X CLIP embeddings, Y SigLIP-2, Z DINOv2" — very
+                // useful for the "I selected DINOv2 but got 0 results"
+                // bug class.
+                if perf::is_profiling_enabled() {
+                    if let Ok(temp_db) = ImageDatabase::new(&db_path) {
+                        let _ = temp_db.initialize();
+                        let stats = temp_db.get_pipeline_stats().ok();
+                        let models_dir = paths::models_dir();
+                        let model_files: Vec<String> = std::fs::read_dir(&models_dir)
+                            .ok()
+                            .map(|entries| {
+                                entries
+                                    .filter_map(|e| e.ok())
+                                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        perf::record_diagnostic(
+                            "startup_state",
+                            serde_json::json!({
+                                "db_path": &db_path,
+                                "models_dir": models_dir.display().to_string(),
+                                "model_files_present": model_files,
+                                "embedding_counts_per_encoder": stats.as_ref().map(|s| {
+                                    s.with_embedding_per_encoder.iter().map(|e| {
+                                        serde_json::json!({
+                                            "encoder_id": e.encoder_id,
+                                            "count": e.count,
+                                        })
+                                    }).collect::<Vec<_>>()
+                                }),
+                                "total_images": stats.as_ref().map(|s| s.total_images),
+                                "with_thumbnail": stats.as_ref().map(|s| s.with_thumbnail),
+                                "orphaned": stats.as_ref().map(|s| s.orphaned),
+                            }),
+                        );
+                    }
+                }
+
                 // One-shot legacy migration: if the user upgraded from
                 // a single-folder build, settings.json has a `scan_root`
                 // field but the new `roots` table is empty. Convert it
