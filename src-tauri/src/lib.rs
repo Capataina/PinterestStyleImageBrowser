@@ -46,6 +46,72 @@ pub mod tag_struct;
 pub mod thumbnail;
 pub mod watcher;
 
+/// Map a cosine-result `PathBuf` back to its database `(id, canonical_path)`.
+///
+/// The cosine index returns paths from its in-memory cache; those
+/// paths might have a Windows extended-prefix (`\\?\`) if the
+/// indexing pipeline canonicalised them on Windows, or a different
+/// canonical form than what's stored in the DB. Three lookup
+/// strategies, in order:
+///
+/// 1. Try the path with `\\?\` stripped (the common case — covers
+///    every modern run on every platform).
+/// 2. Fall back to the raw path the cosine index gave us.
+/// 3. As a last resort, walk `all_images_cache` looking for any row
+///    whose path matches under any normalisation. This handles
+///    legacy DBs where some rows were inserted with one canonical
+///    form and the cosine index now returns another.
+///
+/// Returns `Some((id, canonical_path))` if any strategy matches.
+///
+/// Audit finding (extracted from triplicated inline closures + 3
+/// triplicated 60-line lookup blocks across `semantic_search`,
+/// `get_similar_images`, `get_tiered_similar_images`). The project
+/// notes already flagged "don't add a fourth normalisation closure"
+/// — the third one was the redundancy.
+fn resolve_image_id_for_cosine_path(
+    db: &ImageDatabase,
+    cosine_path: &std::path::Path,
+    all_images_cache: Option<&[ImageData]>,
+) -> Option<(ID, String)> {
+    let path_str = cosine_path.to_string_lossy().into_owned();
+    let normalized = paths::strip_windows_extended_prefix(&path_str).into_owned();
+
+    // Strategy 1: direct DB lookup using the normalised path.
+    if let Ok(id) = db.get_image_id_by_path(&normalized) {
+        return Some((id, normalized));
+    }
+    // Strategy 2: direct DB lookup using the raw path.
+    if let Ok(id) = db.get_image_id_by_path(&path_str) {
+        return Some((id, path_str));
+    }
+    // Strategy 3: scan the cached image list for a flexible match.
+    let images = all_images_cache?;
+    let search_path = cosine_path
+        .canonicalize()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| normalized.clone());
+
+    images
+        .iter()
+        .find(|img| {
+            let img_norm = paths::strip_windows_extended_prefix(&img.path);
+            let img_canon = std::path::Path::new(&img.path)
+                .canonicalize()
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| img_norm.clone().into_owned());
+
+            img_norm.as_ref() == normalized.as_str()
+                || img_norm.as_ref() == path_str.as_str()
+                || img.path == normalized
+                || img.path == path_str
+                || img_canon == search_path
+        })
+        .map(|img| (img.id, img.path.clone()))
+}
+
 pub struct CosineIndexState {
     /// Wrapped in Arc<Mutex<...>> rather than plain Mutex<...> so the
     /// indexing thread (Pass 5) can hold a clone alongside the Tauri-
@@ -430,47 +496,21 @@ fn semantic_search(
         query
     );
 
-    // Helper function to normalize Windows paths
-    let normalize_path = |path_str: &str| -> String {
-        if path_str.starts_with("\\\\?\\") {
-            path_str[4..].to_string()
-        } else {
-            path_str.to_string()
-        }
-    };
-
-    // Get all images for flexible path matching and thumbnail info
+    // Get all images once for flexible matching (audit: was previously
+    // implicit in semantic_search but two of the similarity commands
+    // called get_all_images twice — hoisting once is the consistent
+    // pattern across all three).
     let all_images = db.get_all_images().ok();
 
-    // Convert results to SemanticSearchResult with thumbnail info
+    // Convert results to SemanticSearchResult with thumbnail info.
+    // Path resolution + Windows-prefix normalisation is shared via
+    // `resolve_image_id_for_cosine_path` (audit: extracted from the
+    // triplicated normalize_path closure + 3-strategy lookup block).
     let results: Vec<SemanticSearchResult> = raw_results
         .into_iter()
         .filter_map(|(path, score)| {
-            let path_str = path.to_string_lossy().to_string();
-            let normalized_path = normalize_path(&path_str);
-
-            // Try to find the image in the database
-            let image_info = db
-                .get_image_id_by_path(&normalized_path)
-                .ok()
-                .map(|id| (id, normalized_path.clone()))
-                .or_else(|| {
-                    db.get_image_id_by_path(&path_str)
-                        .ok()
-                        .map(|id| (id, path_str.clone()))
-                })
-                .or_else(|| {
-                    // Flexible matching
-                    all_images.as_ref().and_then(|images| {
-                        images.iter().find(|img| {
-                            let img_normalized = normalize_path(&img.path);
-                            img_normalized == normalized_path
-                                || img_normalized == path_str
-                                || img.path == normalized_path
-                                || img.path == path_str
-                        }).map(|img| (img.id, img.path.clone()))
-                    })
-                });
+            let image_info =
+                resolve_image_id_for_cosine_path(&db, &path, all_images.as_deref());
 
             image_info.map(|(id, final_path)| {
                 // Get thumbnail info if available
@@ -540,16 +580,18 @@ fn get_tiered_similar_images(
         index.populate_from_db(&db);
     }
 
-    // Get the path of the clicked image to exclude it from results
-    let exclude_path = {
-        let all_images = db
-            .get_all_images()
-            .map_err(|e| format!("Failed to get images: {e}"))?;
-        all_images
-            .iter()
-            .find(|img| img.id == image_id)
-            .map(|img| PathBuf::from(&img.path))
-    };
+    // Hoist db.get_all_images() to once per command (audit finding —
+    // was called twice: once for the exclude-path lookup and once
+    // again later for flexible match). One LEFT-JOIN-aggregate query
+    // covers both purposes.
+    let all_images = db
+        .get_all_images()
+        .map_err(|e| format!("Failed to get images: {e}"))?;
+
+    let exclude_path = all_images
+        .iter()
+        .find(|img| img.id == image_id)
+        .map(|img| PathBuf::from(&img.path));
 
     let embedding = db
         .get_image_embedding(image_id)
@@ -558,70 +600,17 @@ fn get_tiered_similar_images(
     let query = Array1::from_vec(embedding);
     let raw_results = index.get_tiered_similar_images(&query, exclude_path.as_ref());
 
-    // Helper function to normalize path for database lookup
-    let normalize_path = |path_str: &str| -> String {
-        if path_str.starts_with("\\\\?\\") {
-            path_str[4..].to_string()
-        } else {
-            path_str.to_string()
-        }
-    };
-
-    let all_images = db.get_all_images().ok();
-
+    // Path resolution shared via `resolve_image_id_for_cosine_path`.
     let results: Vec<SimilarImage> = raw_results
         .into_iter()
         .filter_map(|(path, score)| {
-            let path_str = path.to_string_lossy().to_string();
-            let normalized_path = normalize_path(&path_str);
-
-            match db.get_image_id_by_path(&normalized_path) {
-                Ok(id) => Some(SimilarImage {
+            resolve_image_id_for_cosine_path(&db, &path, Some(&all_images)).map(
+                |(id, final_path)| SimilarImage {
                     id,
-                    path: normalized_path,
+                    path: final_path,
                     score,
-                }),
-                Err(_) => match db.get_image_id_by_path(&path_str) {
-                    Ok(id) => Some(SimilarImage {
-                        id,
-                        path: path_str,
-                        score,
-                    }),
-                    Err(_) => {
-                        if let Some(ref images) = all_images {
-                            let search_path = path
-                                .canonicalize()
-                                .ok()
-                                .map(|p| p.to_string_lossy().to_string())
-                                .unwrap_or_else(|| normalize_path(&path_str));
-
-                            images
-                                .iter()
-                                .find(|img| {
-                                    let img_normalized = normalize_path(&img.path);
-                                    let img_canon = std::path::Path::new(&img.path)
-                                        .canonicalize()
-                                        .ok()
-                                        .map(|p| p.to_string_lossy().to_string())
-                                        .unwrap_or_else(|| normalize_path(&img.path));
-
-                                    img_normalized == normalized_path
-                                        || img_normalized == path_str
-                                        || img.path == normalized_path
-                                        || img.path == path_str
-                                        || img_canon == search_path
-                                })
-                                .map(|matching_image| SimilarImage {
-                                    id: matching_image.id,
-                                    path: matching_image.path.clone(),
-                                    score,
-                                })
-                        } else {
-                            None
-                        }
-                    }
                 },
-            }
+            )
         })
         .collect();
 
@@ -668,34 +657,31 @@ fn get_similar_images(
         );
     }
 
-    // Get the path of the clicked image to exclude it from results
+    // Hoist db.get_all_images() to once per command (audit finding —
+    // was called twice: once for the exclude-path lookup and once again
+    // later for flexible matching). Single LEFT-JOIN-aggregate covers
+    // both. Surfacing the error here is the right call — silent
+    // get_all_images failure on the second call previously degraded
+    // results to "no flexible match" without the user knowing why.
     debug!("Looking up image path for image_id: {}", image_id);
-    let exclude_path = {
-        let all_images = db
-            .get_all_images()
-            .map_err(|e| format!("Failed to get images: {e}"))?;
-        debug!("Total images in database: {}", all_images.len());
-        let found = all_images.iter().find(|img| img.id == image_id).map(|img| {
-            debug!("Found image - id: {}, path: {}", img.id, img.path);
-            PathBuf::from(&img.path)
-        });
-        if found.is_none() {
-            warn!(
-                "Could not find image with id: {}",
-                image_id
-            );
-        }
-        found
-    };
+    let all_images = db
+        .get_all_images()
+        .map_err(|e| format!("Failed to get images: {e}"))?;
+    debug!("Total images in database: {}", all_images.len());
+
+    let exclude_path = all_images.iter().find(|img| img.id == image_id).map(|img| {
+        debug!("Found image - id: {}, path: {}", img.id, img.path);
+        PathBuf::from(&img.path)
+    });
+    if exclude_path.is_none() {
+        warn!("Could not find image with id: {}", image_id);
+    }
 
     debug!("Fetching embedding for image_id: {}", image_id);
     let embedding = db
         .get_image_embedding(image_id)
         .map_err(|e| format!("Failed to fetch embedding: {e}"))?;
-    debug!(
-        "Retrieved embedding - length: {}",
-        embedding.len()
-    );
+    debug!("Retrieved embedding - length: {}", embedding.len());
 
     let query = Array1::from_vec(embedding);
     debug!(
@@ -716,114 +702,33 @@ fn get_similar_images(
     }
 
     debug!("Converting results to SimilarImage structs...");
-    
-    // Helper function to normalize path for database lookup
-    // Removes Windows extended path prefix (\\?\) if present
-    let normalize_path = |path_str: &str| -> String {
-        if path_str.starts_with("\\\\?\\") {
-            path_str[4..].to_string()
-        } else {
-            path_str.to_string()
-        }
-    };
-    
-    // Get all images once for flexible matching if needed
-    let all_images = match db.get_all_images() {
-        Ok(images) => Some(images),
-        Err(e) => {
-            warn!("Failed to get all images for flexible matching: {}", e);
-            None
-        }
-    };
-    
+
+    // Path resolution shared via `resolve_image_id_for_cosine_path`
+    // (audit: extracted from triplicated normalize_path closure +
+    // 60-line lookup block).
     let results: Vec<SimilarImage> = raw_results
         .into_iter()
         .filter_map(|(path, score)| {
-            let path_str = path.to_string_lossy().to_string();
-            let normalized_path = normalize_path(&path_str);
-            
-            // Try normalized path first (most common case)
-            match db.get_image_id_by_path(&normalized_path) {
-                Ok(id) => {
-                    debug!(
-                        "  Mapped path to id - path: {:?}, id: {}, score: {:.4}",
-                        path.file_name().unwrap_or_default(),
-                        id,
-                        score
-                    );
-                    Some(SimilarImage {
-                        id,
-                        path: normalized_path,
-                        score,
-                    })
-                }
-                Err(_) => {
-                    // Try original path format
-                    match db.get_image_id_by_path(&path_str) {
-                        Ok(id) => {
-                            debug!(
-                                "  Mapped path to id (original format) - path: {:?}, id: {}, score: {:.4}",
-                                path.file_name().unwrap_or_default(),
-                                id,
-                                score
-                            );
-                            Some(SimilarImage {
-                                id,
-                                path: path_str,
-                                score,
-                            })
-                        }
-                        Err(_) => {
-                            // Fallback: flexible matching by comparing canonicalized paths
-                            if let Some(ref images) = all_images {
-                                let search_path = path.canonicalize()
-                                    .ok()
-                                    .map(|p| p.to_string_lossy().to_string())
-                                    .unwrap_or_else(|| normalize_path(&path_str));
-
-                                if let Some(matching_image) = images.iter().find(|img| {
-                                    let img_normalized = normalize_path(&img.path);
-                                    let img_canon = std::path::Path::new(&img.path)
-                                        .canonicalize()
-                                        .ok()
-                                        .map(|p| p.to_string_lossy().to_string())
-                                        .unwrap_or_else(|| normalize_path(&img.path));
-
-                                    img_normalized == normalized_path ||
-                                    img_normalized == path_str ||
-                                    img.path == normalized_path ||
-                                    img.path == path_str ||
-                                    img_canon == search_path
-                                }) {
-                                    debug!(
-                                        "  Mapped path to id (flexible match) - path: {:?}, id: {}, score: {:.4}",
-                                        path.file_name().unwrap_or_default(),
-                                        matching_image.id,
-                                        score
-                                    );
-                                    Some(SimilarImage {
-                                        id: matching_image.id,
-                                        path: matching_image.path.clone(),
-                                        score,
-                                    })
-                                } else {
-                                    warn!(
-                                        "  Failed to map path to id - path: {:?}",
-                                        path.file_name().unwrap_or_default()
-                                    );
-                                    None
-                                }
-                            } else {
-                                warn!(
-                                    "  Failed to map path to id - path: {:?}",
-                                    path.file_name().unwrap_or_default()
-                                );
-                                None
-                            }
-                        }
-                    }
-                }
+            let info = resolve_image_id_for_cosine_path(&db, &path, Some(&all_images));
+            if info.is_none() {
+                warn!(
+                    "  Failed to map path to id - path: {:?}",
+                    path.file_name().unwrap_or_default()
+                );
             }
+            info.map(|(id, final_path)| {
+                debug!(
+                    "  Mapped path to id - path: {:?}, id: {}, score: {:.4}",
+                    path.file_name().unwrap_or_default(),
+                    id,
+                    score
+                );
+                SimilarImage {
+                    id,
+                    path: final_path,
+                    score,
+                }
+            })
         })
         .collect();
 

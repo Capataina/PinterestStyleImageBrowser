@@ -26,9 +26,30 @@
 //! - `cargo tauri dev` (debug)   → <repo>/Library/
 //! - `tauri build` (release)     → ~/Library/Application Support/<bundle_id>/
 
+use std::borrow::Cow;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+
+/// Strip the Windows extended-path prefix `\\?\` if present. Returns
+/// the input borrow unchanged when the prefix is absent (the common
+/// case on every non-Windows platform), so call sites pay no
+/// allocation when the path doesn't need normalising.
+///
+/// Why this exists as a function (not a closure copied per command):
+/// audit finding — the same 7-line closure was triplicated across
+/// `semantic_search`, `get_similar_images`, and `get_tiered_similar_images`.
+/// The project notes already flagged "don't add a fourth normalisation
+/// closure"; the third one was already the redundancy. This helper is
+/// the single place to fix Windows path handling if the schema ever
+/// changes (e.g., normalising at insert time).
+pub fn strip_windows_extended_prefix(path_str: &str) -> Cow<'_, str> {
+    if path_str.starts_with("\\\\?\\") {
+        Cow::Owned(path_str[4..].to_string())
+    } else {
+        Cow::Borrowed(path_str)
+    }
+}
 
 #[cfg(not(debug_assertions))]
 use tracing::warn;
